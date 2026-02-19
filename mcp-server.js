@@ -268,6 +268,15 @@ const channelIdSchema = z.union([
   z.string({ invalid_type_error: "channelId must be a string" }).min(1),
 ]);
 
+const markChannelReadSchema = {
+  channelId: channelIdSchema.describe("Numeric channel ID or username"),
+  messageId: z
+    .number({ invalid_type_error: "messageId must be a number" })
+    .int()
+    .positive()
+    .describe("Mark as read up to this message ID (inclusive)"),
+};
+
 const userIdSchema = z.union([
   z.number({ invalid_type_error: "userId must be a number" }),
   z.string({ invalid_type_error: "userId must be a string" }).min(1),
@@ -623,7 +632,7 @@ function createServerInstance() {
 
   server.tool(
     "listChannels",
-    "Lists available Telegram dialogs for the authenticated account.",
+    "Lists available Telegram dialogs for the authenticated account, including unread message counts.",
     listChannelsSchema,
     async ({ limit }) => {
       await telegramClient.ensureLogin();
@@ -1688,6 +1697,25 @@ function createServerInstance() {
           {
             type: "text",
             text: JSON.stringify(jobs, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "markChannelRead",
+    "Marks a Telegram channel as read up to the specified message ID.",
+    markChannelReadSchema,
+    async ({ channelId, messageId }) => {
+      await telegramClient.ensureLogin();
+      const result = await telegramClient.markChannelRead(channelId, messageId);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result, null, 2),
           },
         ],
       };
