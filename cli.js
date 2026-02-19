@@ -167,6 +167,12 @@ function buildProgram() {
     .option('--enable', 'Enable sync')
     .option('--disable', 'Disable sync')
     .action(withGlobalOptions((globalFlags, options) => runChannelsSync(globalFlags, options)));
+  channels
+    .command('mark-read')
+    .description('Mark channel as read up to a message')
+    .option('--chat <id|username>', 'Channel identifier')
+    .option('--message-id <n>', 'Mark as read up to this message ID')
+    .action(withGlobalOptions((globalFlags, options) => runChannelsMarkRead(globalFlags, options)));
 
   const messages = program.command('messages').description('List and search messages');
   messages
@@ -2049,6 +2055,40 @@ async function runChannelsSync(globalFlags, options = {}) {
         } else {
           console.log(`Sync disabled for ${result.channel_id}`);
         }
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runChannelsMarkRead(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.chat) {
+      throw new Error('--chat is required');
+    }
+    if (!options.messageId) {
+      throw new Error('--message-id is required');
+    }
+    const messageId = parsePositiveInt(options.messageId, '--message-id');
+    if (messageId === null) {
+      throw new Error('--message-id must be a positive integer');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `tgcli auth` first.');
+      }
+      const result = await telegramClient.markChannelRead(options.chat, messageId);
+      if (globalFlags.json) {
+        writeJson(result);
+      } else {
+        console.log(`Marked channel ${result.channelId} as read up to message ${result.messageId}.`);
       }
     } finally {
       await messageSyncService.shutdown();
