@@ -75,10 +75,12 @@ tgcli messages search "Claude Code" --chat <id|@username> --source archive --jso
 tgcli messages search --query "Claude Code" --chat <id|@username> --source archive --json --timeout 30s
 tgcli messages search --regex "claude\\s+(code|agent)" --chat <id|@username> --source archive --json --timeout 30s
 tgcli messages search --tag ai --chat <id|@username> --source archive --json --timeout 30s
+tgcli messages search --tags "ai,dev" --chat <id|@username> --source archive --json --timeout 30s
 tgcli messages search "release" --chat <id|@username> --after 2025-06-01T00:00:00Z --before 2025-06-30T00:00:00Z --source archive --json --timeout 30s
+tgcli messages search "Release" --case-sensitive --chat <id|@username> --source archive --json --timeout 30s
 ```
 
-Both positional query and `--query` flag work. `--chat` accepts multiple values. Use `--regex` for pattern matching, `--tag` to filter by channel tags, `--after`/`--before` for date range.
+Both positional query and `--query` flag work. `--chat` accepts multiple values. Use `--regex` for pattern matching, `--tag`/`--tags` to filter by channel tags, `--after`/`--before` for date range, `--case-sensitive` to disable case-insensitive search.
 
 ### Send Text/File
 
@@ -147,6 +149,8 @@ tgcli tags list --chat <id|@username> --json --timeout 30s
 tgcli tags set --chat <id|@username> --tag ai --tag dev --json --timeout 30s
 tgcli tags search --tag ai --limit 20 --json --timeout 30s
 tgcli tags auto --limit 50 --json --timeout 90s            # AI-powered: generates tags from channel metadata/content
+tgcli tags auto --chat <id|@username> --source manual --json --timeout 90s
+tgcli tags auto --limit 50 --no-refresh-metadata --json --timeout 90s
 ```
 
 ### Metadata (Channel Cache)
@@ -163,11 +167,14 @@ tgcli metadata refresh --only-missing --limit 50 --json --timeout 90s
 tgcli sync status --json --timeout 30s
 tgcli sync jobs list --json --timeout 30s
 tgcli sync jobs list --status error --json --timeout 30s
+tgcli sync jobs list --channel <id|@username> --json --timeout 30s
 tgcli sync jobs add --chat <id|@username> --depth 500 --json --timeout 30s
 tgcli sync jobs add --chat <id|@username> --min-date 2025-01-01T00:00:00Z --json --timeout 30s
 tgcli sync jobs retry --all-errors --json --timeout 30s
 tgcli sync jobs retry --job-id <id> --json --timeout 30s
+tgcli sync jobs retry --channel <id|@username> --json --timeout 30s
 tgcli sync jobs cancel --job-id <id> --json --timeout 30s
+tgcli sync jobs cancel --channel <id|@username> --json --timeout 30s
 ```
 
 ### Service (Background Sync Daemon)
@@ -188,7 +195,9 @@ tgcli auth logout --json --timeout 30s
 tgcli config list --json --timeout 30s
 tgcli config get <key> --json --timeout 30s
 tgcli config set <key> <value> --json --timeout 30s
+tgcli config unset <key> --json --timeout 30s
 tgcli doctor --json --timeout 30s
+tgcli doctor --connect --json --timeout 30s
 ```
 
 ## Archive + Analysis Workflow
@@ -210,6 +219,34 @@ For tasks like "analyze chat history", "what happened this week", "digest/news":
    - `tgcli messages list --chat <id> --source live --limit 500 --json --timeout 90s`
 5. Build digest/synthesis from JSON payload.
 
+## Continuous Sync Workflow
+
+For tasks like "monitor these channels", "keep syncing my subscriptions":
+
+Architecture: `channels sync --enable` marks channels for watching → `sync jobs add` creates backfill tasks → `service start` runs a persistent daemon that processes jobs and pulls realtime updates.
+
+1. Enable sync for each channel:
+   - `tgcli channels sync --chat <id|@username> --enable --json --timeout 30s`
+   - repeat for each channel to monitor
+2. Add backfill jobs (optional, pulls history):
+   - `tgcli sync jobs add --chat <id|@username> --depth 1000 --json --timeout 30s`
+3. Start the background daemon:
+   - `tgcli service install --json --timeout 30s` — first time only
+   - `tgcli service start --json --timeout 30s`
+4. Verify it's running:
+   - `tgcli service status --json --timeout 30s`
+   - `tgcli sync status --json --timeout 30s` — shows per-channel sync progress
+5. Check for errors:
+   - `tgcli sync jobs list --status error --json --timeout 30s`
+   - `tgcli sync jobs retry --all-errors --json --timeout 30s`
+6. Stop monitoring a channel:
+   - `tgcli channels sync --chat <id|@username> --disable --json --timeout 30s`
+
+Alternative without systemd service (one-shot or foreground):
+- `tgcli sync --once` — run one sync pass and exit
+- `tgcli sync --follow` — keep syncing in foreground (ctrl-c to stop)
+- `tgcli sync --follow --idle-exit 5m` — auto-exit after 5 minutes idle
+
 ## Sync Semantics
 
 - "My channels/subscriptions" -> `tgcli channels list ...`
@@ -229,6 +266,8 @@ For tasks like "analyze chat history", "what happened this week", "digest/news":
 - "tag channels by topic"
 - "add user to telegram group"
 - "get invite link for group"
+- "start syncing this channel"
+- "monitor my telegram channels"
 - "прочитай сообщения в канале"
 - "найди в телеграме про релиз"
 - "отправь сообщение в канал"
