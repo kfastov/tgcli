@@ -184,6 +184,7 @@ function buildProgram() {
     .option('--after <iso>', 'Filter messages after date')
     .option('--before <iso>', 'Filter messages before date')
     .option('--limit <n>', 'Limit results')
+    .option('--offset-id <id>', 'Fetch messages older than this message ID (for pagination)')
     .action(withGlobalOptions((globalFlags, options) => runMessagesList(globalFlags, options)));
   messages
     .command('search')
@@ -2151,7 +2152,12 @@ async function runMessagesList(globalFlags, options = {}) {
             const response = await telegramClient.getTopicMessages(id, topicId, finalLimit);
             liveMessages = response.messages;
           } else {
-            const response = await telegramClient.getMessagesByChannelId(id, finalLimit);
+            const fetchOptions = {};
+            const offsetId = parsePositiveInt(options.offsetId, '--offset-id');
+            if (offsetId) {
+              fetchOptions.offsetId = offsetId;
+            }
+            const response = await telegramClient.getMessagesByChannelId(id, finalLimit, fetchOptions);
             liveMessages = response.messages;
             peerTitle = response.peerTitle ?? null;
           }

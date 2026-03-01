@@ -643,6 +643,7 @@ class TelegramClient {
       minId = 0,
       maxId = 0,
       reverse = false,
+      offsetId = 0,
     } = options;
     const peerRef = normalizeChannelId(channelId);
     const peer = await this.client.resolvePeer(peerRef);
@@ -662,6 +663,11 @@ class TelegramClient {
 
     if (maxId) {
       iterOptions.maxId = maxId;
+    }
+
+    if (offsetId) {
+      iterOptions.offset = { id: offsetId, date: 0 };
+      iterOptions.addOffset = 0;
     }
 
     for await (const message of this.client.iterHistory(peer, iterOptions)) {
