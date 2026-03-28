@@ -167,6 +167,12 @@ function buildProgram() {
     .option('--enable', 'Enable sync')
     .option('--disable', 'Disable sync')
     .action(withGlobalOptions((globalFlags, options) => runChannelsSync(globalFlags, options)));
+  channels
+    .command('mark-read')
+    .description('Mark channel as read up to a message')
+    .option('--chat <id|username>', 'Channel identifier')
+    .option('--message-id <n>', 'Mark as read up to this message ID')
+    .action(withGlobalOptions((globalFlags, options) => runChannelsMarkRead(globalFlags, options)));
 
   const messages = program.command('messages').description('List and search messages');
   messages
@@ -178,6 +184,7 @@ function buildProgram() {
     .option('--after <iso>', 'Filter messages after date')
     .option('--before <iso>', 'Filter messages before date')
     .option('--limit <n>', 'Limit results')
+    .option('--offset-id <id>', 'Fetch messages older than this message ID (for pagination)')
     .action(withGlobalOptions((globalFlags, options) => runMessagesList(globalFlags, options)));
   messages
     .command('search')
@@ -2058,6 +2065,40 @@ async function runChannelsSync(globalFlags, options = {}) {
   }, timeoutMs);
 }
 
+async function runChannelsMarkRead(globalFlags, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.chat) {
+      throw new Error('--chat is required');
+    }
+    if (!options.messageId) {
+      throw new Error('--message-id is required');
+    }
+    const messageId = parsePositiveInt(options.messageId, '--message-id');
+    if (messageId === null) {
+      throw new Error('--message-id must be a positive integer');
+    }
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `tgcli auth` first.');
+      }
+      const result = await telegramClient.markChannelRead(options.chat, messageId);
+      if (globalFlags.json) {
+        writeJson(result);
+      } else {
+        console.log(`Marked channel ${result.channelId} as read up to message ${result.messageId}.`);
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
 function createLiveMetadataResolver(messageSyncService, telegramClient) {
   return async (channelId, fallback = {}) => {
     const meta = messageSyncService.getChannelMetadata(channelId);
@@ -2111,7 +2152,12 @@ async function runMessagesList(globalFlags, options = {}) {
             const response = await telegramClient.getTopicMessages(id, topicId, finalLimit);
             liveMessages = response.messages;
           } else {
-            const response = await telegramClient.getMessagesByChannelId(id, finalLimit);
+            const fetchOptions = {};
+            const offsetId = parsePositiveInt(options.offsetId, '--offset-id');
+            if (offsetId) {
+              fetchOptions.offsetId = offsetId;
+            }
+            const response = await telegramClient.getMessagesByChannelId(id, finalLimit, fetchOptions);
             liveMessages = response.messages;
             peerTitle = response.peerTitle ?? null;
           }

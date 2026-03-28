@@ -546,6 +546,8 @@ class TelegramClient {
         chatType,
         isForum,
         isGroup,
+        unreadCount: typeof dialog.unreadCount === 'number' ? dialog.unreadCount : 0,
+        unreadMentionsCount: typeof dialog.unreadMentionsCount === 'number' ? dialog.unreadMentionsCount : 0,
       });
 
       if (results.length >= effectiveLimit) {
@@ -621,6 +623,8 @@ class TelegramClient {
           chatType,
           isForum,
           isGroup,
+          unreadCount: typeof dialog.unreadCount === 'number' ? dialog.unreadCount : 0,
+          unreadMentionsCount: typeof dialog.unreadMentionsCount === 'number' ? dialog.unreadMentionsCount : 0,
         });
       }
 
@@ -639,6 +643,7 @@ class TelegramClient {
       minId = 0,
       maxId = 0,
       reverse = false,
+      offsetId = 0,
     } = options;
     const peerRef = normalizeChannelId(channelId);
     const peer = await this.client.resolvePeer(peerRef);
@@ -658,6 +663,11 @@ class TelegramClient {
 
     if (maxId) {
       iterOptions.maxId = maxId;
+    }
+
+    if (offsetId) {
+      iterOptions.offset = { id: offsetId, date: 0 };
+      iterOptions.addOffset = 0;
     }
 
     for await (const message of this.client.iterHistory(peer, iterOptions)) {
@@ -971,6 +981,18 @@ class TelegramClient {
     const peerRef = normalizeChannelId(channelId);
     await this.client.leaveChat(peerRef);
     return true;
+  }
+
+  async markChannelRead(channelId, messageId) {
+    await this.ensureLogin();
+    const msgId = Number(messageId);
+    if (!Number.isInteger(msgId) || msgId <= 0) {
+      throw new Error('messageId must be a positive integer');
+    }
+    const peerRef = normalizeChannelId(channelId);
+    const peer = await this.client.resolvePeer(peerRef);
+    await this.client.readHistory(peer, { maxId: msgId });
+    return { channelId: peer?.id?.toString?.() ?? String(channelId), messageId: msgId };
   }
 
   async getPeerMetadata(channelId, peerType) {
