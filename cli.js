@@ -6,7 +6,7 @@ import { spawn, spawnSync } from 'child_process';
 import { setTimeout as delay } from 'timers/promises';
 import { fileURLToPath } from 'url';
 import readline from 'readline';
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 
 import { acquireStoreLock, acquireReadLock, readStoreLock } from './store-lock.js';
 import { loadConfig, normalizeConfig, saveConfig, validateConfig } from './core/config.js';
@@ -184,7 +184,9 @@ function buildProgram() {
     .option('--after <iso>', 'Filter messages after date')
     .option('--before <iso>', 'Filter messages before date')
     .option('--limit <n>', 'Limit results')
-    .option('--offset-id <id>', 'Fetch messages older than this message ID (for pagination)')
+    .option('--before-id <id>', 'Only messages older than this message ID')
+    .option('--after-id <id>', 'Only messages newer than this message ID')
+    .addOption(new Option('--offset-id <id>', 'Deprecated alias for --before-id').hideHelp())
     .action(withGlobalOptions((globalFlags, options) => runMessagesList(globalFlags, options)));
   messages
     .command('search')
@@ -197,6 +199,8 @@ function buildProgram() {
     .option('--after <iso>', 'Filter messages after date')
     .option('--before <iso>', 'Filter messages before date')
     .option('--limit <n>', 'Limit results')
+    .option('--before-id <id>', 'Only messages older than this message ID')
+    .option('--after-id <id>', 'Only messages newer than this message ID')
     .option('--regex <pattern>', 'Regex pattern')
     .option('--tag <tag>', 'Filter by tag', collectList)
     .option('--tags <tags>', 'Comma-separated tags')
@@ -896,6 +900,28 @@ function parsePositiveInt(value, label) {
   return parsed;
 }
 
+function parseMessageIdWindow(options = {}, { allowOffsetAlias = false } = {}) {
+  const beforeId = parsePositiveInt(options.beforeId, '--before-id');
+  const afterId = parsePositiveInt(options.afterId, '--after-id');
+  const offsetId = allowOffsetAlias
+    ? parsePositiveInt(options.offsetId, '--offset-id')
+    : null;
+
+  if (beforeId && offsetId && beforeId !== offsetId) {
+    throw new Error('--before-id and --offset-id must match when both are provided');
+  }
+
+  const resolvedBeforeId = beforeId ?? offsetId ?? null;
+  if (resolvedBeforeId && afterId && afterId >= resolvedBeforeId) {
+    throw new Error('--after-id must be lower than --before-id');
+  }
+
+  return {
+    beforeId: resolvedBeforeId,
+    afterId,
+  };
+}
+
 function parseNonNegativeInt(value, label) {
   if (value === undefined || value === null || value === '') {
     return null;
@@ -955,6 +981,30 @@ function filterLiveMessagesByDate(messages, fromDate, toDate) {
       return false;
     }
     if (toMs && ts > toMs) {
+      return false;
+    }
+    return true;
+  });
+}
+
+function getMessageIdValue(message) {
+  const value = message?.messageId ?? message?.id;
+  return Number.isFinite(value) ? value : null;
+}
+
+function filterMessagesById(messages, beforeId, afterId) {
+  if (!beforeId && !afterId) {
+    return messages;
+  }
+  return messages.filter((message) => {
+    const messageId = getMessageIdValue(message);
+    if (!messageId) {
+      return false;
+    }
+    if (beforeId && messageId >= beforeId) {
+      return false;
+    }
+    if (afterId && messageId <= afterId) {
       return false;
     }
     return true;
@@ -1051,6 +1101,26 @@ function mergeMessageSets(sets, limit) {
   const merged = Array.from(map.values());
   merged.sort((a, b) => messageDateMs(b) - messageDateMs(a));
   return limit && limit > 0 ? merged.slice(0, limit) : merged;
+}
+
+function buildMessageListJsonPayload(source, messages, requestedLimit) {
+  const hasMore = messages.length === requestedLimit;
+  const payload = {
+    source,
+    returned: messages.length,
+    hasMore,
+    messages,
+  };
+
+  if (hasMore) {
+    const lastMessage = messages[messages.length - 1];
+    const nextBeforeId = getMessageIdValue(lastMessage);
+    if (nextBeforeId) {
+      payload.nextBeforeId = nextBeforeId;
+    }
+  }
+
+  return payload;
 }
 
 function normalizeInviteCode(value) {
@@ -2125,6 +2195,7 @@ async function runMessagesList(globalFlags, options = {}) {
       const channelIds = parseListValues(options.chat);
       const topicId = parsePositiveInt(options.topic, '--topic');
       const finalLimit = parsePositiveInt(options.limit, '--limit') ?? 50;
+      const { beforeId, afterId } = parseMessageIdWindow(options, { allowOffsetAlias: true });
       let archivedResults = [];
       let liveResults = [];
       let usedLiveFallback = false;
@@ -2149,16 +2220,21 @@ async function runMessagesList(globalFlags, options = {}) {
           let liveMessages = [];
 
           if (topicId) {
-            const response = await telegramClient.getTopicMessages(id, topicId, finalLimit);
-            liveMessages = response.messages;
+            const response = await telegramClient.getTopicMessages(id, topicId, finalLimit, {
+              beforeId,
+              afterId,
+            });
+            liveMessages = filterMessagesById(response.messages, beforeId, afterId);
           } else {
             const fetchOptions = {};
-            const offsetId = parsePositiveInt(options.offsetId, '--offset-id');
-            if (offsetId) {
-              fetchOptions.offsetId = offsetId;
+            if (beforeId) {
+              fetchOptions.beforeId = beforeId;
+            }
+            if (afterId) {
+              fetchOptions.afterId = afterId;
             }
             const response = await telegramClient.getMessagesByChannelId(id, finalLimit, fetchOptions);
-            liveMessages = response.messages;
+            liveMessages = filterMessagesById(response.messages, beforeId, afterId);
             peerTitle = response.peerTitle ?? null;
           }
 
@@ -2182,6 +2258,8 @@ async function runMessagesList(globalFlags, options = {}) {
           topicId,
           fromDate: options.after,
           toDate: options.before,
+          beforeId,
+          afterId,
           limit: finalLimit,
         });
         archivedResults = archived.map((message) => ({ ...message, source: 'archive' }));
@@ -2211,7 +2289,7 @@ async function runMessagesList(globalFlags, options = {}) {
       }
 
       if (globalFlags.json) {
-        writeJson({ source: outputSource, returned: messages.length, messages });
+        writeJson(buildMessageListJsonPayload(outputSource, messages, finalLimit));
       } else {
         const groups = groupMessagesByChannel(messages);
         for (const group of groups) {
@@ -2257,6 +2335,7 @@ async function runMessagesSearch(globalFlags, queryParts, options = {}) {
       ];
       const topicId = parsePositiveInt(options.topic, '--topic');
       const finalLimit = parsePositiveInt(options.limit, '--limit') ?? 100;
+      const { beforeId, afterId } = parseMessageIdWindow(options);
       const caseInsensitive = !options.caseSensitive;
 
       if (!query && !options.regex && tagList.length === 0) {
@@ -2315,14 +2394,22 @@ async function runMessagesSearch(globalFlags, queryParts, options = {}) {
               query,
               limit: finalLimit,
               topicId,
+              beforeId,
+              afterId,
             });
             liveMessages = response.messages;
             peerTitle = response.peerTitle ?? null;
           } else if (topicId) {
-            const response = await telegramClient.getTopicMessages(id, topicId, finalLimit);
+            const response = await telegramClient.getTopicMessages(id, topicId, finalLimit, {
+              beforeId,
+              afterId,
+            });
             liveMessages = response.messages;
           } else {
-            const response = await telegramClient.getMessagesByChannelId(id, finalLimit);
+            const response = await telegramClient.getMessagesByChannelId(id, finalLimit, {
+              beforeId,
+              afterId,
+            });
             liveMessages = response.messages;
             peerTitle = response.peerTitle ?? null;
           }
@@ -2332,6 +2419,7 @@ async function runMessagesSearch(globalFlags, queryParts, options = {}) {
           username = meta.username;
 
           let filtered = filterLiveMessagesByDate(liveMessages, options.after, options.before);
+          filtered = filterMessagesById(filtered, beforeId, afterId);
           if (liveRegex) {
             filtered = filtered.filter((message) =>
               liveRegex.test(message.text ?? message.message ?? ''),
@@ -2356,6 +2444,8 @@ async function runMessagesSearch(globalFlags, queryParts, options = {}) {
           topicId,
           fromDate: options.after,
           toDate: options.before,
+          beforeId,
+          afterId,
           limit: finalLimit,
           caseInsensitive,
         });

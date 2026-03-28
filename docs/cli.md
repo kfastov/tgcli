@@ -52,10 +52,44 @@ MCP: disabled by default (set `mcp.enabled` in config.json to true to serve MCP)
 - topics search --chat <id|username> --query <text> [--limit]
 
 ## messages
-- messages list [--chat] [--topic] [--source archive|live|both] [--after ISO] [--before ISO] [--limit]
-- messages search <query> [--chat] [--topic] [--source] [--after] [--before] [--tag] [--regex] [--limit]
+- messages list [--chat] [--topic] [--source archive|live|both] [--after ISO] [--before ISO] [--before-id N] [--after-id N] [--limit]
+- messages search <query> [--chat] [--topic] [--source] [--after] [--before] [--before-id N] [--after-id N] [--tag] [--regex] [--limit]
 - messages show --chat <id> --id <msgId> [--source]
 - messages context --chat <id> --id <msgId> [--before N] [--after N] [--source]
+
+### Pagination
+
+Use `--before-id` and `--after-id` for cursor-based pagination by message ID:
+- `--before-id N` — only messages older than message ID N (backward pagination)
+- `--after-id N` — only messages newer than message ID N (forward pagination)
+
+With `--json`, the response includes pagination metadata:
+```json
+{
+  "source": "live",
+  "returned": 50,
+  "hasMore": true,
+  "nextBeforeId": 429100,
+  "messages": [...]
+}
+```
+- `hasMore` — true when the number of returned messages equals the requested limit
+- `nextBeforeId` — the ID of the oldest message in the batch; pass it as `--before-id` to get the next page
+
+Example: paginating through history:
+```bash
+# Page 1
+tgcli messages list --chat <id> --limit 50 --source live --json
+# → hasMore: true, nextBeforeId: 12345
+
+# Page 2
+tgcli messages list --chat <id> --limit 50 --source live --before-id 12345 --json
+# → hasMore: true, nextBeforeId: 11000
+
+# Continue until hasMore: false
+```
+
+Legacy `--offset-id` is accepted as a hidden alias for `--before-id`.
 
 ## send
 - send text --to <id|username> --message "..." [--topic]
