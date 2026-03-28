@@ -11,7 +11,7 @@
     "prepare": "npm run build",
     "build": "echo \"No build step required\"",
     "prepublishOnly": "npm test",
-    "test": "echo \"No tests specified yet\""
+    "test": "vitest run"
   },
   "bin": {
     "tgcli": "cli.js"
@@ -56,5 +56,8 @@
     "@mtcute/node": "^0.27.8",
     "better-sqlite3": "^12.6.0",
     "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.2"
   }
 }
