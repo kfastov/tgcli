@@ -1462,6 +1462,243 @@ class TelegramClient {
       messages,
     };
   }
+  // --- Chat Folders ---
+
+  async getFolders() {
+    await this.ensureLogin();
+    const result = await this.client.getFolders();
+    const filters = result?.filters ?? [];
+    return filters.map((f) => {
+      if (f._ === 'dialogFilterDefault') return { id: 0, title: 'All Chats', type: 'default' };
+      return {
+        id: f.id,
+        title: typeof f.title === 'string' ? f.title : (f.title?.text ?? 'Unknown'),
+        emoji: f.emoticon ?? null,
+        color: f.color ?? null,
+        type: f._ === 'dialogFilterChatlist' ? 'chatlist' : 'filter',
+        contacts: f.contacts ?? false,
+        nonContacts: f.nonContacts ?? false,
+        groups: f.groups ?? false,
+        broadcasts: f.broadcasts ?? false,
+        bots: f.bots ?? false,
+        excludeMuted: f.excludeMuted ?? false,
+        excludeRead: f.excludeRead ?? false,
+        excludeArchived: f.excludeArchived ?? false,
+        includePeers: f.includePeers?.length ?? 0,
+        excludePeers: f.excludePeers?.length ?? 0,
+        pinnedPeers: f.pinnedPeers?.length ?? 0,
+      };
+    });
+  }
+
+  async findFolder(idOrName) {
+    await this.ensureLogin();
+    const trimmed = String(idOrName).trim();
+    if (trimmed === '') throw new Error('Folder identifier cannot be empty');
+    if (/^\d+$/.test(trimmed)) return this.client.findFolder({ id: Number(trimmed) });
+    return this.client.findFolder({ title: trimmed });
+  }
+
+  async showFolder(idOrName, options = {}) {
+    await this.ensureLogin();
+    const folder = await this.findFolder(idOrName);
+    if (!folder) throw new Error(`Folder not found: ${idOrName}`);
+
+    const normalizePeers = (peers) => (peers ?? []).map((p) => this._normalizePeer(p));
+
+    const resolvePeers = async (peers) => {
+      const normalized = normalizePeers(peers);
+      if (!options.resolve) return normalized;
+
+      return Promise.all(normalized.map(async (peer) => {
+        const name = await this._resolvePeerName(peer.type, peer.id);
+        const nameField = peer.type === 'user' ? 'name' : 'title';
+        return { ...peer, [nameField]: name ?? '(unresolved)' };
+      }));
+    };
+
+    return {
+      id: folder.id,
+      title: typeof folder.title === 'string' ? folder.title : (folder.title?.text ?? 'Unknown'),
+      emoji: folder.emoticon ?? null,
+      color: folder.color ?? null,
+      type: folder._ === 'dialogFilterChatlist' ? 'chatlist' : folder._ === 'dialogFilterDefault' ? 'default' : 'filter',
+      contacts: folder.contacts ?? false,
+      nonContacts: folder.nonContacts ?? false,
+      groups: folder.groups ?? false,
+      broadcasts: folder.broadcasts ?? false,
+      bots: folder.bots ?? false,
+      excludeMuted: folder.excludeMuted ?? false,
+      excludeRead: folder.excludeRead ?? false,
+      excludeArchived: folder.excludeArchived ?? false,
+      includePeers: await resolvePeers(folder.includePeers),
+      excludePeers: await resolvePeers(folder.excludePeers),
+      pinnedPeers: await resolvePeers(folder.pinnedPeers),
+    };
+  }
+
+  async createFolder(options) {
+    await this.ensureLogin();
+    if (!options.title) throw new Error('Folder title is required');
+    const params = { title: options.title };
+    if (options.emoji) params.emoticon = options.emoji;
+    if (options.contacts !== undefined) params.contacts = options.contacts;
+    if (options.nonContacts !== undefined) params.nonContacts = options.nonContacts;
+    if (options.groups !== undefined) params.groups = options.groups;
+    if (options.broadcasts !== undefined) params.broadcasts = options.broadcasts;
+    if (options.bots !== undefined) params.bots = options.bots;
+    if (options.excludeMuted !== undefined) params.excludeMuted = options.excludeMuted;
+    if (options.excludeRead !== undefined) params.excludeRead = options.excludeRead;
+    if (options.excludeArchived !== undefined) params.excludeArchived = options.excludeArchived;
+    if (options.includePeers?.length) params.includePeers = options.includePeers;
+    if (options.excludePeers?.length) params.excludePeers = options.excludePeers;
+    if (options.pinnedPeers?.length) params.pinnedPeers = options.pinnedPeers;
+    const result = await this.client.createFolder(params);
+    return { id: result.id, title: typeof result.title === 'string' ? result.title : (result.title?.text ?? 'Unknown') };
+  }
+
+  async editFolder(idOrName, modification) {
+    await this.ensureLogin();
+    const folder = await this.findFolder(idOrName);
+    if (!folder) throw new Error(`Folder not found: ${idOrName}`);
+    if (this._isDefaultFolder(folder)) throw new Error('Cannot modify the default "All Chats" folder');
+    const mod = {};
+    if (modification.title !== undefined) mod.title = modification.title;
+    if (modification.emoji !== undefined) mod.emoticon = modification.emoji;
+    if (modification.contacts !== undefined) mod.contacts = modification.contacts;
+    if (modification.nonContacts !== undefined) mod.nonContacts = modification.nonContacts;
+    if (modification.groups !== undefined) mod.groups = modification.groups;
+    if (modification.broadcasts !== undefined) mod.broadcasts = modification.broadcasts;
+    if (modification.bots !== undefined) mod.bots = modification.bots;
+    if (modification.excludeMuted !== undefined) mod.excludeMuted = modification.excludeMuted;
+    if (modification.excludeRead !== undefined) mod.excludeRead = modification.excludeRead;
+    if (modification.excludeArchived !== undefined) mod.excludeArchived = modification.excludeArchived;
+    if (modification.includePeers !== undefined) mod.includePeers = modification.includePeers;
+    if (modification.excludePeers !== undefined) mod.excludePeers = modification.excludePeers;
+    if (modification.pinnedPeers !== undefined) mod.pinnedPeers = modification.pinnedPeers;
+    const result = await this.client.editFolder({ folder, modification: mod });
+    return { id: result.id, title: typeof result.title === 'string' ? result.title : (result.title?.text ?? 'Unknown') };
+  }
+
+  async deleteFolder(idOrName) {
+    await this.ensureLogin();
+    const folder = await this.findFolder(idOrName);
+    if (!folder) throw new Error(`Folder not found: ${idOrName}`);
+    if (this._isDefaultFolder(folder)) throw new Error('Cannot delete the default "All Chats" folder');
+    await this.client.deleteFolder(folder.id);
+    return { deleted: true, id: folder.id };
+  }
+
+  async setFoldersOrder(ids) {
+    await this.ensureLogin();
+    if (!ids.length) throw new Error('At least one folder ID is required');
+    const numericIds = ids.map((id) => {
+      const n = Number(id);
+      if (!Number.isInteger(n) || n < 0) throw new Error(`Invalid folder ID: ${id}`);
+      return n;
+    });
+    const unique = new Set(numericIds);
+    if (unique.size !== numericIds.length) throw new Error('Duplicate folder IDs are not allowed');
+    await this.client.setFoldersOrder(numericIds);
+    return { ok: true };
+  }
+
+  async addChatToFolder(idOrName, chatId) {
+    await this.ensureLogin();
+    const folder = await this.findFolder(idOrName);
+    if (!folder) throw new Error(`Folder not found: ${idOrName}`);
+    if (this._isDefaultFolder(folder)) throw new Error('Cannot modify the default "All Chats" folder');
+    const peers = folder.includePeers ? [...folder.includePeers] : [];
+    const chatIdStr = String(chatId);
+    const alreadyIncluded = peers.some((p) => {
+      const id = this._extractPeerId(p);
+      return id === chatIdStr;
+    });
+    if (alreadyIncluded) throw new Error(`Chat ${chatId} already in folder ${folder.id}`);
+    peers.push(chatId);
+    await this.client.editFolder({ folder, modification: { includePeers: peers } });
+    return { ok: true, folderId: folder.id };
+  }
+
+  async removeChatFromFolder(idOrName, chatId) {
+    await this.ensureLogin();
+    const folder = await this.findFolder(idOrName);
+    if (!folder) throw new Error(`Folder not found: ${idOrName}`);
+    if (this._isDefaultFolder(folder)) throw new Error('Cannot modify the default "All Chats" folder');
+    const chatIdStr = String(chatId);
+    const originalPeers = folder.includePeers ?? [];
+    const peers = originalPeers.filter((p) => {
+      const peerId = this._extractPeerId(p);
+      return peerId !== chatIdStr;
+    });
+    if (peers.length === originalPeers.length) {
+      throw new Error(`Chat ${chatId} not found in folder ${folder.id}`);
+    }
+    await this.client.editFolder({ folder, modification: { includePeers: peers } });
+    return { ok: true, folderId: folder.id };
+  }
+
+  async joinChatlist(link) {
+    await this.ensureLogin();
+    if (!/^https?:\/\/t\.me\/addlist\/[a-zA-Z0-9_-]+\/?(\?[^\s]*)?$/.test(link)) {
+      throw new Error(`Invalid chatlist link: ${link}. Expected format: https://t.me/addlist/<slug>`);
+    }
+    const result = await this.client.joinChatlist(link);
+    if (!result) throw new Error(`Failed to join chatlist: no result returned for ${link}`);
+    return {
+      id: result.id,
+      title: typeof result.title === 'string' ? result.title : (result.title?.text ?? 'Unknown'),
+      type: 'chatlist',
+    };
+  }
+
+  // --- Folder helper methods ---
+
+  _isDefaultFolder(folder) {
+    return folder.id === 0 || folder._ === 'dialogFilterDefault';
+  }
+
+  _extractPeerId(peer) {
+    if (peer == null) throw new Error(`Peer is ${peer}, cannot extract ID`);
+    if (typeof peer !== 'object') return String(peer);
+    const id = peer.userId ?? peer.channelId ?? peer.chatId;
+    if (id == null) throw new Error(`Peer object has no recognizable ID field: ${JSON.stringify(peer)}`);
+    return String(id);
+  }
+
+  _normalizePeer(peer) {
+    if (peer == null) throw new Error(`Peer is ${peer}, cannot normalize`);
+    if (typeof peer !== 'object') throw new Error(`Peer must be an object, got ${typeof peer}`);
+
+    let type, id;
+    if (peer.userId != null) {
+      type = 'user';
+      id = Number(peer.userId);
+    } else if (peer.channelId != null) {
+      type = 'channel';
+      id = Number(peer.channelId);
+    } else if (peer.chatId != null) {
+      type = 'chat';
+      id = Number(peer.chatId);
+    } else {
+      throw new Error(`Peer object has no recognizable ID field: ${JSON.stringify(peer)}`);
+    }
+
+    return { type, id };
+  }
+
+  async _resolvePeerName(type, id) {
+    try {
+      if (type === 'user') {
+        const user = await this.client.getFullUser(id);
+        return user.displayName || user.firstName || null;
+      }
+      const chat = await this.client.getChat(id);
+      return chat.displayName || chat.title || null;
+    } catch {
+      return null;
+    }
+  }
 }
 
 export default TelegramClient;
