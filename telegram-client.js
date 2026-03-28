@@ -363,6 +363,32 @@ export function normalizeChannelId(channelId) {
   throw new Error('Invalid channel ID provided');
 }
 
+function normalizePositiveMessageId(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+}
+
+function filterSerializedMessagesById(messages, options = {}) {
+  const beforeId = normalizePositiveMessageId(options.beforeId);
+  const afterId = normalizePositiveMessageId(options.afterId);
+  if (!beforeId && !afterId) {
+    return messages;
+  }
+  return messages.filter((message) => {
+    const messageId = normalizePositiveMessageId(message?.id);
+    if (!messageId) {
+      return false;
+    }
+    if (beforeId && messageId >= beforeId) {
+      return false;
+    }
+    if (afterId && messageId <= afterId) {
+      return false;
+    }
+    return true;
+  });
+}
+
 class TelegramClient {
   constructor(apiId, apiHash, phoneNumber, sessionPath = DEFAULT_SESSION_PATH, options = {}) {
     this.apiId = coerceApiId(apiId);
@@ -644,30 +670,45 @@ class TelegramClient {
       maxId = 0,
       reverse = false,
       offsetId = 0,
+      beforeId = 0,
+      afterId = 0,
     } = options;
     const peerRef = normalizeChannelId(channelId);
     const peer = await this.client.resolvePeer(peerRef);
 
     const effectiveLimit = limit && limit > 0 ? limit : 100;
+    const effectiveBeforeId = normalizePositiveMessageId(beforeId)
+      || normalizePositiveMessageId(offsetId);
+    const effectiveAfterId = normalizePositiveMessageId(afterId);
+    const effectiveMinId = effectiveAfterId || normalizePositiveMessageId(minId);
+    const effectiveMaxId = normalizePositiveMessageId(maxId);
+    const useAfterIdPagination = Boolean(effectiveAfterId);
     const messages = [];
 
     const iterOptions = {
       limit: effectiveLimit,
       chunkSize: Math.min(effectiveLimit, 100),
-      reverse,
+      reverse: useAfterIdPagination ? true : reverse,
     };
 
-    if (minId) {
-      iterOptions.minId = minId;
+    if (effectiveMinId) {
+      iterOptions.minId = effectiveMinId;
     }
 
-    if (maxId) {
-      iterOptions.maxId = maxId;
+    if (effectiveMaxId) {
+      iterOptions.maxId = effectiveMaxId;
     }
 
-    if (offsetId) {
-      iterOptions.offset = { id: offsetId, date: 0 };
-      iterOptions.addOffset = 0;
+    if (effectiveBeforeId) {
+      if (useAfterIdPagination || iterOptions.maxId) {
+        const boundedMaxId = Math.max(0, effectiveBeforeId - 1);
+        iterOptions.maxId = iterOptions.maxId
+          ? Math.min(iterOptions.maxId, boundedMaxId)
+          : boundedMaxId;
+      } else {
+        iterOptions.offset = { id: effectiveBeforeId, date: 0 };
+        iterOptions.addOffset = 0;
+      }
     }
 
     for await (const message of this.client.iterHistory(peer, iterOptions)) {
@@ -677,11 +718,18 @@ class TelegramClient {
       }
     }
 
+    if (useAfterIdPagination) {
+      messages.reverse();
+    }
+
     return {
       peerTitle: peer?.displayName || 'Unknown',
       peerId: peer?.id?.toString?.() ?? String(channelId),
       peerType: normalizePeerType(peer),
-      messages,
+      messages: filterSerializedMessagesById(messages, {
+        beforeId: effectiveBeforeId,
+        afterId: effectiveAfterId,
+      }),
     };
   }
 
@@ -765,7 +813,10 @@ class TelegramClient {
       limit,
       query,
     });
-    const messages = results.map((message) => this._serializeMessage(message, peer));
+    const messages = filterSerializedMessagesById(
+      results.map((message) => this._serializeMessage(message, peer)),
+      options,
+    );
 
     return {
       peerTitle: peer?.displayName || 'Unknown',
@@ -1200,7 +1251,10 @@ class TelegramClient {
       limit,
       query: options.query ?? '',
     });
-    const messages = results.map((message) => this._serializeMessage(message, message.chat));
+    const messages = filterSerializedMessagesById(
+      results.map((message) => this._serializeMessage(message, message.chat)),
+      options,
+    );
 
     return {
       total: results.total ?? messages.length,

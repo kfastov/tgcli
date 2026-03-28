@@ -2169,7 +2169,7 @@ export default class MessageSyncService {
     return matches;
   }
 
-  listArchivedMessages({ channelIds, topicId, fromDate, toDate, limit = 50 }) {
+  listArchivedMessages({ channelIds, topicId, fromDate, toDate, beforeId, afterId, limit = 50 }) {
     const resolvedIds = Array.isArray(channelIds) ? channelIds : (channelIds ? [channelIds] : []);
     const normalizedIds = resolvedIds.map((id) => normalizeChannelKey(id)).filter(Boolean);
     const clauses = [];
@@ -2193,6 +2193,16 @@ export default class MessageSyncService {
     if (toDate) {
       params.push(parseIsoDate(toDate));
       clauses.push('messages.date <= ?');
+    }
+
+    if (Number.isFinite(beforeId) && beforeId > 0) {
+      params.push(Number(beforeId));
+      clauses.push('messages.message_id < ?');
+    }
+
+    if (Number.isFinite(afterId) && afterId > 0) {
+      params.push(Number(afterId));
+      clauses.push('messages.message_id > ?');
     }
 
     const whereClause = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -2380,6 +2390,16 @@ export default class MessageSyncService {
     if (options.toDate) {
       params.push(parseIsoDate(options.toDate));
       clauses.push('messages.date <= ?');
+    }
+
+    if (Number.isFinite(options.beforeId) && options.beforeId > 0) {
+      params.push(Number(options.beforeId));
+      clauses.push('messages.message_id < ?');
+    }
+
+    if (Number.isFinite(options.afterId) && options.afterId > 0) {
+      params.push(Number(options.afterId));
+      clauses.push('messages.message_id > ?');
     }
 
     if (queryText) {
