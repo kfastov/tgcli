@@ -36,7 +36,7 @@ const VALIDATION_MESSAGE_PATTERNS = [
 
 // --- Helpers ---
 
-function formatErrorMessage(error) {
+export function formatErrorMessage(error) {
   if (error instanceof Error && error.message) {
     return error.message;
   }
@@ -85,6 +85,21 @@ function looksLikeTransportError(message, error) {
     return true;
   }
   return message.toLowerCase().includes('transport error');
+}
+
+export function parseRequiredWaitSeconds(error) {
+  const message = formatErrorMessage(error);
+  const floodWaitMatch = /FLOOD_WAIT_(\d+)/i.exec(message);
+  if (floodWaitMatch) {
+    return Number(floodWaitMatch[1]);
+  }
+
+  const requiredWaitMatch = /wait of (\d+) seconds/i.exec(message);
+  if (requiredWaitMatch) {
+    return Number(requiredWaitMatch[1]);
+  }
+
+  return null;
 }
 
 function looksLikeTelegramError(message, code, error) {
@@ -166,6 +181,20 @@ export function classifySendError(error, { method, attempt = 1, retries = 0 } = 
 
   const message = formatErrorMessage(error);
   const code = extractErrorCode(error);
+  const waitSeconds = parseRequiredWaitSeconds(error);
+
+  if (waitSeconds !== null || /FLOOD_WAIT/i.test(message)) {
+    return {
+      type: 'rate_limit',
+      method,
+      message,
+      code,
+      attempt,
+      retries,
+      retryable: true,
+      waitSeconds,
+    };
+  }
 
   if (looksLikeValidationError(message, code)) {
     return { type: 'validation', method, message, code, attempt, retries, retryable: false };
@@ -203,6 +232,7 @@ export function classifySendError(error, { method, attempt = 1, retries = 0 } = 
  *   retries      — max retry count (default 0)
  *   method       — method name for error details (default 'sendMedia')
  *   retryBackoff — parsed backoff config from parseRetryBackoff()
+ *   maxWaitSeconds — max FLOOD_WAIT to honor in seconds (default 300)
  *   timeoutMs    — total time budget in ms (optional)
  *   onRetry      — callback on each retry (optional)
  *   sleep        — sleep function for testing (default: setTimeout)
@@ -212,6 +242,9 @@ export async function executeSendWithRetries(sendFn, options = {}) {
   const retries = Number.isInteger(options.retries) && options.retries >= 0 ? options.retries : 0;
   const method = options.method ?? 'sendMedia';
   const backoff = parseRetryBackoff(options.retryBackoff);
+  const maxWaitSeconds = Number.isFinite(options.maxWaitSeconds) && options.maxWaitSeconds >= 0
+    ? options.maxWaitSeconds
+    : 300;
   const sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const now = options.now ?? (() => Date.now());
   const deadlineAt = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
@@ -237,7 +270,11 @@ export async function executeSendWithRetries(sendFn, options = {}) {
       return { result, attempts: attempt };
     } catch (error) {
       const details = classifySendError(error, { method, attempt, retries });
-      const shouldRetry = details.retryable && attempt <= retries;
+      const waitSeconds = Number.isFinite(details.waitSeconds) ? details.waitSeconds : null;
+      const exceedsMaxWait = details.type === 'rate_limit'
+        && waitSeconds !== null
+        && waitSeconds > maxWaitSeconds;
+      const shouldRetry = details.retryable && attempt <= retries && !exceedsMaxWait;
       if (!shouldRetry) {
         throw new SendCommandError(details);
       }
@@ -254,7 +291,9 @@ export async function executeSendWithRetries(sendFn, options = {}) {
         }
       }
 
-      const retryDelayMs = getRetryDelayMs(backoff, attempt);
+      const retryDelayMs = details.type === 'rate_limit' && waitSeconds !== null
+        ? waitSeconds * 1000
+        : getRetryDelayMs(backoff, attempt);
 
       if (deadlineAt !== null) {
         const left = remainingMs();
@@ -338,4 +377,17 @@ export function formatSendErrorMessage(details = {}) {
     ? `, code ${details.code}`
     : '';
   return `${details.method ?? 'sendMedia'} failed [${details.type ?? 'unknown'}]: ${details.message ?? 'Unknown error'} (attempt ${attempt}/${totalAttempts}${codeSuffix})`;
+}
+
+export function classifyError(error, context = {}) {
+  return classifySendError(error, context);
+}
+
+export function computeRetryWaitSeconds(error, attempt) {
+  const requiredWaitSeconds = parseRequiredWaitSeconds(error);
+  if (requiredWaitSeconds !== null) {
+    return requiredWaitSeconds;
+  }
+
+  return getRetryDelayMs({ kind: 'exponential', baseMs: 1000 }, attempt) / 1000;
 }
