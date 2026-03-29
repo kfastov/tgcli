@@ -33,6 +33,27 @@ describe('executeSendWithRetries', () => {
     });
   });
 
+  it('retries FLOOD_WAIT using the server-specified wait time', async () => {
+    const sendFn = vi.fn()
+      .mockRejectedValueOnce(new Error('A wait of 3 seconds is required'))
+      .mockResolvedValueOnce({ messageId: 123 });
+    const sleep = vi.fn().mockResolvedValue(undefined);
+
+    const result = await executeSendWithRetries(sendFn, {
+      method: 'sendPhoto',
+      retries: 2,
+      retryBackoff: parseRetryBackoff('10'),
+      sleep,
+    });
+
+    expect(sendFn).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledWith(3000);
+    expect(result).toEqual({
+      result: { messageId: 123 },
+      attempts: 2,
+    });
+  });
+
   it('does not retry validation errors', async () => {
     const sendFn = vi.fn().mockRejectedValue(new Error('File not found: /tmp/missing.png'));
 
@@ -235,6 +256,32 @@ describe('executeSendWithRetries', () => {
         type: 'network',
         attempt: 1,
         retries: 0,
+      }),
+    });
+
+    expect(sendFn).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('does not retry FLOOD_WAIT when maxWaitSeconds is exceeded', async () => {
+    const sendFn = vi.fn().mockRejectedValue(new Error('FLOOD_WAIT_301'));
+    const sleep = vi.fn().mockResolvedValue(undefined);
+
+    await expect(
+      executeSendWithRetries(sendFn, {
+        method: 'sendPhoto',
+        retries: 2,
+        maxWaitSeconds: 300,
+        sleep,
+      }),
+    ).rejects.toMatchObject({
+      name: 'SendCommandError',
+      details: expect.objectContaining({
+        type: 'rate_limit',
+        attempt: 1,
+        retries: 2,
+        retryable: true,
+        waitSeconds: 301,
       }),
     });
 
@@ -515,9 +562,9 @@ describe('classifySendError', () => {
     expect(result).toMatchObject({ type: 'telegram', retryable: false, code: 403 });
   });
 
-  it('classifies FLOOD_WAIT as non-retryable telegram error', () => {
+  it('classifies FLOOD_WAIT as retryable rate_limit error', () => {
     const result = classifySendError(new Error('FLOOD_WAIT_30'), { method: 'sendPhoto' });
-    expect(result).toMatchObject({ type: 'telegram', retryable: false });
+    expect(result).toMatchObject({ type: 'rate_limit', retryable: true, waitSeconds: 30 });
   });
 
   it('classifies RpcError by name as telegram error', () => {
