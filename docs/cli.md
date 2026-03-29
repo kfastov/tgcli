@@ -92,8 +92,10 @@ tgcli messages list --chat <id> --limit 50 --source live --before-id 12345 --jso
 Legacy `--offset-id` is accepted as a hidden alias for `--before-id`.
 
 ## send
-- send text --to <id|username> --message "..." [--topic]
-- send file --to <id|username> --file PATH [--caption] [--filename]
+- send text --to <id|username> --message "..." [--topic <id>] [--parse-mode markdown|html|none] [--reply-to <id>] [--schedule <iso>] [--silent] [--no-preview] [--no-forwards] [--retries <n>] [--retry-backoff constant|linear|exponential|<ms>]
+- send photo --to <id|username> --photo PATH [--caption "..."] [--topic <id>] [--parse-mode markdown|html|none] [--reply-to <id>] [--schedule <iso>] [--silent] [--no-forwards] [--spoiler] [--caption-above] [--retries <n>] [--retry-backoff constant|linear|exponential|<ms>]
+- send file --to <id|username> --file PATH [--caption "..."] [--filename NAME] [--topic <id>] [--parse-mode markdown|html|none] [--reply-to <id>] [--schedule <iso>] [--silent] [--no-forwards] [--spoiler] [--caption-above] [--force-document] [--retries <n>] [--retry-backoff constant|linear|exponential|<ms>]
+  - `--retries` defaults to `2` for all send commands.
 
 ## media
 - media download --chat <id|username> --id <msgId> [--output PATH]

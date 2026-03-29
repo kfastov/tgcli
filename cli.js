@@ -36,7 +36,7 @@ const CONFIG_SPECS = [
 ];
 
 const SEND_PARSE_MODES = ['markdown', 'html', 'none'];
-const DEFAULT_SEND_PHOTO_RETRIES = 2;
+const DEFAULT_SEND_RETRIES = 2;
 
 const CLI_PROGRAM = buildProgram();
 
@@ -252,7 +252,8 @@ function buildProgram() {
     .option('--silent', 'Send without notification sound')
     .option('--no-forwards', 'Protect message from forwarding')
     .option('--schedule <iso>', 'Schedule message (ISO 8601 datetime)')
-    .option('--retries <n>', 'Max retries on failure', '0')
+    .option('--retries <n>', 'Max retries on failure', String(DEFAULT_SEND_RETRIES))
+    .option('--retry-backoff <value>', 'Retry backoff in ms or strategy: constant|linear|exponential')
     .action(withGlobalOptions((globalFlags, options) => runSendText(globalFlags, options)));
   send
     .command('photo')
@@ -269,7 +270,7 @@ function buildProgram() {
     .option('--caption-above', 'Show caption above media')
     .option('--spoiler', 'Blur media until tapped')
     .option('--schedule <iso>', 'Schedule message (ISO 8601 datetime)')
-    .option('--retries <n>', 'Retry count for transient send failures')
+    .option('--retries <n>', 'Max retries on failure', String(DEFAULT_SEND_RETRIES))
     .option('--retry-backoff <value>', 'Retry backoff in ms or strategy: constant|linear|exponential')
     .action(withGlobalOptions((globalFlags, options) => runSendPhoto(globalFlags, options)));
   send
@@ -289,7 +290,8 @@ function buildProgram() {
     .option('--spoiler', 'Blur media until tapped')
     .option('--schedule <iso>', 'Schedule message (ISO 8601 datetime)')
     .option('--force-document', 'Send as uncompressed document')
-    .option('--retries <n>', 'Max retries on failure', '0')
+    .option('--retries <n>', 'Max retries on failure', String(DEFAULT_SEND_RETRIES))
+    .option('--retry-backoff <value>', 'Retry backoff in ms or strategy: constant|linear|exponential')
     .action(withGlobalOptions((globalFlags, options) => runSendFile(globalFlags, options)));
 
   const media = program.command('media').description('Download media');
@@ -2824,14 +2826,15 @@ async function runSendText(globalFlags, options = {}) {
   resolveSendAliases(options);
   const timeoutMs = globalFlags.timeoutMs;
   const method = 'sendText';
-  let retries = 0;
+  let retries = DEFAULT_SEND_RETRIES;
 
   try {
     return await runWithTimeout(async () => {
       if (!options.to) throw new Error('--to is required');
       if (!options.message) throw new Error('--message is required');
       const parseMode = parseSendParseMode(options.parseMode);
-      retries = parseNonNegativeInt(options.retries, '--retries') ?? 0;
+      retries = parseNonNegativeInt(options.retries, '--retries') ?? DEFAULT_SEND_RETRIES;
+      const retryBackoff = parseRetryBackoff(options.retryBackoff);
       const storeDir = resolveStoreDir();
       const release = acquireStoreLock(storeDir);
       const { telegramClient, messageSyncService } = createServices({ storeDir });
@@ -2855,8 +2858,8 @@ async function runSendText(globalFlags, options = {}) {
           {
             method,
             retries,
-            retryBackoff: parseRetryBackoff('exponential'),
-            sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+            retryBackoff,
+            sleep: (ms) => delay(ms),
           },
         );
         const payload = { channelId: options.to, ...result };
@@ -2883,7 +2886,7 @@ async function runSendPhoto(globalFlags, options = {}) {
   resolveSendAliases(options);
   const timeoutMs = globalFlags.timeoutMs;
   const method = 'sendPhoto';
-  let retries = DEFAULT_SEND_PHOTO_RETRIES;
+  let retries = DEFAULT_SEND_RETRIES;
 
   try {
     return await runWithTimeout(async () => {
@@ -2893,7 +2896,7 @@ async function runSendPhoto(globalFlags, options = {}) {
       if (parseMode && !(typeof options.caption === 'string' && options.caption.trim())) {
         throw new Error('--parse-mode requires --caption for send photo');
       }
-      retries = parseNonNegativeInt(options.retries, '--retries') ?? DEFAULT_SEND_PHOTO_RETRIES;
+      retries = parseNonNegativeInt(options.retries, '--retries') ?? DEFAULT_SEND_RETRIES;
       const retryBackoff = parseRetryBackoff(options.retryBackoff);
       const storeDir = resolveStoreDir();
       const release = acquireStoreLock(storeDir);
@@ -2948,7 +2951,7 @@ async function runSendFile(globalFlags, options = {}) {
   resolveSendAliases(options);
   const timeoutMs = globalFlags.timeoutMs;
   const method = 'sendFile';
-  let retries = 0;
+  let retries = DEFAULT_SEND_RETRIES;
 
   try {
     return await runWithTimeout(async () => {
@@ -2958,7 +2961,8 @@ async function runSendFile(globalFlags, options = {}) {
       if (parseMode && !(typeof options.caption === 'string' && options.caption.trim())) {
         throw new Error('--parse-mode requires --caption for send file');
       }
-      retries = parseNonNegativeInt(options.retries, '--retries') ?? 0;
+      retries = parseNonNegativeInt(options.retries, '--retries') ?? DEFAULT_SEND_RETRIES;
+      const retryBackoff = parseRetryBackoff(options.retryBackoff);
       const storeDir = resolveStoreDir();
       const release = acquireStoreLock(storeDir);
       const { telegramClient, messageSyncService } = createServices({ storeDir });
@@ -2986,8 +2990,8 @@ async function runSendFile(globalFlags, options = {}) {
           {
             method,
             retries,
-            retryBackoff: parseRetryBackoff('exponential'),
-            sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+            retryBackoff,
+            sleep: (ms) => delay(ms),
           },
         );
         const payload = { channelId: options.to, ...result };
