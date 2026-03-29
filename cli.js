@@ -4,13 +4,22 @@ import os from 'os';
 import path from 'path';
 import { spawn, spawnSync } from 'child_process';
 import { setTimeout as delay } from 'timers/promises';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import readline from 'readline';
 import { Command, Option } from 'commander';
 
 import { acquireStoreLock, acquireReadLock, readStoreLock } from './store-lock.js';
 import { loadConfig, normalizeConfig, saveConfig, validateConfig } from './core/config.js';
 import { createServices } from './core/services.js';
+import {
+  buildSendErrorPayload,
+  buildSendSuccessPayload,
+  classifySendError,
+  executeSendWithRetries,
+  formatSendErrorMessage,
+  parseRetryBackoff,
+  SendCommandError,
+} from './core/send-utils.js';
 import { resolveStoreDir } from './core/store.js';
 
 const CLI_PATH = fileURLToPath(import.meta.url);
@@ -25,6 +34,9 @@ const CONFIG_SPECS = [
   { key: 'mcp.host', path: ['mcp', 'host'], type: 'string' },
   { key: 'mcp.port', path: ['mcp', 'port'], type: 'number' },
 ];
+
+const SEND_PARSE_MODES = ['markdown', 'html', 'none'];
+const DEFAULT_SEND_RETRIES = 2;
 
 const CLI_PROGRAM = buildProgram();
 
@@ -225,22 +237,61 @@ function buildProgram() {
     .option('--after <n>', 'Messages after')
     .action(withGlobalOptions((globalFlags, options) => runMessagesContext(globalFlags, options)));
 
-  const send = program.command('send').description('Send text or files');
+  const send = program.command('send').description('Send text, photos, or files');
   send
     .command('text')
     .description('Send a text message')
     .option('--to <id|username>', 'Recipient id or username')
+    .addOption(new Option('--chat <id|username>', 'Alias for --to').hideHelp())
     .option('--message <text>', 'Message text')
+    .addOption(new Option('--text <text>', 'Alias for --message').hideHelp())
+    .option('--parse-mode <mode>', 'Parse mode: markdown|html|none')
     .option('--topic <id>', 'Forum topic id')
+    .option('--reply-to <id>', 'Reply to message id')
+    .option('--no-preview', 'Disable link preview')
+    .option('--silent', 'Send without notification sound')
+    .option('--no-forwards', 'Protect message from forwarding')
+    .option('--schedule <iso>', 'Schedule message (ISO 8601 datetime)')
+    .option('--retries <n>', 'Max retries on failure', String(DEFAULT_SEND_RETRIES))
+    .option('--retry-backoff <value>', 'Retry backoff in ms or strategy: constant|linear|exponential')
     .action(withGlobalOptions((globalFlags, options) => runSendText(globalFlags, options)));
+  send
+    .command('photo')
+    .description('Send a photo with preview')
+    .option('--to <id|username>', 'Recipient id or username')
+    .addOption(new Option('--chat <id|username>', 'Alias for --to').hideHelp())
+    .option('--photo <path>', 'Photo path')
+    .option('--caption <text>', 'Optional caption')
+    .option('--parse-mode <mode>', 'Parse mode for caption: markdown|html|none')
+    .option('--topic <id>', 'Forum topic id')
+    .option('--reply-to <id>', 'Reply to message id')
+    .option('--silent', 'Send without notification sound')
+    .option('--no-forwards', 'Protect message from forwarding')
+    .option('--caption-above', 'Show caption above media')
+    .option('--spoiler', 'Blur media until tapped')
+    .option('--schedule <iso>', 'Schedule message (ISO 8601 datetime)')
+    .option('--retries <n>', 'Max retries on failure', String(DEFAULT_SEND_RETRIES))
+    .option('--retry-backoff <value>', 'Retry backoff in ms or strategy: constant|linear|exponential')
+    .action(withGlobalOptions((globalFlags, options) => runSendPhoto(globalFlags, options)));
   send
     .command('file')
     .description('Send a file')
     .option('--to <id|username>', 'Recipient id or username')
+    .addOption(new Option('--chat <id|username>', 'Alias for --to').hideHelp())
     .option('--file <path>', 'File path')
     .option('--caption <text>', 'Optional caption')
+    .option('--parse-mode <mode>', 'Parse mode for caption: markdown|html|none')
     .option('--filename <name>', 'Override filename')
     .option('--topic <id>', 'Forum topic id')
+    .option('--reply-to <id>', 'Reply to message id')
+    .option('--silent', 'Send without notification sound')
+    .option('--no-forwards', 'Protect message from forwarding')
+    .option('--caption-above', 'Show caption above media')
+    .option('--spoiler', 'Blur media until tapped')
+    .option('--schedule <iso>', 'Schedule message (ISO 8601 datetime)')
+    .option('--force-document', 'Send as uncompressed document')
+    .option('--retries <n>', 'Max retries on failure', String(DEFAULT_SEND_RETRIES))
+    .option('--retry-backoff <value>', 'Retry backoff in ms or strategy: constant|linear|exponential')
     .action(withGlobalOptions((globalFlags, options) => runSendFile(globalFlags, options)));
 
   const media = program.command('media').description('Download media');
@@ -457,6 +508,14 @@ function writeJson(payload) {
 }
 
 function writeError(error, asJson) {
+  if (error instanceof SendCommandError) {
+    if (asJson) {
+      process.stderr.write(`${JSON.stringify(buildSendErrorPayload(error.details), null, 2)}\n`);
+    } else {
+      process.stderr.write(`${formatSendErrorMessage(error.details)}\n`);
+    }
+    return;
+  }
   const message = error?.message ?? String(error);
   if (asJson) {
     process.stderr.write(`${JSON.stringify({ ok: false, error: message })}\n`);
@@ -2709,74 +2768,250 @@ async function runMessagesContext(globalFlags, options = {}) {
   }, timeoutMs);
 }
 
-async function runSendText(globalFlags, options = {}) {
-  const timeoutMs = globalFlags.timeoutMs;
-  return runWithTimeout(async () => {
-    if (!options.to) {
-      throw new Error('--to is required');
-    }
-    if (!options.message) {
-      throw new Error('--message is required');
-    }
-    const storeDir = resolveStoreDir();
-    const release = acquireStoreLock(storeDir);
-    const { telegramClient, messageSyncService } = createServices({ storeDir });
-    try {
-      if (!(await telegramClient.isAuthorized().catch(() => false))) {
-        throw new Error('Not authenticated. Run `node cli.js auth` first.');
-      }
-      const topicId = parsePositiveInt(options.topic, '--topic');
-      const result = await telegramClient.sendTextMessage(options.to, options.message, { topicId });
-      const payload = { channelId: options.to, ...result };
+function parseSendParseMode(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const normalized = String(value).trim().toLowerCase();
+  if (!SEND_PARSE_MODES.includes(normalized)) {
+    throw new Error(`--parse-mode must be one of: ${SEND_PARSE_MODES.join(', ')}`);
+  }
+  return normalized;
+}
 
-      if (globalFlags.json) {
-        writeJson(payload);
-      } else {
-        console.log(`Message sent (${result.messageId}).`);
+function parseScheduleDate(value) {
+  if (value === undefined || value === null || value === '') return undefined;
+  const date = new Date(value);
+  if (isNaN(date.getTime())) throw new Error('--schedule must be a valid ISO 8601 datetime');
+  const now = Date.now();
+  if (date.getTime() < now) throw new Error('--schedule must be in the future');
+  if (date.getTime() > now + 365 * 24 * 60 * 60 * 1000) throw new Error('--schedule must be within 365 days from now');
+  return Math.floor(date.getTime() / 1000);
+}
+
+function resolveSendAliases(options) {
+  if (!options.to && options.chat) options.to = options.chat;
+  if (!options.message && options.text) options.message = options.text;
+}
+
+function normalizeSendCommandError(error, { method, retries, attempt = 1 } = {}) {
+  if (error instanceof SendCommandError) return error;
+  if (error instanceof TypeError || error instanceof ReferenceError || error instanceof SyntaxError || error instanceof RangeError) return error;
+  return new SendCommandError(classifySendError(error, { method, retries, attempt }));
+}
+
+function logSendRetry(details, globalFlags) {
+  if (globalFlags.json) {
+    process.stderr.write(`${JSON.stringify({ event: 'retry', type: details.type, method: details.method, message: details.message, attempt: details.attempt, retries: details.retries })}\n`);
+    return;
+  }
+  const totalAttempts = (details.retries ?? 0) + 1;
+  const codeSuffix = details.code !== undefined && details.code !== null && details.code !== ''
+    ? ` (${details.code})` : '';
+  process.stderr.write(
+    `${details.method} transient ${details.type} error on attempt ${details.attempt}/${totalAttempts}${codeSuffix}; retrying...\n`,
+  );
+}
+
+function buildSendPhotoSuccessPayload({ method, inputChatId, result, attempts }) {
+  return buildSendSuccessPayload({
+    method,
+    chatId: result?.chatId ?? inputChatId,
+    messageId: result?.messageId,
+    media: result?.media ?? { type: 'photo' },
+    attempts,
+    warning: result?.warning,
+  });
+}
+
+async function runSendText(globalFlags, options = {}) {
+  resolveSendAliases(options);
+  const timeoutMs = globalFlags.timeoutMs;
+  const method = 'sendText';
+  let retries = DEFAULT_SEND_RETRIES;
+
+  try {
+    return await runWithTimeout(async () => {
+      if (!options.to) throw new Error('--to is required');
+      if (!options.message) throw new Error('--message is required');
+      const parseMode = parseSendParseMode(options.parseMode);
+      retries = parseNonNegativeInt(options.retries, '--retries') ?? DEFAULT_SEND_RETRIES;
+      const retryBackoff = parseRetryBackoff(options.retryBackoff);
+      const storeDir = resolveStoreDir();
+      const release = acquireStoreLock(storeDir);
+      const { telegramClient, messageSyncService } = createServices({ storeDir });
+      try {
+        if (!(await telegramClient.isAuthorized().catch(() => false))) {
+          throw new Error('Not authenticated. Run `node cli.js auth` first.');
+        }
+        const topicId = parsePositiveInt(options.topic, '--topic');
+        const replyToMessageId = parsePositiveInt(options.replyTo, '--reply-to');
+        const scheduleDate = parseScheduleDate(options.schedule);
+        const { result, attempts } = await executeSendWithRetries(
+          () => telegramClient.sendTextMessage(options.to, options.message, {
+            topicId,
+            replyToMessageId,
+            parseMode,
+            noPreview: options.noPreview,
+            silent: options.silent || false,
+            noforwards: options.forwards === false,
+            scheduleDate,
+          }),
+          {
+            method,
+            retries,
+            retryBackoff,
+            sleep: (ms) => delay(ms),
+          },
+        );
+        const payload = { channelId: options.to, ...result };
+        if (attempts > 1) {
+          payload.attempts = attempts;
+        }
+        if (globalFlags.json) {
+          writeJson(payload);
+        } else {
+          console.log(`Message sent (${result.messageId}).`);
+        }
+      } finally {
+        await messageSyncService.shutdown();
+        await telegramClient.destroy();
+        release();
       }
-    } finally {
-      await messageSyncService.shutdown();
-      await telegramClient.destroy();
-      release();
-    }
-  }, timeoutMs);
+    }, timeoutMs);
+  } catch (error) {
+    throw normalizeSendCommandError(error, { method, retries });
+  }
+}
+
+async function runSendPhoto(globalFlags, options = {}) {
+  resolveSendAliases(options);
+  const timeoutMs = globalFlags.timeoutMs;
+  const method = 'sendPhoto';
+  let retries = DEFAULT_SEND_RETRIES;
+
+  try {
+    return await runWithTimeout(async () => {
+      if (!options.to) throw new Error('--to is required');
+      if (!options.photo) throw new Error('--photo is required');
+      const parseMode = parseSendParseMode(options.parseMode);
+      if (parseMode && !(typeof options.caption === 'string' && options.caption.trim())) {
+        throw new Error('--parse-mode requires --caption for send photo');
+      }
+      retries = parseNonNegativeInt(options.retries, '--retries') ?? DEFAULT_SEND_RETRIES;
+      const retryBackoff = parseRetryBackoff(options.retryBackoff);
+      const storeDir = resolveStoreDir();
+      const release = acquireStoreLock(storeDir);
+      const { telegramClient, messageSyncService } = createServices({ storeDir });
+      try {
+        if (!(await telegramClient.isAuthorized().catch(() => false))) {
+          throw new Error('Not authenticated. Run `node cli.js auth` first.');
+        }
+        const topicId = parsePositiveInt(options.topic, '--topic');
+        const replyToMessageId = parsePositiveInt(options.replyTo, '--reply-to');
+        const scheduleDate = parseScheduleDate(options.schedule);
+        const sendOptions = {
+          caption: options.caption,
+          topicId,
+          replyToMessageId,
+          parseMode,
+          silent: options.silent || false,
+          noforwards: options.forwards === false,
+          captionAbove: options.captionAbove || false,
+          spoiler: options.spoiler || false,
+          scheduleDate,
+        };
+        const prepared = await telegramClient.preparePhotoMessage(options.to, options.photo, sendOptions);
+        const { result, attempts } = await executeSendWithRetries(
+          () => telegramClient.sendPreparedPhotoMessage(prepared),
+          {
+            method,
+            retries,
+            retryBackoff,
+            timeoutMs,
+            sleep: (ms) => delay(ms),
+            onRetry: (details) => logSendRetry(details, globalFlags),
+          },
+        );
+        if (globalFlags.json) {
+          writeJson(buildSendPhotoSuccessPayload({ method, inputChatId: options.to, result, attempts }));
+        } else {
+          console.log(`Photo sent (${result.messageId}).`);
+        }
+      } finally {
+        await messageSyncService.shutdown();
+        await telegramClient.destroy();
+        release();
+      }
+    }, timeoutMs);
+  } catch (error) {
+    throw normalizeSendCommandError(error, { method, retries });
+  }
 }
 
 async function runSendFile(globalFlags, options = {}) {
+  resolveSendAliases(options);
   const timeoutMs = globalFlags.timeoutMs;
-  return runWithTimeout(async () => {
-    if (!options.to) {
-      throw new Error('--to is required');
-    }
-    if (!options.file) {
-      throw new Error('--file is required');
-    }
-    const storeDir = resolveStoreDir();
-    const release = acquireStoreLock(storeDir);
-    const { telegramClient, messageSyncService } = createServices({ storeDir });
-    try {
-      if (!(await telegramClient.isAuthorized().catch(() => false))) {
-        throw new Error('Not authenticated. Run `node cli.js auth` first.');
-      }
-      const topicId = parsePositiveInt(options.topic, '--topic');
-      const result = await telegramClient.sendFileMessage(options.to, options.file, {
-        caption: options.caption,
-        filename: options.filename,
-        topicId,
-      });
-      const payload = { channelId: options.to, ...result };
+  const method = 'sendFile';
+  let retries = DEFAULT_SEND_RETRIES;
 
-      if (globalFlags.json) {
-        writeJson(payload);
-      } else {
-        console.log(`File sent (${result.messageId}).`);
+  try {
+    return await runWithTimeout(async () => {
+      if (!options.to) throw new Error('--to is required');
+      if (!options.file) throw new Error('--file is required');
+      const parseMode = parseSendParseMode(options.parseMode);
+      if (parseMode && !(typeof options.caption === 'string' && options.caption.trim())) {
+        throw new Error('--parse-mode requires --caption for send file');
       }
-    } finally {
-      await messageSyncService.shutdown();
-      await telegramClient.destroy();
-      release();
-    }
-  }, timeoutMs);
+      retries = parseNonNegativeInt(options.retries, '--retries') ?? DEFAULT_SEND_RETRIES;
+      const retryBackoff = parseRetryBackoff(options.retryBackoff);
+      const storeDir = resolveStoreDir();
+      const release = acquireStoreLock(storeDir);
+      const { telegramClient, messageSyncService } = createServices({ storeDir });
+      try {
+        if (!(await telegramClient.isAuthorized().catch(() => false))) {
+          throw new Error('Not authenticated. Run `node cli.js auth` first.');
+        }
+        const topicId = parsePositiveInt(options.topic, '--topic');
+        const replyToMessageId = parsePositiveInt(options.replyTo, '--reply-to');
+        const scheduleDate = parseScheduleDate(options.schedule);
+        const { result, attempts } = await executeSendWithRetries(
+          () => telegramClient.sendFileMessage(options.to, options.file, {
+            caption: options.caption,
+            filename: options.filename,
+            topicId,
+            replyToMessageId,
+            parseMode,
+            silent: options.silent || false,
+            noforwards: options.forwards === false,
+            captionAbove: options.captionAbove || false,
+            spoiler: options.spoiler || false,
+            scheduleDate,
+            forceDocument: options.forceDocument || false,
+          }),
+          {
+            method,
+            retries,
+            retryBackoff,
+            sleep: (ms) => delay(ms),
+          },
+        );
+        const payload = { channelId: options.to, ...result };
+        if (attempts > 1) {
+          payload.attempts = attempts;
+        }
+        if (globalFlags.json) {
+          writeJson(payload);
+        } else {
+          console.log(`File sent (${result.messageId}).`);
+        }
+      } finally {
+        await messageSyncService.shutdown();
+        await telegramClient.destroy();
+        release();
+      }
+    }, timeoutMs);
+  } catch (error) {
+    throw normalizeSendCommandError(error, { method, retries });
+  }
 }
 
 async function runMediaDownload(globalFlags, options = {}) {
@@ -3574,8 +3809,40 @@ async function runGroupsLeave(globalFlags, options = {}) {
   }, timeoutMs);
 }
 
+function isCliEntrypoint(argvPath = process.argv[1]) {
+  if (!argvPath) return false;
+  try {
+    return pathToFileURL(fs.realpathSync(argvPath)).href === import.meta.url;
+  } catch (error) {
+    return pathToFileURL(path.resolve(argvPath)).href === import.meta.url;
+  }
+}
+
+function shouldRunMain(entryPath = process.argv[1]) {
+  if (!entryPath) return false;
+  try {
+    return fs.realpathSync(entryPath) === CLI_PATH;
+  } catch (error) {
+    return path.resolve(entryPath) === CLI_PATH;
+  }
+}
+
 async function main() {
   await CLI_PROGRAM.parseAsync(process.argv);
 }
 
-await main();
+export {
+  buildProgram,
+  buildSendPhotoSuccessPayload,
+  isCliEntrypoint,
+  logSendRetry,
+  main,
+  normalizeSendCommandError,
+  parseNonNegativeInt,
+  shouldRunMain,
+  writeError,
+};
+
+if (isCliEntrypoint()) {
+  await main();
+}
