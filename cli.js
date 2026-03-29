@@ -464,12 +464,100 @@ function buildProgram() {
     .option('--chat <id|username>', 'Group identifier')
     .action(withGlobalOptions((globalFlags, options) => runGroupsLeave(globalFlags, options)));
 
+  // --- Folders ---
+  const folders = program.command('folders').description('Chat folder management');
+  folders
+    .command('list')
+    .description('List all folders')
+    .action(withGlobalOptions((globalFlags) => runFoldersList(globalFlags)));
+  folders
+    .command('show')
+    .description('Show folder details')
+    .argument('<folder>', 'Folder ID or title')
+    .option('--resolve', 'Resolve peer IDs to names (slower, requires API calls)')
+    .action(withGlobalOptions((globalFlags, folder, opts) => runFoldersShow(globalFlags, folder, opts)));
+  folders
+    .command('create')
+    .description('Create a new folder')
+    .requiredOption('--title <name>', 'Folder name (max 12 chars)')
+    .option('--emoji <emoji>', 'Emoji icon')
+    .option('--include-contacts', 'Include contacts')
+    .option('--include-non-contacts', 'Include non-contacts')
+    .option('--include-groups', 'Include groups')
+    .option('--include-channels', 'Include channels')
+    .option('--include-bots', 'Include bots')
+    .option('--exclude-muted', 'Exclude muted')
+    .option('--exclude-read', 'Exclude read')
+    .option('--exclude-archived', 'Exclude archived')
+    .option('--chat <id>', 'Chat to include (repeatable)', collectOption, [])
+    .option('--exclude-chat <id>', 'Chat to exclude (repeatable)', collectOption, [])
+    .option('--pin-chat <id>', 'Pin chat in folder (repeatable)', collectOption, [])
+    .action(withGlobalOptions((globalFlags, options) => runFoldersCreate(globalFlags, options)));
+  folders
+    .command('edit')
+    .description('Edit an existing folder')
+    .argument('<folder>', 'Folder ID or title')
+    .option('--title <name>', 'Folder name (max 12 chars)')
+    .option('--emoji <emoji>', 'Emoji icon')
+    .option('--include-contacts', 'Include contacts')
+    .option('--no-include-contacts', 'Do not include contacts')
+    .option('--include-non-contacts', 'Include non-contacts')
+    .option('--no-include-non-contacts', 'Do not include non-contacts')
+    .option('--include-groups', 'Include groups')
+    .option('--no-include-groups', 'Do not include groups')
+    .option('--include-channels', 'Include channels')
+    .option('--no-include-channels', 'Do not include channels')
+    .option('--include-bots', 'Include bots')
+    .option('--no-include-bots', 'Do not include bots')
+    .option('--exclude-muted', 'Exclude muted')
+    .option('--no-exclude-muted', 'Do not exclude muted')
+    .option('--exclude-read', 'Exclude read')
+    .option('--no-exclude-read', 'Do not exclude read')
+    .option('--exclude-archived', 'Exclude archived')
+    .option('--no-exclude-archived', 'Do not exclude archived')
+    .option('--chat <id>', 'Chat to include (repeatable)', collectOption, [])
+    .option('--exclude-chat <id>', 'Chat to exclude (repeatable)', collectOption, [])
+    .option('--pin-chat <id>', 'Pin chat in folder (repeatable)', collectOption, [])
+    .action(withGlobalOptions((globalFlags, folder, options) => runFoldersEdit(globalFlags, folder, options)));
+  folders
+    .command('delete')
+    .description('Delete a folder')
+    .argument('<folder>', 'Folder ID or title')
+    .action(withGlobalOptions((globalFlags, folder) => runFoldersDelete(globalFlags, folder)));
+  folders
+    .command('reorder')
+    .description('Reorder folders')
+    .requiredOption('--ids <id1,id2,...>', 'Comma-separated folder IDs in desired order')
+    .action(withGlobalOptions((globalFlags, options) => runFoldersReorder(globalFlags, options)));
+  const foldersChats = folders.command('chats').description('Manage chats in a folder');
+  foldersChats
+    .command('add')
+    .description('Add chat to folder')
+    .argument('<folder>', 'Folder ID or title')
+    .requiredOption('--chat <chatId>', 'Chat identifier')
+    .action(withGlobalOptions((globalFlags, folder, options) => runFoldersChatsAdd(globalFlags, folder, options)));
+  foldersChats
+    .command('remove')
+    .description('Remove chat from folder')
+    .argument('<folder>', 'Folder ID or title')
+    .requiredOption('--chat <chatId>', 'Chat identifier')
+    .action(withGlobalOptions((globalFlags, folder, options) => runFoldersChatsRemove(globalFlags, folder, options)));
+  folders
+    .command('join')
+    .description('Join shared folder via invite link')
+    .argument('<link>', 'Shared folder invite link')
+    .action(withGlobalOptions((globalFlags, link) => runFoldersJoin(globalFlags, link)));
+
   disableHelpCommand(program);
   program.addHelpText('after', '\nUse "tgcli [command] --help" for more information about a command.');
   program.action(() => {
     program.help();
   });
   return program;
+}
+
+function collectOption(value, previous) {
+  return previous.concat([value]);
 }
 
 function disableHelpCommand(command) {
@@ -3800,6 +3888,298 @@ async function runGroupsLeave(globalFlags, options = {}) {
         writeJson({ channelId: options.chat, left: true });
       } else {
         console.log(`Left ${options.chat}`);
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+// --- Folders handlers ---
+
+async function runFoldersList(globalFlags) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    const storeDir = resolveStoreDir();
+    const release = acquireReadLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `tgcli auth` first.');
+      }
+      const folders = await telegramClient.getFolders();
+      if (globalFlags.json) {
+        writeJson(folders);
+      } else {
+        for (const f of folders) {
+          console.log(`${f.title} (id=${f.id}, type=${f.type})`);
+        }
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runFoldersShow(globalFlags, folder, opts = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    const storeDir = resolveStoreDir();
+    const release = acquireReadLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `tgcli auth` first.');
+      }
+      const info = await telegramClient.showFolder(folder, { resolve: opts.resolve });
+      if (globalFlags.json) {
+        writeJson(info);
+      } else {
+        console.log(`${info.title} (id=${info.id}, type=${info.type})`);
+        if (info.emoji) console.log(`  emoji: ${info.emoji}`);
+        const flags = ['contacts', 'nonContacts', 'groups', 'broadcasts', 'bots'].filter((f) => info[f]);
+        if (flags.length) console.log(`  includes: ${flags.join(', ')}`);
+        const excludes = ['excludeMuted', 'excludeRead', 'excludeArchived'].filter((f) => info[f]);
+        if (excludes.length) console.log(`  excludes: ${excludes.join(', ')}`);
+
+        if (opts.resolve) {
+          const printResolvedPeers = (peers, label) => {
+            if (!peers?.length) return;
+            if (label) console.log(`  ${label}:`);
+            const indent = label ? '    ' : '  ';
+            const grouped = {};
+            for (const p of peers) {
+              const group = p.type + 's';
+              if (!grouped[group]) grouped[group] = [];
+              const displayName = p.name ?? p.title ?? '(unresolved)';
+              grouped[group].push(`${displayName} (${p.id})`);
+            }
+            for (const [group, items] of Object.entries(grouped)) {
+              console.log(`${indent}${group}:`);
+              for (const item of items) console.log(`${indent}  - ${item}`);
+            }
+          };
+          printResolvedPeers(info.includePeers);
+          printResolvedPeers(info.excludePeers, 'excluded');
+          printResolvedPeers(info.pinnedPeers, 'pinned');
+        } else {
+          const printPeers = (peers, label) => {
+            if (!peers?.length) {
+              console.log(`  ${label}: (none)`);
+              return;
+            }
+            console.log(`  ${label}:`);
+            for (const p of peers) console.log(`    - ${p.type}:${p.id}`);
+          };
+          printPeers(info.includePeers, 'includePeers');
+          printPeers(info.excludePeers, 'excludePeers');
+          printPeers(info.pinnedPeers, 'pinnedPeers');
+        }
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runFoldersCreate(globalFlags, options) {
+  if (!options.title || options.title.length > 12) throw new Error('Folder title must be 1-12 characters');
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `tgcli auth` first.');
+      }
+      const result = await telegramClient.createFolder({
+        title: options.title,
+        emoji: options.emoji,
+        contacts: options.includeContacts,
+        nonContacts: options.includeNonContacts,
+        groups: options.includeGroups,
+        broadcasts: options.includeChannels,
+        bots: options.includeBots,
+        excludeMuted: options.excludeMuted,
+        excludeRead: options.excludeRead,
+        excludeArchived: options.excludeArchived,
+        includePeers: options.chat?.length ? options.chat : undefined,
+        excludePeers: options.excludeChat?.length ? options.excludeChat : undefined,
+        pinnedPeers: options.pinChat?.length ? options.pinChat : undefined,
+      });
+      if (globalFlags.json) {
+        writeJson(result);
+      } else {
+        console.log(`Created folder: ${result.title} (id=${result.id})`);
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runFoldersEdit(globalFlags, folder, options) {
+  if (options.title !== undefined && (options.title.length === 0 || options.title.length > 12)) throw new Error('Folder title must be 1-12 characters');
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `tgcli auth` first.');
+      }
+      const modification = {};
+      if (options.title !== undefined) modification.title = options.title;
+      if (options.emoji !== undefined) modification.emoji = options.emoji;
+      if (options.includeContacts !== undefined) modification.contacts = options.includeContacts;
+      if (options.includeNonContacts !== undefined) modification.nonContacts = options.includeNonContacts;
+      if (options.includeGroups !== undefined) modification.groups = options.includeGroups;
+      if (options.includeChannels !== undefined) modification.broadcasts = options.includeChannels;
+      if (options.includeBots !== undefined) modification.bots = options.includeBots;
+      if (options.excludeMuted !== undefined) modification.excludeMuted = options.excludeMuted;
+      if (options.excludeRead !== undefined) modification.excludeRead = options.excludeRead;
+      if (options.excludeArchived !== undefined) modification.excludeArchived = options.excludeArchived;
+      if (options.chat?.length) modification.includePeers = options.chat;
+      if (options.excludeChat?.length) modification.excludePeers = options.excludeChat;
+      if (options.pinChat?.length) modification.pinnedPeers = options.pinChat;
+      const result = await telegramClient.editFolder(folder, modification);
+      if (globalFlags.json) {
+        writeJson(result);
+      } else {
+        console.log(`Updated folder: ${result.title} (id=${result.id})`);
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runFoldersDelete(globalFlags, folder) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `tgcli auth` first.');
+      }
+      const result = await telegramClient.deleteFolder(folder);
+      if (globalFlags.json) {
+        writeJson(result);
+      } else {
+        console.log(`Deleted folder id=${result.id}`);
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runFoldersReorder(globalFlags, options) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `tgcli auth` first.');
+      }
+      const ids = options.ids.split(',').map((s) => s.trim()).filter((s) => s !== '').map(Number);
+      const result = await telegramClient.setFoldersOrder(ids);
+      if (globalFlags.json) {
+        writeJson(result);
+      } else {
+        console.log('Folders reordered');
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runFoldersChatsAdd(globalFlags, folder, options) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.chat) throw new Error('--chat is required');
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `tgcli auth` first.');
+      }
+      const result = await telegramClient.addChatToFolder(folder, options.chat);
+      if (globalFlags.json) {
+        writeJson(result);
+      } else {
+        console.log(`Chat added to folder id=${result.folderId}`);
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runFoldersChatsRemove(globalFlags, folder, options) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    if (!options.chat) throw new Error('--chat is required');
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `tgcli auth` first.');
+      }
+      const result = await telegramClient.removeChatFromFolder(folder, options.chat);
+      if (globalFlags.json) {
+        writeJson(result);
+      } else {
+        console.log(`Chat removed from folder id=${result.folderId}`);
+      }
+    } finally {
+      await messageSyncService.shutdown();
+      await telegramClient.destroy();
+      release();
+    }
+  }, timeoutMs);
+}
+
+async function runFoldersJoin(globalFlags, link) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    const { telegramClient, messageSyncService } = createServices({ storeDir });
+    try {
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `tgcli auth` first.');
+      }
+      const result = await telegramClient.joinChatlist(link);
+      if (globalFlags.json) {
+        writeJson(result);
+      } else {
+        console.log(`Joined folder: ${result.title} (id=${result.id})`);
       }
     } finally {
       await messageSyncService.shutdown();

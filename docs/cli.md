@@ -129,3 +129,16 @@ Legacy `--offset-id` is accepted as a hidden alias for `--before-id`.
 - groups invite revoke --chat <id>
 - groups join --code <invite-code>
 - groups leave --chat <id>
+
+## folders
+- folders list
+- folders show <folder> [--resolve]
+- folders create --title <name> [--emoji] [--include-contacts] [--include-non-contacts] [--include-groups] [--include-channels] [--include-bots] [--exclude-muted] [--exclude-read] [--exclude-archived] [--chat <id>...] [--exclude-chat <id>...] [--pin-chat <id>...]
+- folders edit <folder> [--title] [--emoji] [flags...] [--chat <id>...] [--exclude-chat <id>...] [--pin-chat <id>...]
+- folders delete <folder>
+- folders reorder --ids <id1,id2,...>
+- folders chats add <folder> --chat <id>
+- folders chats remove <folder> --chat <id>
+- folders join <link>
+
+`<folder>` can be a numeric folder ID or folder title.
