@@ -9,6 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -19,9 +20,7 @@ jobs:
       - run: npm test
       - name: Verify tag matches package version
         run: node -e "const fs=require('fs');const pkg=JSON.parse(fs.readFileSync('package.json','utf8'));const tag=(process.env.GITHUB_REF_NAME||'').replace(/^v/,'');if(!tag){throw new Error('Missing release tag');}if(pkg.version!==tag){throw new Error(`Tag ${tag} does not match package.json ${pkg.version}`);}"
-      - run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: npm publish --access public --provenance
 
   update-brew:
     needs: publish-npm
