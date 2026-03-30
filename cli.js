@@ -30,6 +30,7 @@ const CONFIG_SPECS = [
   { key: 'apiId', path: ['apiId'], type: 'number' },
   { key: 'apiHash', path: ['apiHash'], type: 'string', secret: true },
   { key: 'phoneNumber', path: ['phoneNumber'], type: 'string' },
+  { key: 'feedback.chatId', path: ['feedback', 'chatId'], type: 'string' },
   { key: 'mcp.enabled', path: ['mcp', 'enabled'], type: 'boolean' },
   { key: 'mcp.host', path: ['mcp', 'host'], type: 'string' },
   { key: 'mcp.port', path: ['mcp', 'port'], type: 'number' },
@@ -37,6 +38,9 @@ const CONFIG_SPECS = [
 
 const SEND_PARSE_MODES = ['markdown', 'html', 'none'];
 const DEFAULT_SEND_RETRIES = 2;
+const FEEDBACK_LAST_FILE = 'feedback-last.json';
+const FEEDBACK_COOLDOWN_MS = 60 * 1000;
+const FEEDBACK_DEFAULT_CHAT_ID = '@kfastov';
 
 const CLI_PROGRAM = buildProgram();
 
@@ -87,6 +91,15 @@ function buildProgram() {
     .description('Unset a config value')
     .argument('<key>', 'Config key')
     .action(withGlobalOptions((globalFlags, key) => runConfigUnset(globalFlags, key)));
+
+  program
+    .command('feedback')
+    .description('Send feedback to the maintainer')
+    .argument('<message...>', 'Feedback message')
+
+    .action(withGlobalOptions((globalFlags, messageParts, options) =>
+      runFeedback(globalFlags, messageParts, options),
+    ));
 
   const sync = program.command('sync').description('Archive backfill and realtime sync');
   sync
@@ -791,6 +804,53 @@ function parseConfigValue(spec, rawValue) {
     return parseNumberValue(rawValue, spec.key);
   }
   return parseStringValue(rawValue, spec.key);
+}
+
+
+
+function getFeedbackRateLimitPath(storeDir) {
+  return path.join(storeDir, FEEDBACK_LAST_FILE);
+}
+
+function readFeedbackLastSentAt(storeDir) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(getFeedbackRateLimitPath(storeDir), 'utf8'));
+    const timestamp = Number(raw?.lastFeedbackAt);
+    return Number.isFinite(timestamp) && timestamp > 0 ? timestamp : null;
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error instanceof SyntaxError) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function getFeedbackCooldownRemainingSeconds(storeDir, now = Date.now()) {
+  const lastFeedbackAt = readFeedbackLastSentAt(storeDir);
+  if (!lastFeedbackAt) {
+    return 0;
+  }
+  const remainingMs = lastFeedbackAt + FEEDBACK_COOLDOWN_MS - now;
+  return remainingMs > 0 ? Math.ceil(remainingMs / 1000) : 0;
+}
+
+function writeFeedbackLastSentAt(storeDir, timestamp = Date.now()) {
+  const payload = { lastFeedbackAt: timestamp };
+  fs.mkdirSync(storeDir, { recursive: true });
+  fs.writeFileSync(
+    getFeedbackRateLimitPath(storeDir),
+    `${JSON.stringify(payload, null, 2)}\n`,
+    'utf8',
+  );
+  return timestamp;
+}
+
+function formatFeedbackMessage(messageText, metadata = {}) {
+  const version = metadata.version ?? readVersion();
+  const platform = metadata.platform ?? process.platform;
+  const nodeVersion = metadata.nodeVersion ?? process.version;
+  const normalizedMessage = parseStringValue(messageText, 'Feedback message');
+  return `💬 tgcli feedback\n\n${normalizedMessage}\n\n---\ntgcli v${version} | ${platform} | ${nodeVersion}`;
 }
 
 function runCommand(command, args, options = {}) {
@@ -1511,6 +1571,61 @@ async function runConfigUnset(globalFlags, key) {
     return;
   }
   console.log(`Cleared ${spec.key}.`);
+}
+
+async function runFeedback(globalFlags, messageParts, options = {}) {
+  const timeoutMs = globalFlags.timeoutMs;
+  return runWithTimeout(async () => {
+    const storeDir = resolveStoreDir();
+    const release = acquireStoreLock(storeDir);
+    let telegramClient = null;
+    let messageSyncService = null;
+
+    try {
+      const { config } = loadConfig(storeDir);
+      const normalizedConfig = normalizeConfig(config ?? {});
+      const chatId = normalizedConfig.feedback?.chatId || FEEDBACK_DEFAULT_CHAT_ID;
+
+            const remainingSeconds = getFeedbackCooldownRemainingSeconds(storeDir);
+      if (remainingSeconds > 0) {
+        throw new Error(`Please wait ${remainingSeconds} seconds before sending another feedback.`);
+      }
+
+      ({ telegramClient, messageSyncService } = createServices({
+        storeDir,
+        config: normalizedConfig,
+      }));
+
+      if (!(await telegramClient.isAuthorized().catch(() => false))) {
+        throw new Error('Not authenticated. Run `tgcli auth` first.');
+      }
+
+      const feedbackText = formatFeedbackMessage(
+        Array.isArray(messageParts) ? messageParts.join(' ') : String(messageParts ?? ''),
+      );
+      const result = await telegramClient.sendTextMessage(chatId, feedbackText, {
+        parseMode: 'none',
+      });
+      writeFeedbackLastSentAt(storeDir);
+
+      if (globalFlags.json) {
+        writeJson({
+          ok: true,
+          messageId: result?.messageId ?? null,
+        });
+      } else {
+        console.log(`Feedback sent (${result?.messageId ?? 'unknown'}).`);
+      }
+    } finally {
+      if (messageSyncService) {
+        await messageSyncService.shutdown();
+      }
+      if (telegramClient) {
+        await telegramClient.destroy();
+      }
+      release();
+    }
+  }, timeoutMs);
 }
 
 async function runSync(globalFlags, options = {}) {
@@ -4214,13 +4329,17 @@ async function main() {
 export {
   buildProgram,
   buildSendPhotoSuccessPayload,
+  formatFeedbackMessage,
+  getFeedbackCooldownRemainingSeconds,
   isCliEntrypoint,
   logSendRetry,
   main,
   normalizeSendCommandError,
   parseNonNegativeInt,
+  runFeedback,
   shouldRunMain,
   writeError,
+  writeFeedbackLastSentAt,
 };
 
 if (isCliEntrypoint()) {

@@ -42,6 +42,7 @@ export function normalizeConfig(raw = {}) {
   const apiHash = normalizeValue(raw.apiHash ?? raw.api_hash);
   const phoneNumber = normalizeValue(raw.phoneNumber ?? raw.phone ?? raw.phone_number);
   const mcpRaw = raw.mcp && typeof raw.mcp === 'object' ? raw.mcp : {};
+  const feedbackRaw = raw.feedback && typeof raw.feedback === 'object' ? raw.feedback : {};
   const mcpEnabled = normalizeBoolean(raw.mcpEnabled ?? raw.mcp_enabled ?? mcpRaw.enabled, false);
   const mcp = {
     enabled: mcpEnabled,
@@ -55,12 +56,19 @@ export function normalizeConfig(raw = {}) {
   if (Number.isFinite(mcpPort) && mcpPort > 0) {
     mcp.port = mcpPort;
   }
-  return {
+  const feedbackChatId = normalizeValue(
+    feedbackRaw.chatId ?? raw.feedbackChatId ?? raw.feedback_chat_id,
+  );
+  const normalized = {
     apiId,
     apiHash,
     phoneNumber,
     mcp,
   };
+  if (feedbackChatId) {
+    normalized.feedback = { chatId: feedbackChatId };
+  }
+  return normalized;
 }
 
 export function validateConfig(config) {
