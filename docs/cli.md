@@ -12,8 +12,8 @@ MCP: disabled by default (set `mcp.enabled` in config.json to true to serve MCP)
 
 ## auth
 - auth
-  - Interactive login (Telegram MTProto), then bootstrap sync.
-  - Flags: --follow, --idle-exit 30s, --download-media
+  - Interactive login (Telegram MTProto). By default this only authenticates; use `--follow` to continue into realtime sync.
+  - Flags: --follow, --qr, --force-sms
 - auth status
 - auth logout
 

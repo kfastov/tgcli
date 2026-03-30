@@ -9,7 +9,7 @@ const DEFAULT_BATCH_SIZE = 100;
 const DEFAULT_INTER_JOB_DELAY_MS = 3000;
 const DEFAULT_INTER_BATCH_DELAY_MS = 1200;
 
-export function createServices(options = {}) {
+function resolveRuntimePaths(options = {}) {
   const resolvedStoreDir = options.storeDir ? path.resolve(options.storeDir) : null;
   if (!resolvedStoreDir && (!options.sessionPath || !options.dbPath)) {
     throw new Error('storeDir is required when sessionPath or dbPath are not provided.');
@@ -23,6 +23,14 @@ export function createServices(options = {}) {
     throw new Error('sessionPath and dbPath are required.');
   }
 
+  return {
+    resolvedStoreDir,
+    sessionPath,
+    dbPath,
+  };
+}
+
+function resolveValidatedConfig(options = {}, resolvedStoreDir = null) {
   const loadedConfig = options.config ?? (resolvedStoreDir ? loadConfig(resolvedStoreDir).config : null);
   const config = normalizeConfig(loadedConfig ?? {});
   const missing = validateConfig(config);
@@ -30,13 +38,35 @@ export function createServices(options = {}) {
     throw new Error('Missing tgcli configuration. Run "tgcli auth" to set credentials.');
   }
 
+  return config;
+}
+
+export function createTelegramClient(options = {}) {
+  const { resolvedStoreDir, sessionPath } = resolveRuntimePaths(options);
+  const config = resolveValidatedConfig(options, resolvedStoreDir);
+
   const telegramClient = new TelegramClient(
     config.apiId,
     config.apiHash,
     config.phoneNumber,
     sessionPath,
+    {
+      forceSms: options.forceSms ?? false,
+      useQr: options.useQr ?? false,
+      disableUpdates: options.disableUpdates ?? false,
+    },
   );
 
+  return {
+    storeDir: resolvedStoreDir,
+    sessionPath,
+    config,
+    telegramClient,
+  };
+}
+
+export function createMessageSyncService(telegramClient, options = {}) {
+  const { resolvedStoreDir, dbPath } = resolveRuntimePaths(options);
   const messageSyncService = new MessageSyncService(telegramClient, {
     dbPath,
     batchSize: options.batchSize ?? DEFAULT_BATCH_SIZE,
@@ -46,6 +76,34 @@ export function createServices(options = {}) {
 
   return {
     storeDir: resolvedStoreDir,
+    dbPath,
+    messageSyncService,
+  };
+}
+
+export function createServices(options = {}) {
+  const { resolvedStoreDir, sessionPath, dbPath } = resolveRuntimePaths(options);
+  const config = resolveValidatedConfig(options, resolvedStoreDir);
+  const { telegramClient } = createTelegramClient({
+    ...options,
+    storeDir: resolvedStoreDir,
+    sessionPath,
+    dbPath,
+    config,
+  });
+
+  const { messageSyncService } = createMessageSyncService(telegramClient, {
+    ...options,
+    storeDir: resolvedStoreDir,
+    sessionPath,
+    dbPath,
+  });
+
+  return {
+    storeDir: resolvedStoreDir,
+    sessionPath,
+    dbPath,
+    config,
     telegramClient,
     messageSyncService,
   };

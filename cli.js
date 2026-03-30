@@ -10,7 +10,7 @@ import { Command, Option } from 'commander';
 
 import { acquireStoreLock, acquireReadLock, readStoreLock } from './store-lock.js';
 import { loadConfig, normalizeConfig, saveConfig, validateConfig } from './core/config.js';
-import { createServices } from './core/services.js';
+import { createMessageSyncService, createServices, createTelegramClient } from './core/services.js';
 import {
   buildSendErrorPayload,
   buildSendSuccessPayload,
@@ -26,6 +26,7 @@ const CLI_PATH = fileURLToPath(import.meta.url);
 const SERVICE_STATE_FILE = 'service-state.json';
 const LAUNCHD_LABEL = 'com.kfastov.tgcli';
 const SYSTEMD_SERVICE_NAME = 'tgcli';
+const AUTH_SYNC_HINT = 'Run `tgcli sync --once` or `tgcli sync --follow` when you need archive data.';
 const CONFIG_SPECS = [
   { key: 'apiId', path: ['apiId'], type: 'number' },
   { key: 'apiHash', path: ['apiHash'], type: 'string', secret: true },
@@ -58,6 +59,8 @@ function buildProgram() {
   const auth = program.command('auth').description('Authentication and session setup');
   auth
     .option('--follow', 'Continue syncing after login')
+    .option('--force-sms', 'Force SMS code delivery instead of in-app')
+    .option('--qr', 'Use QR-code login flow instead of confirmation code')
     .action(withGlobalOptions((globalFlags, options) =>
       runAuthLogin(globalFlags, options),
     ));
@@ -1462,42 +1465,72 @@ async function runAuthLogout(globalFlags) {
 
 async function runAuthLogin(globalFlags, options = {}) {
   const timeoutMs = globalFlags.timeoutMs;
+  let release = null;
+  let telegramClient = null;
+  let messageSyncService = null;
+  let keepRunning = false;
+  const cleanup = async () => {
+    if (messageSyncService) {
+      const currentService = messageSyncService;
+      messageSyncService = null;
+      await currentService.shutdown();
+    }
+    if (telegramClient) {
+      const currentClient = telegramClient;
+      telegramClient = null;
+      await currentClient.destroy();
+    }
+    if (release) {
+      const currentRelease = release;
+      release = null;
+      currentRelease();
+    }
+  };
   return runWithTimeout(async () => {
     const storeDir = resolveStoreDir();
-    const release = acquireStoreLock(storeDir);
     const config = await ensureStoreConfig(storeDir);
-    const { telegramClient, messageSyncService } = createServices({ storeDir, config });
+    release = acquireStoreLock(storeDir);
     try {
+      ({ telegramClient } = createTelegramClient({
+        storeDir,
+        config,
+        forceSms: options.forceSms,
+        useQr: options.qr,
+        disableUpdates: !options.follow,
+      }));
       const loginSuccess = await telegramClient.login();
       if (!loginSuccess) {
         throw new Error('Failed to login to Telegram.');
       }
-      const dialogCount = await messageSyncService.refreshChannelsFromDialogs();
       if (options.follow) {
+        ({ messageSyncService } = createMessageSyncService(telegramClient, { storeDir }));
+        await messageSyncService.refreshChannelsFromDialogs();
         await telegramClient.startUpdates();
         messageSyncService.startRealtimeSync();
         messageSyncService.resumePendingJobs();
         await withShutdown(async () => {
-          await messageSyncService.shutdown();
-          await telegramClient.destroy();
-          release();
+          await cleanup();
         });
+        keepRunning = true;
         return;
       }
 
       if (globalFlags.json) {
-        writeJson({ authenticated: true, dialogs: dialogCount });
+        writeJson({
+          authenticated: true,
+          dialogs: null,
+          archiveReady: false,
+          archiveError: null,
+        });
       } else {
-        console.log(`Authenticated. Seeded ${dialogCount} dialogs.`);
+        console.log(`Authenticated. ${AUTH_SYNC_HINT}`);
       }
     } finally {
-      if (!options.follow) {
-        await messageSyncService.shutdown();
-        await telegramClient.destroy();
-        release();
+      if (!keepRunning) {
+        await cleanup();
       }
     }
-  }, timeoutMs);
+  }, timeoutMs, cleanup);
 }
 
 async function runConfigList(globalFlags) {
@@ -4336,6 +4369,7 @@ export {
   main,
   normalizeSendCommandError,
   parseNonNegativeInt,
+  runAuthLogin,
   runFeedback,
   shouldRunMain,
   writeError,
