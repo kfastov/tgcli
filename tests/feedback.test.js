@@ -84,18 +84,22 @@ tgcli v2.0.8 | linux | v24.0.0`);
     expect(getFeedbackCooldownRemainingSeconds(storeDir, 1_060_000)).toBe(0);
   });
 
-  it('rejects feedback when feedback.chatId is missing', async () => {
+  it('uses default recipient @kfastov when feedback.chatId is not configured', async () => {
     saveConfig(storeDir, {
       apiId: '12345',
       apiHash: 'hash',
       phoneNumber: '+10000000000',
     });
+    const { telegramClient } = createMockServices(999);
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
 
-    await expect(
-      runFeedback({ json: false, timeoutMs: null }, ['missing', 'recipient'], {}),
-    ).rejects.toThrow(`Feedback recipient not configured. Run:
-  tgcli config set feedback.chatId <username-or-id>`);
-    expect(createServices).not.toHaveBeenCalled();
+    await runFeedback({ json: true, timeoutMs: null }, ['test', 'feedback'], {});
+
+    expect(telegramClient.sendTextMessage).toHaveBeenCalledWith(
+      '@kfastov',
+      expect.any(String),
+      { parseMode: 'none' },
+    );
   });
 
   it('sends plain-text feedback and returns JSON output', async () => {
