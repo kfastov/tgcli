@@ -1463,7 +1463,7 @@ async function runAuthLogout(globalFlags) {
   }, timeoutMs);
 }
 
-async function runAuthLogin(globalFlags, options = {}) {
+export async function runAuthLogin(globalFlags, options = {}) {
   const timeoutMs = globalFlags.timeoutMs;
   let release = null;
   let telegramClient = null;
@@ -4369,7 +4369,6 @@ export {
   main,
   normalizeSendCommandError,
   parseNonNegativeInt,
-  runAuthLogin,
   runFeedback,
   shouldRunMain,
   writeError,
