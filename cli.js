@@ -95,9 +95,7 @@ function buildProgram() {
     .command('feedback')
     .description('Send feedback to the maintainer')
     .argument('<message...>', 'Feedback message')
-    .option('--bug', 'Report a bug')
-    .option('--suggestion', 'Suggest an improvement')
-    .option('--praise', 'Send positive feedback')
+
     .action(withGlobalOptions((globalFlags, messageParts, options) =>
       runFeedback(globalFlags, messageParts, options),
     ));
@@ -807,17 +805,7 @@ function parseConfigValue(spec, rawValue) {
   return parseStringValue(rawValue, spec.key);
 }
 
-function resolveFeedbackCategory(options = {}) {
-  const categories = [
-    options.bug ? 'bug' : null,
-    options.suggestion ? 'suggestion' : null,
-    options.praise ? 'praise' : null,
-  ].filter(Boolean);
-  if (categories.length > 1) {
-    throw new Error('Choose only one of --bug, --suggestion, or --praise.');
-  }
-  return categories[0] ?? 'general';
-}
+
 
 function getFeedbackRateLimitPath(storeDir) {
   return path.join(storeDir, FEEDBACK_LAST_FILE);
@@ -856,12 +844,12 @@ function writeFeedbackLastSentAt(storeDir, timestamp = Date.now()) {
   return timestamp;
 }
 
-function formatFeedbackMessage(messageText, category, metadata = {}) {
+function formatFeedbackMessage(messageText, metadata = {}) {
   const version = metadata.version ?? readVersion();
   const platform = metadata.platform ?? process.platform;
   const nodeVersion = metadata.nodeVersion ?? process.version;
   const normalizedMessage = parseStringValue(messageText, 'Feedback message');
-  return `📋 tgcli feedback [${category}]\n\n${normalizedMessage}\n\n---\ntgcli v${version} | ${platform} | ${nodeVersion}`;
+  return `💬 tgcli feedback\n\n${normalizedMessage}\n\n---\ntgcli v${version} | ${platform} | ${nodeVersion}`;
 }
 
 function runCommand(command, args, options = {}) {
@@ -1600,8 +1588,7 @@ async function runFeedback(globalFlags, messageParts, options = {}) {
         throw new Error('Feedback recipient not configured. Run:\n  tgcli config set feedback.chatId <username-or-id>');
       }
 
-      const category = resolveFeedbackCategory(options);
-      const remainingSeconds = getFeedbackCooldownRemainingSeconds(storeDir);
+            const remainingSeconds = getFeedbackCooldownRemainingSeconds(storeDir);
       if (remainingSeconds > 0) {
         throw new Error(`Please wait ${remainingSeconds} seconds before sending another feedback.`);
       }
@@ -1617,7 +1604,6 @@ async function runFeedback(globalFlags, messageParts, options = {}) {
 
       const feedbackText = formatFeedbackMessage(
         Array.isArray(messageParts) ? messageParts.join(' ') : String(messageParts ?? ''),
-        category,
       );
       const result = await telegramClient.sendTextMessage(chatId, feedbackText, {
         parseMode: 'none',
@@ -1628,7 +1614,6 @@ async function runFeedback(globalFlags, messageParts, options = {}) {
         writeJson({
           ok: true,
           messageId: result?.messageId ?? null,
-          category,
         });
       } else {
         console.log(`Feedback sent (${result?.messageId ?? 'unknown'}).`);
@@ -4353,7 +4338,6 @@ export {
   main,
   normalizeSendCommandError,
   parseNonNegativeInt,
-  resolveFeedbackCategory,
   runFeedback,
   shouldRunMain,
   writeError,

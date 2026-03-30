@@ -19,7 +19,6 @@ import { saveConfig } from '../core/config.js';
 import {
   formatFeedbackMessage,
   getFeedbackCooldownRemainingSeconds,
-  resolveFeedbackCategory,
   runFeedback,
   writeFeedbackLastSentAt,
 } from '../cli.js';
@@ -64,29 +63,19 @@ describe('tgcli feedback helpers', () => {
     fs.rmSync(storeDir, { recursive: true, force: true });
   });
 
-  it('formats feedback messages with category header and metadata footer', () => {
+  it('formats feedback message with header and metadata footer', () => {
     expect(
-      formatFeedbackMessage('global search should be supported', 'bug', {
+      formatFeedbackMessage('global search should be supported', {
         version: '2.0.8',
         platform: 'linux',
         nodeVersion: 'v24.0.0',
       }),
-    ).toBe(`📋 tgcli feedback [bug]
+    ).toBe(`💬 tgcli feedback
 
 global search should be supported
 
 ---
 tgcli v2.0.8 | linux | v24.0.0`);
-  });
-
-  it('detects category flags and defaults to general', () => {
-    expect(resolveFeedbackCategory({ bug: true })).toBe('bug');
-    expect(resolveFeedbackCategory({ suggestion: true })).toBe('suggestion');
-    expect(resolveFeedbackCategory({ praise: true })).toBe('praise');
-    expect(resolveFeedbackCategory({})).toBe('general');
-    expect(() => resolveFeedbackCategory({ bug: true, suggestion: true })).toThrow(
-      'Choose only one of --bug, --suggestion, or --praise.',
-    );
   });
 
   it('computes cooldown remaining seconds from the last feedback timestamp', () => {
@@ -109,7 +98,7 @@ tgcli v2.0.8 | linux | v24.0.0`);
     expect(createServices).not.toHaveBeenCalled();
   });
 
-  it('sends plain-text feedback and returns JSON output when requested', async () => {
+  it('sends plain-text feedback and returns JSON output', async () => {
     saveConfig(storeDir, {
       apiId: '12345',
       apiHash: 'hash',
@@ -122,12 +111,12 @@ tgcli v2.0.8 | linux | v24.0.0`);
     await runFeedback(
       { json: true, timeoutMs: null },
       ['rename', 'sync', 'to', 'backfill'],
-      { suggestion: true },
+      {},
     );
 
     expect(telegramClient.sendTextMessage).toHaveBeenCalledWith(
       '@maintainer',
-      formatFeedbackMessage('rename sync to backfill', 'suggestion', {
+      formatFeedbackMessage('rename sync to backfill', {
         version: PACKAGE_VERSION,
         platform: process.platform,
         nodeVersion: process.version,
@@ -137,7 +126,6 @@ tgcli v2.0.8 | linux | v24.0.0`);
     expect(JSON.parse(stdoutSpy.mock.calls[0][0])).toEqual({
       ok: true,
       messageId: 654,
-      category: 'suggestion',
     });
     expect(messageSyncService.shutdown).toHaveBeenCalledTimes(1);
     expect(telegramClient.destroy).toHaveBeenCalledTimes(1);
@@ -152,10 +140,10 @@ tgcli v2.0.8 | linux | v24.0.0`);
     });
     const { telegramClient } = createMockServices(700);
 
-    await runFeedback({ json: false, timeoutMs: null }, ['first', 'feedback'], { bug: true });
+    await runFeedback({ json: false, timeoutMs: null }, ['first', 'feedback'], {});
 
     await expect(
-      runFeedback({ json: false, timeoutMs: null }, ['second', 'feedback'], { bug: true }),
+      runFeedback({ json: false, timeoutMs: null }, ['second', 'feedback'], {}),
     ).rejects.toThrow('Please wait 60 seconds before sending another feedback.');
     expect(telegramClient.sendTextMessage).toHaveBeenCalledTimes(1);
     expect(createServices).toHaveBeenCalledTimes(1);

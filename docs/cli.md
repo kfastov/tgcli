@@ -92,7 +92,7 @@ tgcli messages list --chat <id> --limit 50 --source live --before-id 12345 --jso
 Legacy `--offset-id` is accepted as a hidden alias for `--before-id`.
 
 ## feedback
-- feedback <message> [--bug] [--suggestion] [--praise]
+- feedback <message>
   - Sends feedback directly to the configured maintainer.
   - Configure recipient: `tgcli config set feedback.chatId <username-or-id>`
   - Rate limited: 1 message per 60 seconds.
