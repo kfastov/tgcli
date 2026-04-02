@@ -43,6 +43,18 @@ function parseLockPid(raw) {
   }
 }
 
+function removeStaleLockFile(lockPath, pid, label) {
+  try {
+    fs.unlinkSync(lockPath);
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return;
+    }
+    const details = error?.message ? `: ${error.message}` : '';
+    throw new Error(`Found stale ${label} for dead pid ${pid}, but could not remove ${lockPath}${details}`);
+  }
+}
+
 function getAliveReadLocks(storeDir) {
   let entries;
   try {
@@ -61,7 +73,7 @@ function getAliveReadLocks(storeDir) {
     if (isPidAlive(pid)) {
       alive.push({ name, pid });
     } else {
-      try { fs.unlinkSync(filePath); } catch {}
+      removeStaleLockFile(filePath, pid, 'read lock');
     }
   }
   return alive;
@@ -87,7 +99,7 @@ export function acquireStoreLock(storeDir, _retried = false) {
       const info = readStoreLock(storeDir);
       const pid = parseLockPid(info.info);
       if (pid && !isPidAlive(pid) && !_retried) {
-        try { fs.unlinkSync(lockPath); } catch {}
+        removeStaleLockFile(lockPath, pid, 'store lock');
         return acquireStoreLock(storeDir, true);
       }
       const details = info.info ? ` (${info.info})` : '';
@@ -120,7 +132,7 @@ export function acquireReadLock(storeDir) {
   if (writeLock.exists) {
     const pid = parseLockPid(writeLock.info);
     if (pid && !isPidAlive(pid)) {
-      try { fs.unlinkSync(writeLock.path); } catch {}
+      removeStaleLockFile(writeLock.path, pid, 'store lock');
     } else {
       const details = writeLock.info ? ` (${writeLock.info})` : '';
       throw new Error(`Store is locked by a writer${details}`);

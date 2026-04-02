@@ -3,6 +3,7 @@ import { InputMedia } from '@mtcute/core';
 import { randomLong } from '@mtcute/core/utils.js';
 import { html } from '@mtcute/html-parser';
 import { md } from '@mtcute/markdown-parser';
+import QRCode from 'qrcode';
 import EventEmitter from 'events';
 import fs from 'fs';
 import { stat } from 'fs/promises';
@@ -519,6 +520,7 @@ class TelegramClient {
     this.apiHash = sanitizeString(apiHash);
     this.phoneNumber = sanitizeString(phoneNumber);
     this.sessionPath = path.resolve(sessionPath);
+    this.options = options;
 
     const dataDir = path.dirname(this.sessionPath);
     if (!fs.existsSync(dataDir)) {
@@ -539,14 +541,61 @@ class TelegramClient {
         this.updateEmitter.emit('channelTooLong', { channelId, diff });
       },
     };
+    this.updatesConfig = updatesConfig;
+    this.client = this._createClient();
+  }
 
-    this.client = new MtCuteClient({
+  _createClient() {
+    const clientOptions = {
       apiId: this.apiId,
       apiHash: this.apiHash,
       storage: this.sessionPath,
       platform: createPlatform(),
-      updates: updatesConfig,
-    });
+    };
+    if (this.options.disableUpdates) {
+      clientOptions.disableUpdates = true;
+    } else {
+      clientOptions.updates = this.updatesConfig;
+    }
+    return new MtCuteClient(clientOptions);
+  }
+
+  _isAuthKeyUnregisteredError(error) {
+    if (!error) return false;
+    const code = error.code || error.status || error.errorCode;
+    const message = (error.errorMessage || error.text || error.message || '').toUpperCase();
+    return code === 401 && message.includes('AUTH_KEY_UNREGISTERED');
+  }
+
+  _isSessionResetError(error) {
+    if (!error) return false;
+    const message = (error.errorMessage || error.text || error.message || '').toUpperCase();
+    return message.includes('SESSION IS RESET');
+  }
+
+  async _recreateClient() {
+    try {
+      await this.client.destroy();
+    } catch (error) {
+      console.warn('[warning] failed to destroy MTProto client during reset:', error?.message || error);
+    }
+    this.client = this._createClient();
+    this.updatesRunning = false;
+    this.rawUpdateHandler = null;
+  }
+
+  async _resetSessionAndClient() {
+    const sessionFiles = [this.sessionPath, `${this.sessionPath}-wal`, `${this.sessionPath}-shm`];
+    for (const filePath of sessionFiles) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          throw error;
+        }
+      }
+    }
+    await this._recreateClient();
   }
 
   _isUnauthorizedError(error) {
@@ -587,17 +636,28 @@ class TelegramClient {
   }
 
   async _askQuestion(prompt) {
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
-
-    return new Promise(resolve => {
-      rl.question(prompt, answer => {
-        rl.close();
-        resolve(answer.trim());
+    const ask = () => {
+      if (process.stdin.isPaused()) {
+        process.stdin.resume();
+      }
+      const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
       });
-    });
+
+      return new Promise(resolve => {
+        rl.question(prompt, answer => {
+          rl.close();
+          resolve(answer.trim());
+        });
+      });
+    };
+
+    let answer = await ask();
+    if (!answer) {
+      answer = await ask();
+    }
+    return answer;
   }
 
   async _askHiddenQuestion(prompt) {
@@ -605,6 +665,9 @@ class TelegramClient {
       return this._askQuestion(prompt);
     }
 
+    if (process.stdin.isPaused()) {
+      process.stdin.resume();
+    }
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
@@ -628,29 +691,103 @@ class TelegramClient {
     });
   }
 
-  async login() {
-    try {
-      if (await this._isAuthorized()) {
-        console.log('Existing session is valid.');
-        return true;
-      }
+  _buildStartParams() {
+    const startParams = {
+      password: async () => {
+        const value = await this._askHiddenQuestion('Enter your 2FA password (leave empty if not enabled): ');
+        return value.length ? value : undefined;
+      },
+    };
 
-      if (!this.phoneNumber) {
+    if (this.options.useQr) {
+      startParams.qrCodeHandler = async (url, expiresAt) => {
+        const expiresLabel = expiresAt instanceof Date && !Number.isNaN(expiresAt.getTime())
+          ? expiresAt.toISOString()
+          : 'unknown';
+        let qrFile = null;
+
+        if (this.options.qrFilePath) {
+          qrFile = this.options.qrFilePath;
+          await QRCode.toFile(qrFile, url, { type: 'png', width: 300 });
+        }
+
+        if (this.options.json) {
+          process.stderr.write(`${JSON.stringify({
+            event: 'qr',
+            url,
+            expiresAt: expiresLabel,
+            qrFile,
+          })}\n`);
+          return;
+        }
+
+        console.log('\nScan this QR code in Telegram: Settings -> Devices -> Link Desktop Device');
+        const terminalQr = await QRCode.toString(url, { type: 'terminal', small: true });
+        console.log(terminalQr);
+        console.log(`QR login URL: ${url}`);
+        console.log(`QR expires at: ${expiresLabel}`);
+        if (qrFile) {
+          console.log(`QR saved to: ${qrFile}`);
+        }
+      };
+    } else {
+      startParams.phone = this.phoneNumber;
+      startParams.code = async () => await this._askQuestion('Enter the code you received: ');
+      startParams.codeSentCallback = async (sentCode) => {
+        if (this.options.forceSms && (sentCode.type === 'app' || sentCode.type === 'email')) {
+          try {
+            await this.client.resendCode({ phone: this.phoneNumber, phoneCodeHash: sentCode.phoneCodeHash });
+            console.log('Code re-sent via SMS.');
+          } catch (error) {
+            const message = (error.text || error.message || '').toUpperCase();
+            if (message.includes('SEND_CODE_UNAVAILABLE')) {
+              console.log('SMS unavailable for this number. Please use the code sent via app.');
+            } else {
+              console.log(`Could not request SMS (${error.text || error.message}). Using code sent via ${sentCode.type}.`);
+            }
+          }
+        } else {
+          console.log(`The confirmation code has been sent via ${sentCode.type}.`);
+        }
+      };
+    }
+
+    return startParams;
+  }
+
+  async login(retriedAfterReset = false, retriedAfterSessionReset = false) {
+    try {
+      const hasExistingSession = await this._isAuthorized();
+
+      if (!hasExistingSession && !this.options.useQr && !this.phoneNumber) {
         throw new Error('TELEGRAM_PHONE_NUMBER is not configured.');
       }
 
-      await this.client.start({
-        phone: this.phoneNumber,
-        code: async () => await this._askQuestion('Enter the code you received: '),
-        password: async () => {
-          const value = await this._askHiddenQuestion('Enter your 2FA password (leave empty if not enabled): ');
-          return value.length ? value : undefined;
-        },
-      });
+      await this.client.start(this._buildStartParams());
 
-      console.log('Logged in successfully!');
+      console.log(hasExistingSession ? 'Existing session is valid.' : 'Logged in successfully!');
       return true;
     } catch (error) {
+      if (!retriedAfterReset && this._isAuthKeyUnregisteredError(error)) {
+        console.log('Detected AUTH_KEY_UNREGISTERED. Resetting local session and retrying login once...');
+        try {
+          await this._resetSessionAndClient();
+          return await this.login(true, retriedAfterSessionReset);
+        } catch (resetError) {
+          console.error('Failed to recover from AUTH_KEY_UNREGISTERED:', resetError);
+          return false;
+        }
+      }
+      if (!retriedAfterSessionReset && this._isSessionResetError(error)) {
+        console.log('Detected session reset during login. Recreating MTProto client and retrying once...');
+        try {
+          await this._recreateClient();
+          return await this.login(retriedAfterReset, true);
+        } catch (resetError) {
+          console.error('Failed to recover from session reset:', resetError);
+          return false;
+        }
+      }
       console.error('Error during login:', error);
       return false;
     }
@@ -674,38 +811,51 @@ class TelegramClient {
     return true;
   }
 
-  async listDialogs(limit = 50) {
-    await this.ensureLogin();
-    const effectiveLimit = limit && limit > 0 ? limit : Infinity;
-    const results = [];
+  async listDialogs(limit = 50, retriedAfterSessionReset = false) {
+    try {
+      await this.ensureLogin();
+      const effectiveLimit = limit && limit > 0 ? limit : Infinity;
+      const results = [];
 
-    for await (const dialog of this.client.iterDialogs({})) {
-      const peer = dialog.peer;
-      if (!peer) continue;
+      for await (const dialog of this.client.iterDialogs({})) {
+        const peer = dialog.peer;
+        if (!peer) continue;
 
-      const id = peer.id.toString();
-      const username = 'username' in peer ? peer.username ?? null : null;
-      const chatType = typeof peer.chatType === 'string' ? peer.chatType : null;
-      const isForum = typeof peer.isForum === 'boolean' ? peer.isForum : null;
-      const isGroup = typeof peer.isGroup === 'boolean' ? peer.isGroup : null;
-      results.push({
-        id,
-        type: normalizePeerType(peer),
-        title: peer.displayName || 'Unknown',
-        username,
-        chatType,
-        isForum,
-        isGroup,
-        unreadCount: typeof dialog.unreadCount === 'number' ? dialog.unreadCount : 0,
-        unreadMentionsCount: typeof dialog.unreadMentionsCount === 'number' ? dialog.unreadMentionsCount : 0,
-      });
+        const id = peer.id.toString();
+        const username = 'username' in peer ? peer.username ?? null : null;
+        const chatType = typeof peer.chatType === 'string' ? peer.chatType : null;
+        const isForum = typeof peer.isForum === 'boolean' ? peer.isForum : null;
+        const isGroup = typeof peer.isGroup === 'boolean' ? peer.isGroup : null;
+        results.push({
+          id,
+          type: normalizePeerType(peer),
+          title: peer.displayName || 'Unknown',
+          username,
+          chatType,
+          isForum,
+          isGroup,
+          unreadCount: typeof dialog.unreadCount === 'number' ? dialog.unreadCount : 0,
+          unreadMentionsCount: typeof dialog.unreadMentionsCount === 'number' ? dialog.unreadMentionsCount : 0,
+        });
 
-      if (results.length >= effectiveLimit) {
-        break;
+        if (results.length >= effectiveLimit) {
+          break;
+        }
       }
-    }
 
-    return results;
+      return results;
+    } catch (error) {
+      if (!retriedAfterSessionReset && this._isSessionResetError(error)) {
+        console.log('Detected session reset while listing dialogs. Recreating MTProto client and retrying once...');
+        await this._recreateClient();
+        const loginSuccess = await this.login();
+        if (!loginSuccess) {
+          throw new Error('Failed to restore session after dialog fetch reset.');
+        }
+        return this.listDialogs(limit, true);
+      }
+      throw error;
+    }
   }
 
   async searchPeers(query, limit = 50) {
