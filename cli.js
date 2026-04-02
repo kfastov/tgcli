@@ -1519,12 +1519,7 @@ export async function runAuthLogin(globalFlags, options = {}) {
       }
 
       if (globalFlags.json) {
-        writeJson({
-          authenticated: true,
-          dialogs: null,
-          archiveReady: false,
-          archiveError: null,
-        });
+        writeJson({ authenticated: true });
       } else {
         console.log(`Authenticated. ${AUTH_SYNC_HINT}`);
       }

@@ -17,8 +17,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import TelegramClient from '../telegram-client.js';
 
-function makeDialog(peer) {
-  return { peer };
+function makeDialog(peer, extra = {}) {
+  return { peer, unreadCount: extra.unreadCount ?? 0, unreadMentionsCount: extra.unreadMentionsCount ?? 0 };
 }
 
 describe('telegram auth recovery', () => {
@@ -126,6 +126,8 @@ describe('telegram auth recovery', () => {
         chatType: 'channel',
         isForum: false,
         isGroup: false,
+        unreadCount: 0,
+        unreadMentionsCount: 0,
       },
     ]);
   });
