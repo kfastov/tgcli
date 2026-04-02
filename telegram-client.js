@@ -3,6 +3,7 @@ import { InputMedia } from '@mtcute/core';
 import { randomLong } from '@mtcute/core/utils.js';
 import { html } from '@mtcute/html-parser';
 import { md } from '@mtcute/markdown-parser';
+import QRCode from 'qrcode';
 import EventEmitter from 'events';
 import fs from 'fs';
 import { stat } from 'fs/promises';
@@ -78,22 +79,6 @@ const LOG_HANDLER = IS_TTY
         ...args,
       );
     };
-let qrCodeRendererPromise = null;
-
-async function loadQrCodeRenderer() {
-  if (!qrCodeRendererPromise) {
-    qrCodeRendererPromise = import('qrcode-terminal')
-      .then((module) => module.default ?? module)
-      .catch(() => ({
-        generate(value, _options, callback) {
-          if (typeof callback === 'function') {
-            callback(`QR rendering unavailable locally.\n${value}`);
-          }
-        },
-      }));
-  }
-  return qrCodeRendererPromise;
-}
 
 async function normalizeUploadFile(file) {
   if (typeof file === 'string') {
@@ -719,13 +704,31 @@ class TelegramClient {
         const expiresLabel = expiresAt instanceof Date && !Number.isNaN(expiresAt.getTime())
           ? expiresAt.toISOString()
           : 'unknown';
+        let qrFile = null;
+
+        if (this.options.qrFilePath) {
+          qrFile = this.options.qrFilePath;
+          await QRCode.toFile(qrFile, url, { type: 'png', width: 300 });
+        }
+
+        if (this.options.json) {
+          process.stderr.write(`${JSON.stringify({
+            event: 'qr',
+            url,
+            expiresAt: expiresLabel,
+            qrFile,
+          })}\n`);
+          return;
+        }
+
         console.log('\nScan this QR code in Telegram: Settings -> Devices -> Link Desktop Device');
-        const qrCode = await loadQrCodeRenderer();
-        qrCode.generate(url, { small: true }, (rendered) => {
-          console.log(rendered);
-        });
+        const terminalQr = await QRCode.toString(url, { type: 'terminal', small: true });
+        console.log(terminalQr);
         console.log(`QR login URL: ${url}`);
         console.log(`QR expires at: ${expiresLabel}`);
+        if (qrFile) {
+          console.log(`QR saved to: ${qrFile}`);
+        }
       };
     } else {
       startParams.phone = this.phoneNumber;

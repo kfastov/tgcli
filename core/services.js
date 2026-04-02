@@ -53,6 +53,8 @@ export function createTelegramClient(options = {}) {
     {
       forceSms: options.forceSms ?? false,
       useQr: options.useQr ?? false,
+      qrFilePath: options.qrFilePath ?? null,
+      json: options.json ?? false,
       disableUpdates: options.disableUpdates ?? false,
     },
   );

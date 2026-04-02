@@ -57,7 +57,13 @@ describe('core services helpers', () => {
       'hash-value',
       '+1234567890',
       path.join(storeDir, 'session.json'),
-      { forceSms: true, useQr: true, disableUpdates: true },
+      expect.objectContaining({
+        forceSms: true,
+        useQr: true,
+        qrFilePath: null,
+        json: false,
+        disableUpdates: true,
+      }),
     );
     expect(messageSyncServiceCtor).not.toHaveBeenCalled();
     expect(result.sessionPath).toBe(path.join(storeDir, 'session.json'));

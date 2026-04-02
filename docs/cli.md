@@ -11,9 +11,10 @@ Store location: OS app data dir (override with TGCLI_STORE).
 MCP: disabled by default (set `mcp.enabled` in config.json to true to serve MCP).
 
 ## auth
-- auth
-  - Interactive login (Telegram MTProto). By default this only authenticates; use `--follow` to continue into realtime sync.
-  - Flags: --follow, --qr, --force-sms
+- auth [--qr] [--qr-file <path>] [--force-sms] [--follow] [--idle-exit <duration>] [--download-media]
+  - Interactive login. Use --qr for QR code login (scan in Telegram app).
+  - --qr-file saves the QR code as a PNG image (useful for agents).
+  - --force-sms forces code delivery via SMS instead of in-app notification.
 - auth status
 - auth logout
 

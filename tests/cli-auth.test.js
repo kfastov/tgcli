@@ -90,6 +90,37 @@ describe('cli auth command', () => {
     expect(destroy).toHaveBeenCalledTimes(1);
   });
 
+  it('passes qr file and json flags through to the telegram client', async () => {
+    const stdoutWriteSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const destroy = vi.fn().mockResolvedValue(undefined);
+    const login = vi.fn().mockResolvedValue(true);
+    createTelegramClientMock.mockReturnValue({
+      telegramClient: {
+        destroy,
+        login,
+      },
+    });
+
+    try {
+      await runAuthLogin(
+        { json: true, timeoutMs: null },
+        { qr: true, qrFile: '/tmp/tgcli-auth.png', forceSms: false, follow: false },
+      );
+    } finally {
+      stdoutWriteSpy.mockRestore();
+    }
+
+    expect(createTelegramClientMock).toHaveBeenCalledWith(expect.objectContaining({
+      forceSms: false,
+      useQr: true,
+      qrFilePath: '/tmp/tgcli-auth.png',
+      json: true,
+      disableUpdates: true,
+    }));
+    expect(login).toHaveBeenCalledTimes(1);
+    expect(destroy).toHaveBeenCalledTimes(1);
+  });
+
   it('treats symlinked tgcli binaries as the cli entrypoint', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tgcli-cli-entrypoint-'));
     const symlinkPath = path.join(tmpDir, 'tgcli');

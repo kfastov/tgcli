@@ -61,6 +61,7 @@ function buildProgram() {
     .option('--follow', 'Continue syncing after login')
     .option('--force-sms', 'Force SMS code delivery instead of in-app')
     .option('--qr', 'Use QR-code login flow instead of confirmation code')
+    .option('--qr-file <path>', 'Save QR code as PNG image file')
     .action(withGlobalOptions((globalFlags, options) =>
       runAuthLogin(globalFlags, options),
     ));
@@ -1496,6 +1497,8 @@ export async function runAuthLogin(globalFlags, options = {}) {
         config,
         forceSms: options.forceSms,
         useQr: options.qr,
+        qrFilePath: options.qrFile,
+        json: globalFlags.json,
         disableUpdates: !options.follow,
       }));
       const loginSuccess = await telegramClient.login();
