@@ -28,13 +28,24 @@ Or:
 brew install kfastov/tap/tgcli
 ```
 
-## Authentication
-
-First-time setup needs Telegram API credentials from https://my.telegram.org/apps
+## First-Time Setup
 
 ```bash
+# 1. Authenticate (needs API credentials from https://my.telegram.org/apps)
 tgcli auth
+
+# 2. Verify authentication succeeded
+tgcli channels list --limit 1
+
+# 3. Install and start background sync service
+tgcli service install
+tgcli service start
+
+# 4. Begin syncing messages
+tgcli sync --follow
 ```
+
+If auth fails or sync doesn't start, run `tgcli doctor` to diagnose. Verify API credentials are correct at https://my.telegram.org/apps.
 
 ## Common Commands
 
@@ -84,3 +95,5 @@ tgcli channels list --limit 10 --json
 
 - Use `--source live|archive|both` when listing or searching messages.
 - `--json` is best for AI/tooling pipelines.
+- Run `tgcli [command] --help` for full option details on any command.
+- See `tgcli doctor` for diagnostics if something isn't working.
