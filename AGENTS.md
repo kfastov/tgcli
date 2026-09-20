@@ -37,3 +37,17 @@
 - On startup, read `backlog.md` and pull tasks from it.
 - Thoroughly verify implemented functionality (tests, smoke runs, manual checks).
 - Commit verified features before starting the next task.
+
+## Agent skills
+
+### Issue tracker
+
+Track issues and specs in GitHub Issues for `kfastov/tgcli`; read `docs/agents/issue-tracker.md` before tracker operations.
+
+### Triage labels
+
+Use the five canonical triage labels; read `docs/agents/triage-labels.md` when triaging or applying status labels.
+
+### Domain docs
+
+Use a single-context layout (`CONTEXT.md` and `docs/adr/`); read `docs/agents/domain.md` before exploring the codebase.
