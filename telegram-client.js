@@ -817,7 +817,7 @@ class TelegramClient {
       const effectiveLimit = limit && limit > 0 ? limit : Infinity;
       const results = [];
 
-      for await (const dialog of this.client.iterDialogs({})) {
+      for await (const dialog of this.client.iterDialogs({ archived: 'keep' })) {
         const peer = dialog.peer;
         if (!peer) continue;
 
@@ -904,7 +904,7 @@ class TelegramClient {
     await this.ensureLogin();
     const results = [];
 
-    for await (const dialog of this.client.iterDialogs({})) {
+    for await (const dialog of this.client.iterDialogs({ archived: 'keep' })) {
       const peer = dialog.peer;
       if (!peer) continue;
 
@@ -1273,7 +1273,7 @@ class TelegramClient {
     const limit = options.limit && options.limit > 0 ? Number(options.limit) : 100;
     const results = [];
 
-    for await (const dialog of this.client.iterDialogs({})) {
+    for await (const dialog of this.client.iterDialogs({ archived: 'keep' })) {
       const peer = dialog.peer;
       if (!peer || !isGroupPeer(peer)) {
         continue;
