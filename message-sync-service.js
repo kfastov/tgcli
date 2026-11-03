@@ -1290,7 +1290,7 @@ export default class MessageSyncService {
   }
 
   async refreshChannelsFromDialogs() {
-    const dialogs = await this.telegramClient.listDialogs(0);
+    const dialogs = await this.telegramClient.listDialogs(0, { includeArchived: true });
     this.upsertChannels(dialogs);
     this._markGapsBehindDialogs(dialogs);
     return dialogs.length;

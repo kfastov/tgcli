@@ -101,6 +101,7 @@ class FakeTelegram {
     this.dialogs = [];
     this.dialogsGate = null;
     this.failNext = new Map();
+    this.archivedDialogs = [];
   }
 
   arriveWhileOffline(message) {
@@ -129,7 +130,7 @@ class FakeTelegram {
         await this.dialogsGate?.promise;
         return {
           _: 'messages.dialogs',
-          dialogs: request.offsetPeer._ === 'inputPeerEmpty' ? this.dialogs : [],
+          dialogs: request.offsetPeer._ === 'inputPeerEmpty' ? this._dialogsIn(request.folderId) : [],
           messages: [],
           ...PEERS,
         };
@@ -139,6 +140,10 @@ class FakeTelegram {
       default:
         throw new Error(`FakeTelegram has no answer for ${request._}`);
     }
+  }
+
+  _dialogsIn(folderId) {
+    return folderId === 0 ? this.dialogs : [...this.dialogs, ...this.archivedDialogs];
   }
 
   _state() {
@@ -831,6 +836,21 @@ describe('cold start catch-up', () => {
       await vi.waitFor(() => expect(recordedGap(FRIEND_CHAT_ID)).toBeNull());
       expect(listDialogs).toHaveBeenCalledTimes(1);
       expect(cursor(FRIEND_CHAT_ID)).toBe(16);
+    });
+
+    it('finds a gap in an archived chat, which the dialog list leaves out by default', async () => {
+      telegram.pts += 5;
+      telegram.commonDifferenceTooLong = true;
+      telegram.history.set(FRIEND_ID, friendHistory(1, 15));
+      telegram.archivedDialogs = [dialogWith(FRIEND_PEER, 15)];
+
+      const { ensureConnected, messageSyncService, telegramClient } = startServer();
+      seedCursor(messageSyncService, FRIEND_CHAT_ID, 10);
+      await ensureConnected();
+
+      await vi.waitFor(() => expect(archivedIds(FRIEND_CHAT_ID)).toEqual([11, 12, 13, 14, 15]));
+      await vi.waitFor(() => expect(recordedGap(FRIEND_CHAT_ID)).toBeNull());
+      await expect(telegramClient.listDialogs(0)).resolves.toEqual([]);
     });
 
     it('treats an overdue timer as an outage, since a sleeping machine reports none', () => {

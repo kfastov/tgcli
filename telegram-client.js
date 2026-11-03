@@ -824,13 +824,13 @@ class TelegramClient {
     return true;
   }
 
-  async listDialogs(limit = 50, retriedAfterSessionReset = false) {
+  async listDialogs(limit = 50, { includeArchived = false, retriedAfterSessionReset = false } = {}) {
     try {
       await this.ensureLogin();
       const effectiveLimit = limit && limit > 0 ? limit : Infinity;
       const results = [];
 
-      for await (const dialog of this.client.iterDialogs({})) {
+      for await (const dialog of this.client.iterDialogs({ archived: includeArchived ? 'keep' : 'exclude' })) {
         const peer = dialog.peer;
         if (!peer) continue;
 
@@ -866,7 +866,7 @@ class TelegramClient {
         if (!loginSuccess) {
           throw new Error('Failed to restore session after dialog fetch reset.');
         }
-        return this.listDialogs(limit, true);
+        return this.listDialogs(limit, { includeArchived, retriedAfterSessionReset: true });
       }
       throw error;
     }
