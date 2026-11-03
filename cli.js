@@ -2638,6 +2638,13 @@ function sendOutcome(result) {
   return result?.scheduled ? 'scheduled' : 'sent';
 }
 
+function printSendOutcome(label, result) {
+  console.log(`${label} ${sendOutcome(result)} (${result.messageId}).`);
+  if (result.warning) {
+    console.error(`Warning: ${result.warning}`);
+  }
+}
+
 // Map a client-side invoke timeout (AbortSignal.timeout fires a TimeoutError, an
 // aborted request fires an AbortError) to the clear send-timeout SendCommandError.
 function isInvokeTimeoutError(error) {
@@ -2696,7 +2703,7 @@ async function runSendText(globalFlags, options = {}) {
     if (globalFlags.json) {
       writeJson(payload);
     } else {
-      console.log(`Message ${sendOutcome(result)} (${result.messageId}).`);
+      printSendOutcome('Message', result);
     }
   } catch (error) {
     throw normalizeSendCommandError(error, { method, retries });
@@ -2734,7 +2741,7 @@ async function runSendPhoto(globalFlags, options = {}) {
     if (globalFlags.json) {
       writeJson(buildSendPhotoSuccessPayload({ method, inputChatId: options.to, result, attempts }));
     } else {
-      console.log(`Photo ${sendOutcome(result)} (${result.messageId}).`);
+      printSendOutcome('Photo', result);
     }
   } catch (error) {
     throw normalizeSendCommandError(error, { method, retries });
@@ -2778,7 +2785,7 @@ async function runSendFile(globalFlags, options = {}) {
     if (globalFlags.json) {
       writeJson(payload);
     } else {
-      console.log(`File ${sendOutcome(result)} (${result.messageId}).`);
+      printSendOutcome('File', result);
     }
   } catch (error) {
     throw normalizeSendCommandError(error, { method, retries });
@@ -3442,6 +3449,7 @@ async function main() {
 export {
   buildProgram,
   buildSendPhotoSuccessPayload,
+  printSendOutcome,
   DEFAULT_SEND_TIMEOUT_MS,
   formatFeedbackMessage,
   formatSendTimeoutMessage,

@@ -16,6 +16,7 @@ import {
   buildSendSuccessPayload,
   executeSendWithRetries,
   SendCommandError,
+  formatErrorMessage,
 } from './send-utils.js';
 
 // --- shared helpers ---
@@ -611,20 +612,35 @@ async function messagesContext(ctx, args = {}) {
 // against the warm client. `sendFn` performs one send attempt; on exhausted
 // retries this throws a SendCommandError carrying structured details, which the
 // control server serializes and the CLI reconstructs.
-async function runSend(sendFn, { method, retries, retryBackoff, timeoutMs }) {
-  return executeSendWithRetries(sendFn, {
+//
+// `sendFn` also gets `onSent` to hand to the client: mtcute keeps a client's own
+// sends out of onNewMessage, so this is the only way they reach the archive, and a
+// send that never reports its message comes back with a warning. onSent must not
+// throw, because an error out of an attempt would retry a send that has already
+// gone through and post the message twice.
+async function runSend(ctx, sendFn, { method, chat, retries, retryBackoff, timeoutMs }) {
+  let archiveWarning = 'Message sent but not archived: the send did not report its message.';
+  const onSent = (message) => {
+    try {
+      ctx.messageSyncService.archiveSentMessage(message);
+      archiveWarning = null;
+    } catch (error) {
+      const reason = formatErrorMessage(error);
+      console.error(`[archive] ${method} to ${chat}: message ${message?.id} was sent but not archived: ${reason}`);
+      archiveWarning = `Message sent but not archived: ${reason}`;
+    }
+  };
+  const { result, attempts } = await executeSendWithRetries(() => sendFn(onSent), {
     method,
     retries,
     retryBackoff,
     timeoutMs,
   });
-}
-
-// The realtime handlers never see the client's own sends, so a send hands its
-// message straight to the archive. Passed down as a callback because the send
-// result itself goes back to the caller as JSON.
-function archiveSent(ctx) {
-  return (message) => ctx.messageSyncService?.archiveSentMessage(message);
+  if (!archiveWarning) {
+    return { result, attempts };
+  }
+  const warning = result?.warning ? `${result.warning}; ${archiveWarning}` : archiveWarning;
+  return { result: { ...result, warning }, attempts };
 }
 
 // args: { chat, text, parseMode?, topicId?, replyToMessageId?, noPreview?, silent?,
@@ -632,7 +648,8 @@ function archiveSent(ctx) {
 // Returns { result, attempts }.
 async function sendText(ctx, args = {}) {
   return runSend(
-    () => ctx.telegramClient.sendTextMessage(args.chat, args.text, {
+    ctx,
+    (onSent) => ctx.telegramClient.sendTextMessage(args.chat, args.text, {
       topicId: args.topicId,
       replyToMessageId: args.replyToMessageId,
       parseMode: args.parseMode,
@@ -640,9 +657,9 @@ async function sendText(ctx, args = {}) {
       silent: args.silent || false,
       noforwards: args.noforwards || false,
       scheduleDate: args.scheduleDate,
-      onSent: archiveSent(ctx),
+      onSent,
     }),
-    { method: 'sendText', retries: args.retries, retryBackoff: args.retryBackoff, timeoutMs: args.timeoutMs },
+    { method: 'sendText', chat: args.chat, retries: args.retries, retryBackoff: args.retryBackoff, timeoutMs: args.timeoutMs },
   );
 }
 
@@ -659,11 +676,11 @@ async function sendPhoto(ctx, args = {}) {
     captionAbove: args.captionAbove || false,
     spoiler: args.spoiler || false,
     scheduleDate: args.scheduleDate,
-    onSent: archiveSent(ctx),
   });
   return runSend(
-    () => ctx.telegramClient.sendPreparedPhotoMessage(prepared),
-    { method: 'sendPhoto', retries: args.retries, retryBackoff: args.retryBackoff, timeoutMs: args.timeoutMs },
+    ctx,
+    (onSent) => ctx.telegramClient.sendPreparedPhotoMessage(prepared, { onSent }),
+    { method: 'sendPhoto', chat: args.chat, retries: args.retries, retryBackoff: args.retryBackoff, timeoutMs: args.timeoutMs },
   );
 }
 
@@ -671,7 +688,8 @@ async function sendPhoto(ctx, args = {}) {
 // forceDocument? }. Returns { result, attempts }.
 async function sendFile(ctx, args = {}) {
   return runSend(
-    () => ctx.telegramClient.sendFileMessage(args.chat, args.file, {
+    ctx,
+    (onSent) => ctx.telegramClient.sendFileMessage(args.chat, args.file, {
       caption: args.caption,
       filename: args.filename,
       topicId: args.topicId,
@@ -683,9 +701,9 @@ async function sendFile(ctx, args = {}) {
       spoiler: args.spoiler || false,
       scheduleDate: args.scheduleDate,
       forceDocument: args.forceDocument || false,
-      onSent: archiveSent(ctx),
+      onSent,
     }),
-    { method: 'sendFile', retries: args.retries, retryBackoff: args.retryBackoff, timeoutMs: args.timeoutMs },
+    { method: 'sendFile', chat: args.chat, retries: args.retries, retryBackoff: args.retryBackoff, timeoutMs: args.timeoutMs },
   );
 }
 

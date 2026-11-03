@@ -240,33 +240,31 @@ function randomIdsEqual(left, right) {
   return String(left) === String(right);
 }
 
-function extractMessageIdFromSendUpdates(response, randomId) {
+const SENT_MESSAGE_UPDATES = new Set(['updateNewMessage', 'updateNewChannelMessage', 'updateNewScheduledMessage']);
+
+// What a send response says about the message it sent: its id and, when the
+// response carries the message itself, the update holding it.
+function readSendResponse(response, randomId) {
   const updates = Array.isArray(response?.updates) ? response.updates : [];
-  for (const update of updates) {
-    if (update?._ === 'updateMessageID' && randomIdsEqual(update.randomId, randomId)) {
-      return update.id;
-    }
-  }
-  for (const update of updates) {
-    if (update?._ === 'updateNewMessage' || update?._ === 'updateNewChannelMessage'
-        || update?._ === 'updateNewScheduledMessage') {
-      return update.message?.id ?? null;
-    }
-  }
-  return null;
+  const assignedId = updates.find(
+    (update) => update?._ === 'updateMessageID' && randomIdsEqual(update.randomId, randomId),
+  )?.id;
+  const messageUpdates = updates.filter((update) => SENT_MESSAGE_UPDATES.has(update?._));
+  const messageUpdate = assignedId === undefined
+    ? messageUpdates[0]
+    : messageUpdates.find((update) => update.message?.id === assignedId);
+  return { messageId: assignedId ?? messageUpdate?.message?.id ?? null, messageUpdate };
 }
 
-// The message a send response delivered to the chat, or null if it was only
-// scheduled: a scheduled message has no place in the chat's history yet.
-function parseDeliveredMessage(response, randomId) {
-  const messageId = extractMessageIdFromSendUpdates(response, randomId);
-  const updates = Array.isArray(response?.updates) ? response.updates : [];
-  const update = updates.find((candidate) => (
-    (candidate?._ === 'updateNewMessage' || candidate?._ === 'updateNewChannelMessage')
-    && candidate.message?._ === 'message'
-    && candidate.message.id === messageId
-  ));
-  return update ? new Message(update.message, PeersIndex.from(response)) : null;
+// The send has already gone through at this point, so a response that cannot be
+// parsed must not fail it.
+function parseSentMessage(messageUpdate, response) {
+  try {
+    return new Message(messageUpdate.message, PeersIndex.from(response), messageUpdate._ === 'updateNewScheduledMessage');
+  } catch (error) {
+    console.error(`[sendPhoto] Failed to parse sent message ${messageUpdate.message?.id}: ${error.message}`);
+    return null;
+  }
 }
 
 function coerceApiId(value) {
@@ -1179,7 +1177,6 @@ class TelegramClient {
       method: 'sendPhoto',
       peerRef: normalizeChannelId(channelId),
       media,
-      onSent: options.onSent,
       request: {
         _: 'messages.sendMedia',
         silent: options.silent ? true : undefined,
@@ -1194,7 +1191,7 @@ class TelegramClient {
     };
   }
 
-  async sendPreparedPhotoMessage(prepared) {
+  async sendPreparedPhotoMessage(prepared, { onSent } = {}) {
     const peer = await this.client.resolvePeer(prepared.peerRef);
     const chatId = peer?._ === 'inputPeerSelf'
       ? String(prepared.peerRef)
@@ -1203,8 +1200,9 @@ class TelegramClient {
     const request = { ...prepared.request, peer, media: normalizedMedia };
     const result = await this.client.call(request);
     this.client.handleClientUpdate(result, true);
-    prepared.onSent?.(parseDeliveredMessage(result, prepared.request.randomId));
-    const messageId = extractMessageIdFromSendUpdates(result, prepared.request.randomId);
+    const { messageId, messageUpdate } = readSendResponse(result, prepared.request.randomId);
+    const sentMessage = onSent && messageUpdate ? parseSentMessage(messageUpdate, result) : null;
+    if (sentMessage) onSent(sentMessage);
     if (!messageId) {
       throw new Error('Failed to resolve sent photo message id from Telegram updates.');
     }
@@ -1233,7 +1231,7 @@ class TelegramClient {
 
   async sendPhotoMessage(channelId, filePath, options = {}) {
     const prepared = await this.preparePhotoMessage(channelId, filePath, options);
-    return this.sendPreparedPhotoMessage(prepared);
+    return this.sendPreparedPhotoMessage(prepared, options);
   }
 
   async downloadMessageMedia(channelId, messageId, options = {}) {

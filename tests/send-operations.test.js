@@ -35,12 +35,22 @@ async function request(port, body) {
   return { status: res.status, json };
 }
 
+// A client send that reports its message through onSent, as the real client does.
+function reportingSend(result) {
+  return vi.fn(async (...args) => {
+    args.at(-1).onSent({ id: result.messageId });
+    return result;
+  });
+}
+
 describe('send operations against the warm client', () => {
+  const messageSyncService = { archiveSentMessage: vi.fn() };
+
   it('sendText returns the client result with attempts', async () => {
     const telegramClient = {
-      sendTextMessage: vi.fn().mockResolvedValue({ messageId: 55 }),
+      sendTextMessage: reportingSend({ messageId: 55 }),
     };
-    const result = await OPERATIONS.sendText({ telegramClient }, {
+    const result = await OPERATIONS.sendText({ telegramClient, messageSyncService }, {
       chat: '@c',
       text: 'hi',
       topicId: 3,
@@ -52,16 +62,18 @@ describe('send operations against the warm client', () => {
       parseMode: 'markdown',
       silent: true,
     }));
+    expect(messageSyncService.archiveSentMessage).toHaveBeenCalledWith({ id: 55 });
     expect(result).toEqual({ result: { messageId: 55 }, attempts: 1 });
   });
 
   it('retries a transient failure server-side and reports the attempt count', async () => {
+    const send = reportingSend({ messageId: 88 });
     const telegramClient = {
       sendTextMessage: vi.fn()
         .mockRejectedValueOnce(new Error('A wait of 1 seconds is required'))
-        .mockResolvedValueOnce({ messageId: 88 }),
+        .mockImplementationOnce(send),
     };
-    const result = await OPERATIONS.sendText({ telegramClient }, {
+    const result = await OPERATIONS.sendText({ telegramClient, messageSyncService }, {
       chat: '@c',
       text: 'hi',
       retries: 2,
@@ -91,15 +103,15 @@ describe('send operations against the warm client', () => {
     const prepared = { method: 'sendPhoto' };
     const telegramClient = {
       preparePhotoMessage: vi.fn().mockResolvedValue(prepared),
-      sendPreparedPhotoMessage: vi.fn().mockResolvedValue({ chatId: '1', messageId: 9, method: 'sendPhoto' }),
+      sendPreparedPhotoMessage: reportingSend({ chatId: '1', messageId: 9, method: 'sendPhoto' }),
     };
-    const result = await OPERATIONS.sendPhoto({ telegramClient }, {
+    const result = await OPERATIONS.sendPhoto({ telegramClient, messageSyncService }, {
       chat: '@c',
       photo: '/tmp/p.png',
       caption: 'hi',
     });
     expect(telegramClient.preparePhotoMessage).toHaveBeenCalledWith('@c', '/tmp/p.png', expect.objectContaining({ caption: 'hi' }));
-    expect(telegramClient.sendPreparedPhotoMessage).toHaveBeenCalledWith(prepared);
+    expect(telegramClient.sendPreparedPhotoMessage).toHaveBeenCalledWith(prepared, { onSent: expect.any(Function) });
     expect(result.attempts).toBe(1);
     expect(result.result).toMatchObject({ messageId: 9 });
   });
@@ -112,11 +124,11 @@ describe('/control/invoke send error relay', () => {
 
   beforeEach(async () => {
     telegramClient = {
-      sendTextMessage: vi.fn().mockResolvedValue({ messageId: 1 }),
+      sendTextMessage: reportingSend({ messageId: 1 }),
     };
     const handler = createControlRequestHandler({
       service: { getJobCounts: vi.fn(() => ({})) },
-      warmServices: { telegramClient, messageSyncService: {} },
+      warmServices: { telegramClient, messageSyncService: { archiveSentMessage: vi.fn() } },
       token: TOKEN,
       pid: 1,
       version: '1',

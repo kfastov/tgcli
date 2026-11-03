@@ -196,6 +196,13 @@ function normalizeChannelKey(channelId) {
   return String(normalizeChannelId(channelId));
 }
 
+// mtcute builds the message of an updateShortSentMessage from the response alone,
+// which has no reply header and no link preview. Telegram answers that way only to
+// text sent outside channels, so any such send may need a full copy afterwards.
+function mayLackFullContent(message) {
+  return message.raw?.peerId?._ !== 'peerChannel' && !message.raw?.media;
+}
+
 function normalizePeerType(peer) {
   if (!peer) return 'chat';
   if (peer.type === 'user' || peer.type === 'bot') return 'user';
@@ -716,6 +723,14 @@ export default class MessageSyncService {
     this._ensureMessageColumn('files', 'TEXT');
     this._ensureMessageColumn('sender', 'TEXT');
     this._ensureMessageColumn('topic', 'TEXT');
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS incomplete_sent_messages (
+        channel_id TEXT NOT NULL,
+        message_id INTEGER NOT NULL,
+        PRIMARY KEY (channel_id, message_id)
+      );
+    `);
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS message_links (
@@ -2092,6 +2107,7 @@ export default class MessageSyncService {
   resumePendingJobs() {
     this._resetErroredJobs();
     void this.processQueue();
+    void this.completeSentMessages();
   }
 
   // Worker-only teardown. Stops the queue loop, requeues *only* the job this
@@ -3196,21 +3212,37 @@ export default class MessageSyncService {
     return row.sync_enabled === 1;
   }
 
-  _handleIncomingMessage(message, { isEdit, moveCursors = true }) {
-    if (!message?.chat?.id) {
+  _handleIncomingMessage(message, { isEdit }) {
+    const record = this._writeMessage(message, { isEdit });
+    if (!record) {
       return;
+    }
+
+    const messageDate = toIsoString(record.date);
+    this._updateChannelCursors(record.channel_id, {
+      lastMessageId: record.message_id,
+      lastMessageDate: messageDate,
+      oldestMessageId: record.message_id,
+      oldestMessageDate: messageDate,
+    });
+  }
+
+  // Returns the written record, or null if the message does not belong in the archive.
+  _writeMessage(message, { isEdit }) {
+    if (!message?.chat?.id) {
+      return null;
     }
     // A scheduled message is not in the chat's history yet: its id comes from a
     // separate sequence, and it arrives again as a normal message once delivered.
     if (message.isScheduled) {
-      return;
+      return null;
     }
 
     const channelId = String(message.chat.id);
     const channelRow = this._ensureChannelFromPeer(channelId, message.chat);
     const syncEnabled = channelRow ? channelRow.sync_enabled === 1 : this._isChannelActive(channelId);
     if (!syncEnabled) {
-      return;
+      return null;
     }
 
     const senderRecord = this._buildUserRecordFromPeer(message.sender || message.from || message.author);
@@ -3223,37 +3255,56 @@ export default class MessageSyncService {
 
     if (isEdit) {
       this.upsertMessageStmt.run(record);
-      this._replaceMessageLinks(record);
-      this._replaceMessageMedia(record);
     } else {
       this.insertMessageStmt.run(record);
-      this._replaceMessageLinks(record);
-      this._replaceMessageMedia(record);
     }
-
-    if (!moveCursors) {
-      return;
-    }
-
-    const messageDate = toIsoString(serialized.date);
-    this._updateChannelCursors(channelId, {
-      lastMessageId: serialized.id,
-      lastMessageDate: messageDate,
-      oldestMessageId: serialized.id,
-      oldestMessageDate: messageDate,
-    });
+    this._replaceMessageLinks(record);
+    this._replaceMessageMedia(record);
+    return record;
   }
 
   // mtcute keeps a client's own sends out of onNewMessage, so the send operations
   // archive them here. The cursors stay put: a send says nothing about messages
   // that arrived while the server was down, and moving last_message_id past them
-  // would hide them from _syncNewerMessages. Errors stop here because the message
-  // is already delivered, and failing the send would make the caller post it again.
+  // would hide them from _syncNewerMessages. Errors are the caller's to contain,
+  // as the message has already gone through.
   archiveSentMessage(message) {
-    try {
-      this._handleIncomingMessage(message, { isEdit: false, moveCursors: false });
-    } catch (error) {
-      console.error(`[archive] Failed to archive sent message ${message?.id} in chat ${message?.chat?.id}: ${error?.message ?? error}`);
+    const record = this._writeMessage(message, { isEdit: false });
+    if (!record) {
+      console.log(`[archive] Skipped sent message ${message?.id}: scheduled, or its chat is not synced.`);
+      return;
+    }
+    console.log(`[archive] Archived sent message ${record.message_id} in chat ${record.channel_id}.`);
+    if (mayLackFullContent(message)) {
+      this.db.prepare(`
+        INSERT OR IGNORE INTO incomplete_sent_messages (channel_id, message_id) VALUES (?, ?)
+      `).run(record.channel_id, record.message_id);
+      void this.completeSentMessages();
+    }
+  }
+
+  // Replaces queued rows with Telegram's full copy. This has to be an explicit
+  // request: history goes through INSERT OR IGNORE and would never replace the row,
+  // and sync stops reaching it once the next message moves the cursor. Runs apart
+  // from the send, whose result must not wait on it or depend on it, so the queue
+  // lets a failure be retried on the next send or server start.
+  async completeSentMessages() {
+    const queued = this.db.prepare('SELECT channel_id, message_id FROM incomplete_sent_messages').all();
+    for (const { channel_id: channelId, message_id: messageId } of queued) {
+      try {
+        const message = await this.telegramClient.getMessageById(channelId, messageId);
+        if (message) {
+          const record = this._buildMessageRecord(channelId, message);
+          this.upsertMessageStmt.run(record);
+          this._replaceMessageLinks(record);
+          this._replaceMessageMedia(record);
+        }
+        this.db.prepare(`
+          DELETE FROM incomplete_sent_messages WHERE channel_id = ? AND message_id = ?
+        `).run(channelId, messageId);
+      } catch (error) {
+        console.error(`[archive] Could not complete sent message ${messageId} in chat ${channelId}, will retry: ${error?.message ?? error}`);
+      }
     }
   }
 
