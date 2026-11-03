@@ -592,6 +592,7 @@ export default class MessageSyncService {
         oldest_message_id INTEGER,
         oldest_message_date TEXT,
         gap_after_message_id INTEGER,
+        newer_sync_pending INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
@@ -647,6 +648,14 @@ export default class MessageSyncService {
     this._ensureChannelColumn('chat_type', 'TEXT');
     this._ensureChannelColumn('is_forum', 'INTEGER');
     this._ensureChannelColumn('gap_after_message_id', 'INTEGER');
+    if (this._ensureChannelColumn('newer_sync_pending', 'INTEGER NOT NULL DEFAULT 0')) {
+      // Jobs queued before this column existed still have their catch-up ahead of them.
+      this.db.prepare(`
+        UPDATE channels
+        SET newer_sync_pending = 1
+        WHERE channel_id IN (SELECT channel_id FROM jobs WHERE status != ?)
+      `).run(JOB_STATUS.IDLE);
+    }
     this._ensureJobColumn('target_message_count', `INTEGER DEFAULT ${DEFAULT_TARGET_MESSAGES}`);
     this._ensureJobColumn('message_count', 'INTEGER DEFAULT 0');
     this._ensureJobColumn('cursor_message_id', 'INTEGER');
@@ -1251,9 +1260,11 @@ export default class MessageSyncService {
 
   _ensureChannelColumn(column, definition) {
     const existing = this.db.prepare('PRAGMA table_info(channels)').all();
-    if (!existing.some((col) => col.name === column)) {
-      this.db.exec(`ALTER TABLE channels ADD COLUMN ${column} ${definition}`);
+    if (existing.some((col) => col.name === column)) {
+      return false;
     }
+    this.db.exec(`ALTER TABLE channels ADD COLUMN ${column} ${definition}`);
+    return true;
   }
 
   _ensureMessageColumn(column, definition) {
@@ -1877,10 +1888,13 @@ export default class MessageSyncService {
     const minDate = options.minDate ? parseIsoDate(options.minDate) : null;
     const minDateIso = minDate ? new Date(minDate * 1000).toISOString() : null;
 
+    // Stays set until a catch-up reaches the newest message, even if this job is canceled.
     this.db.prepare(`
-      INSERT INTO channels (channel_id, updated_at)
-      VALUES (?, CURRENT_TIMESTAMP)
-      ON CONFLICT(channel_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
+      INSERT INTO channels (channel_id, newer_sync_pending, updated_at)
+      VALUES (?, 1, CURRENT_TIMESTAMP)
+      ON CONFLICT(channel_id) DO UPDATE SET
+        newer_sync_pending = 1,
+        updated_at = CURRENT_TIMESTAMP
     `).run(normalizedId);
 
     const stmt = this.db.prepare(`
@@ -3213,7 +3227,8 @@ export default class MessageSyncService {
     return this.db.prepare(`
       SELECT channel_id, peer_title, peer_type, username, sync_enabled,
              last_message_id, last_message_date, oldest_message_id, oldest_message_date,
-             gap_after_message_id
+             gap_after_message_id,
+             newer_sync_pending
       FROM channels
       WHERE channel_id = ?
     `).get(channelId);
@@ -3284,6 +3299,16 @@ export default class MessageSyncService {
     );
   }
 
+  // last_message_id is where a pending catch-up resumes, so until it reaches the newest
+  // message updates leave it alone: their message may be far above what is fetched so far.
+  // The catch-up sees that message again on its way up, and the archive ignores the repeat.
+  _updateChannelCursorsFromUpdate(channelId, { lastMessageId, lastMessageDate, ...oldest }) {
+    const newest = this._getChannel(channelId)?.newer_sync_pending
+      ? {}
+      : { lastMessageId, lastMessageDate };
+    this._updateChannelCursors(channelId, { ...newest, ...oldest });
+  }
+
   _ensureChannelFromPeer(channelId, peer) {
     const peerTitle = peer?.displayName ?? null;
     const peerType = normalizePeerType(peer);
@@ -3322,7 +3347,7 @@ export default class MessageSyncService {
     }
 
     const messageDate = toIsoString(record.date);
-    this._updateChannelCursors(record.channel_id, {
+    this._updateChannelCursorsFromUpdate(record.channel_id, {
       lastMessageId: record.message_id,
       lastMessageDate: messageDate,
       oldestMessageId: record.message_id,
@@ -3544,7 +3569,7 @@ export default class MessageSyncService {
     // and will not report them again, so the gap has to be on disk before anything else.
     const hasGap = this._markChannelGap(batchChannelId);
 
-    this._updateChannelCursors(batchChannelId, {
+    this._updateChannelCursorsFromUpdate(batchChannelId, {
       lastMessageId: latestMessageId,
       lastMessageDate: latestMessageDate,
       oldestMessageId: oldestMessageId,
@@ -3566,11 +3591,7 @@ export default class MessageSyncService {
 
     // A recorded gap starts below the cursor. Any sync of the channel fills it.
     const fillingGap = channel.gap_after_message_id !== null;
-    let minId = fillingGap ? channel.gap_after_message_id : (channel.last_message_id || 0);
-    let lastMessageId = channel.last_message_id || 0;
-    let lastMessageDate = channel.last_message_date || null;
-    let oldestMessageId = channel.oldest_message_id || null;
-    let oldestMessageDate = channel.oldest_message_date || null;
+    let lastMessageId = fillingGap ? channel.gap_after_message_id : (channel.last_message_id || 0);
     let hasMoreNewer = false;
     let stoppedEarly = false;
     let peerTitle = channel.peer_title;
@@ -3581,10 +3602,13 @@ export default class MessageSyncService {
         stoppedEarly = true;
         break;
       }
+      // Pages go oldest first and the cursor moves after each one, so it only ever
+      // passes archived messages and an interrupted run resumes without a hole. With no
+      // cursor yet this returns the newest batch: older history is _backfillHistory's.
       const { peerTitle: title, peerType: type, messages } = await this.telegramClient.getMessagesByChannelId(
         normalizedId,
         this.batchSize,
-        { afterId: minId },
+        { afterId: lastMessageId },
       );
 
       if (this.stopRequested) {
@@ -3596,7 +3620,7 @@ export default class MessageSyncService {
       peerType = type ?? peerType;
 
       const newMessages = messages
-        .filter((msg) => msg.id > minId)
+        .filter((msg) => msg.id > lastMessageId)
         .sort((a, b) => a.id - b.id);
 
       if (!newMessages.length) {
@@ -3622,14 +3646,14 @@ export default class MessageSyncService {
       const oldest = newMessages[0];
 
       lastMessageId = newest.id;
-      lastMessageDate = toIsoString(newest.date) || lastMessageDate;
 
-      if (!oldestMessageId || oldest.id < oldestMessageId) {
-        oldestMessageId = oldest.id;
-        oldestMessageDate = toIsoString(oldest.date) || oldestMessageDate;
-      }
+      this._updateChannelCursors(normalizedId, {
+        lastMessageId: newest.id,
+        lastMessageDate: toIsoString(newest.date),
+        oldestMessageId: oldest.id,
+        oldestMessageDate: toIsoString(oldest.date),
+      });
 
-      minId = newest.id;
       hasMoreNewer = newMessages.length >= this.batchSize;
       // The start moves up with each page, so an interrupted fill loses nothing.
       if (fillingGap) {
@@ -3644,7 +3668,12 @@ export default class MessageSyncService {
         break;
       }
 
+      console.log(`[sync] Channel ${normalizedId}: archived up to message ${newest.id}, fetching newer.`);
       await delay(this.interBatchDelayMs);
+    }
+
+    if (!stoppedEarly) {
+      this.db.prepare('UPDATE channels SET newer_sync_pending = 0 WHERE channel_id = ?').run(normalizedId);
     }
 
     if (peerTitle || peerType) {
@@ -3658,13 +3687,6 @@ export default class MessageSyncService {
       });
     }
 
-    this._updateChannelCursors(normalizedId, {
-      lastMessageId,
-      lastMessageDate,
-      oldestMessageId,
-      oldestMessageDate,
-    });
-
     if (fillingGap && !stoppedEarly) {
       this._setChannelGapStart(normalizedId, null);
       console.log(`[sync] Channel ${normalizedId}: gap closed.`);
@@ -3673,7 +3695,6 @@ export default class MessageSyncService {
     return {
       hasMoreNewer,
       lastMessageId,
-      oldestMessageId,
       stoppedEarly,
     };
   }

@@ -243,7 +243,7 @@ describe('archiving messages sent by tgcli', () => {
   `).get(channelId).sync_enabled;
 
   const liveHistory = (...messages) => {
-    harness.telegramClient.getMessagesByChannelId = vi.fn(async (_id, _limit, { minId }) => ({
+    harness.telegramClient.getMessagesByChannelId = vi.fn(async (_id, _limit, { afterId: minId }) => ({
       peerTitle: 'Group',
       peerType: 'chat',
       messages: messages
