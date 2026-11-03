@@ -2047,21 +2047,29 @@ export default class MessageSyncService {
       this._handleDeleteMessage(update);
     };
 
-    this.telegramClient.client.onNewMessage.add(newMessageHandler);
-    this.telegramClient.client.onEditMessage.add(editMessageHandler);
-    this.telegramClient.client.onDeleteMessage.add(deleteMessageHandler);
-
     this.realtimeHandlers = {
       newMessageHandler,
       editMessageHandler,
       deleteMessageHandler,
     };
+    this._attachRealtimeHandlers();
+
+    this.unsubscribeClientReplaced = this.telegramClient.onClientReplaced(() => {
+      this._attachRealtimeHandlers();
+    });
 
     this.unsubscribeChannelTooLong = this.telegramClient.onChannelTooLong((payload) => {
       this._handleChannelTooLong(payload);
     });
 
     this.realtimeActive = true;
+  }
+
+  _attachRealtimeHandlers() {
+    const { client } = this.telegramClient;
+    client.onNewMessage.add(this.realtimeHandlers.newMessageHandler);
+    client.onEditMessage.add(this.realtimeHandlers.editMessageHandler);
+    client.onDeleteMessage.add(this.realtimeHandlers.deleteMessageHandler);
   }
 
   async processQueue() {
@@ -2127,6 +2135,10 @@ export default class MessageSyncService {
       this.telegramClient.client.onEditMessage.remove(this.realtimeHandlers.editMessageHandler);
       this.telegramClient.client.onDeleteMessage.remove(this.realtimeHandlers.deleteMessageHandler);
       this.realtimeHandlers = null;
+      if (this.unsubscribeClientReplaced) {
+        this.unsubscribeClientReplaced();
+        this.unsubscribeClientReplaced = null;
+      }
       if (this.unsubscribeChannelTooLong) {
         this.unsubscribeChannelTooLong();
         this.unsubscribeChannelTooLong = null;

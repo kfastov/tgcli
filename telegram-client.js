@@ -583,6 +583,7 @@ class TelegramClient {
     this.client = this._createClient();
     this.updatesRunning = false;
     this.rawUpdateHandler = null;
+    this.updateEmitter.emit('clientReplaced');
   }
 
   async _resetSessionAndClient() {
@@ -1579,6 +1580,13 @@ class TelegramClient {
   onChannelTooLong(listener) {
     this.updateEmitter.on('channelTooLong', listener);
     return () => this.updateEmitter.off('channelTooLong', listener);
+  }
+
+  // Listeners on the mtcute client die with it. Fires before the new client logs in,
+  // so whoever re-subscribes here is in time for its catch-up.
+  onClientReplaced(listener) {
+    this.updateEmitter.on('clientReplaced', listener);
+    return () => this.updateEmitter.off('clientReplaced', listener);
   }
 
   async startUpdates() {
