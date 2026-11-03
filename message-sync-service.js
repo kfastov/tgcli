@@ -5,6 +5,7 @@ import { setTimeout as delay } from 'timers/promises';
 import { Message, PeersIndex, _messageMediaFromTl } from '@mtcute/core';
 import { normalizeChannelId, summarizeMedia } from './telegram-client.js';
 import { resolveStoreDir, resolveStorePaths } from './core/store.js';
+import { parseRequiredWaitSeconds } from './core/send-utils.js';
 
 const DEFAULT_DB_PATH = resolveStorePaths(resolveStoreDir()).dbPath;
 const DEFAULT_TARGET_MESSAGES = 1000;
@@ -196,11 +197,6 @@ const TAG_RULES = [
     ],
   },
 ];
-
-function parseFloodWaitSeconds(error) {
-  const match = /wait of (\d+) seconds is required/i.exec(error?.message || '');
-  return match ? Number(match[1]) : null;
-}
 
 function normalizeChannelKey(channelId) {
   return String(normalizeChannelId(channelId));
@@ -1371,6 +1367,10 @@ export default class MessageSyncService {
     `).run(messageId, channelId);
   }
 
+  _closeChannelGap(channelId) {
+    this._setChannelGapStart(channelId, null);
+  }
+
   _getGapChannelIds() {
     return this.db.prepare(`
       SELECT channel_id FROM channels
@@ -1989,6 +1989,20 @@ export default class MessageSyncService {
     return stmt.get(normalizedId, target, minDateIso);
   }
 
+  // What arrived while a chat was off still has to be fetched. Queues a job, keeping
+  // the depth of an earlier one, unless one is already waiting or running.
+  queueResyncJob(channelId) {
+    const [existing] = this.listJobs({ channelId, limit: 1 });
+    if (existing?.status === JOB_STATUS.PENDING || existing?.status === JOB_STATUS.IN_PROGRESS) {
+      return { job: existing, queued: false };
+    }
+    const job = existing
+      ? this.addJob(channelId, { depth: existing.target_message_count, minDate: existing.backfill_min_date })
+      : this.addJob(channelId);
+    void this.processQueue();
+    return { job, queued: true };
+  }
+
   listJobs(options = {}) {
     const status = options.status ? String(options.status) : null;
     const channelId = options.channelId ? normalizeChannelKey(options.channelId) : null;
@@ -2331,7 +2345,7 @@ export default class MessageSyncService {
       if (this.stopRequested) {
         return;
       }
-      const waitSeconds = parseFloodWaitSeconds(error);
+      const waitSeconds = parseRequiredWaitSeconds(error);
       if (waitSeconds !== null) {
         console.log(`[sync] Channel ${channelId}: rate limited, waiting ${waitSeconds}s before fetching the rest of the gap.`);
         await this._delayUnlessStopped(waitSeconds * 1000);
@@ -3031,7 +3045,7 @@ export default class MessageSyncService {
         this._updateJobStatus(job.id, JOB_STATUS.PENDING);
         return;
       }
-      const waitSeconds = parseFloodWaitSeconds(error);
+      const waitSeconds = parseRequiredWaitSeconds(error);
       if (waitSeconds !== null) {
         this.db.prepare(`
           UPDATE jobs
@@ -3565,6 +3579,9 @@ export default class MessageSyncService {
         DELETE FROM sent_messages_to_refetch WHERE channel_id = ? AND message_id = ?
       `).run(channelId, messageId);
     } catch (error) {
+      if (this.stopRequested) {
+        return;
+      }
       console.error(`[archive] Could not refetch sent message ${messageId} in chat ${channelId}, will retry on the next server start: ${error?.message ?? error}`);
     }
   }
@@ -3573,6 +3590,9 @@ export default class MessageSyncService {
     try {
       const queued = this.db.prepare('SELECT channel_id, message_id FROM sent_messages_to_refetch').all();
       for (const { channel_id: channelId, message_id: messageId } of queued) {
+        if (this.stopRequested) {
+          return;
+        }
         await this._refetchSentMessage(channelId, messageId);
       }
     } catch (error) {
@@ -3760,19 +3780,7 @@ export default class MessageSyncService {
         break;
       }
 
-      const userRecords = new Map();
-      for (const message of newMessages) {
-        const userRecord = this._buildUserRecordFromSerialized(message);
-        if (userRecord) {
-          userRecords.set(userRecord.user_id, userRecord);
-        }
-      }
-
-      const records = newMessages.map((msg) => this._buildMessageRecord(normalizedId, msg));
-      this.insertMessagesTx(records);
-      if (userRecords.size) {
-        this.upsertUsersTx([...userRecords.values()]);
-      }
+      this.archiveHistoryMessages(normalizedId, newMessages);
 
       const newest = newMessages[newMessages.length - 1];
       const oldest = newMessages[0];
@@ -3820,7 +3828,7 @@ export default class MessageSyncService {
     }
 
     if (fillingGap && !stoppedEarly) {
-      this._setChannelGapStart(normalizedId, null);
+      this._closeChannelGap(normalizedId);
       console.log(`[sync] Channel ${normalizedId}: gap closed.`);
     }
 

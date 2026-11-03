@@ -466,6 +466,44 @@ describe('catching up on messages newer than the cursor', () => {
     expect(archivedIds()).toEqual(range(1, 20));
   });
 
+  describe('queueResyncJob', () => {
+    beforeEach(() => {
+      vi.spyOn(service, 'processQueue').mockResolvedValue();
+    });
+
+    it('queues a job for a chat without one', () => {
+      seedChat();
+
+      const { job, queued } = service.queueResyncJob(CHANNEL_ID);
+
+      expect(queued).toBe(true);
+      expect(job.status).toBe('pending');
+      expect(service.processQueue).toHaveBeenCalledTimes(1);
+    });
+
+    it('leaves a job alone that is already waiting', () => {
+      seedChat();
+      const existing = addJob();
+
+      const { job, queued } = service.queueResyncJob(CHANNEL_ID);
+
+      expect(queued).toBe(false);
+      expect(job.id).toBe(existing.id);
+    });
+
+    it.each(['idle', 'error'])('runs a job again that is %s, keeping its depth', (status) => {
+      seedChat();
+      service.addJob(CHANNEL_ID, { depth: 77 });
+      service.db.prepare('UPDATE jobs SET status = ? WHERE channel_id = ?').run(status, CHANNEL_ID);
+
+      const { job, queued } = service.queueResyncJob(CHANNEL_ID);
+
+      expect(queued).toBe(true);
+      expect(job.status).toBe('pending');
+      expect(job.target_message_count).toBe(77);
+    });
+  });
+
   describe('getMessagesByChannelId afterId', () => {
     it('returns the oldest messages above afterId, far from both ends of the chat', async () => {
       historyIds = range(1, 500);

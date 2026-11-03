@@ -232,9 +232,7 @@ describe('POST /control/invoke', () => {
       },
       messageSyncService: {
         setChannelSync: vi.fn(() => ({ channel_id: '@g', sync_enabled: 1 })),
-        listJobs: vi.fn(() => []),
-        addJob: vi.fn(() => ({ id: 5, status: 'pending' })),
-        processQueue: vi.fn(),
+        queueResyncJob: vi.fn(() => ({ job: { id: 5, status: 'pending' }, queued: true })),
       },
     };
     ensureLogin = vi.fn(() => Promise.resolve());
@@ -275,7 +273,7 @@ describe('POST /control/invoke', () => {
     });
     expect(status).toBe(200);
     expect(warmServices.messageSyncService.setChannelSync).toHaveBeenCalledWith('@g', true);
-    expect(warmServices.messageSyncService.addJob).toHaveBeenCalledWith('@g');
+    expect(warmServices.messageSyncService.queueResyncJob).toHaveBeenCalledWith('@g');
     expect(json.result).toMatchObject({ channelId: '@g', syncEnabled: true, jobId: 5, jobQueued: true });
     expect(ensureLogin).toHaveBeenCalledTimes(1);
   });

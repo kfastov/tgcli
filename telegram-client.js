@@ -1209,7 +1209,7 @@ class TelegramClient {
     if (!messageId) {
       throw new Error('Failed to resolve sent photo message id from Telegram updates.');
     }
-    const scheduled = prepared.request.scheduleDate ? { scheduled: true } : {};
+    const scheduledField = prepared.request.scheduleDate ? { scheduled: true } : {};
     let sent;
     try {
       // Scheduled messages have their own id space; getMessages would miss them or hit an unrelated message.
@@ -1220,12 +1220,12 @@ class TelegramClient {
       console.error(`[sendPhoto] message lookup for enrichment failed for peer ${prepared.peerRef}, message ${messageId}: ${error.message}`);
     }
     if (sent) {
-      return { chatId, ...buildSendMessageResult(sent, { method: 'sendPhoto', defaultMediaType: 'photo' }), ...scheduled };
+      return { chatId, ...buildSendMessageResult(sent, { method: 'sendPhoto', defaultMediaType: 'photo' }), ...scheduledField };
     }
     return {
       chatId,
       messageId: Number(messageId),
-      ...scheduled,
+      ...scheduledField,
       method: 'sendPhoto',
       media: { type: 'photo' },
       warning: 'Media enrichment failed; file_id unavailable',

@@ -262,34 +262,20 @@ async function channelShow(ctx, args = {}) {
   };
 }
 
-// args: { chat, enable }. Toggle the per-chat archive flag; enabling also queues a
-// job unless one is already active, so what arrived while the chat was off gets
-// fetched. Returns the new sync state plus job info.
+// args: { chat, enable }. Toggle the per-chat archive flag; enabling also makes sure
+// a job fetches what arrived while the chat was off. Returns the new sync state plus
+// job info.
 async function channelSetSync(ctx, args = {}) {
   const result = ctx.messageSyncService.setChannelSync(args.chat, Boolean(args.enable));
-  let job = null;
-  let jobQueued = false;
-  if (args.enable) {
-    const [existing] = ctx.messageSyncService.listJobs({ channelId: args.chat, limit: 1 });
-    if (existing && existing.status !== 'idle') {
-      job = existing;
-    } else {
-      job = existing
-        ? ctx.messageSyncService.addJob(args.chat, {
-          depth: existing.target_message_count,
-          minDate: existing.backfill_min_date,
-        })
-        : ctx.messageSyncService.addJob(args.chat);
-      jobQueued = true;
-      void ctx.messageSyncService.processQueue();
-    }
-  }
+  const { job, queued } = args.enable
+    ? ctx.messageSyncService.queueResyncJob(args.chat)
+    : { job: null, queued: false };
   return {
     channelId: result.channel_id,
     syncEnabled: Boolean(result.sync_enabled),
     jobId: job?.id ?? null,
     jobStatus: job?.status ?? null,
-    jobQueued,
+    jobQueued: queued,
   };
 }
 
