@@ -1,5 +1,5 @@
 import { TelegramClient as MtCuteClient } from '@mtcute/node';
-import { InputMedia } from '@mtcute/core';
+import { InputMedia, Message, PeersIndex } from '@mtcute/core';
 import { randomLong } from '@mtcute/core/utils.js';
 import { html } from '@mtcute/html-parser';
 import { md } from '@mtcute/markdown-parser';
@@ -253,6 +253,19 @@ function extractMessageIdFromSendUpdates(response, randomId) {
     }
   }
   return null;
+}
+
+// The message a send response delivered to the chat, or null if it was only
+// scheduled: a scheduled message has no place in the chat's history yet.
+function parseDeliveredMessage(response, randomId) {
+  const messageId = extractMessageIdFromSendUpdates(response, randomId);
+  const updates = Array.isArray(response?.updates) ? response.updates : [];
+  const update = updates.find((candidate) => (
+    (candidate?._ === 'updateNewMessage' || candidate?._ === 'updateNewChannelMessage')
+    && candidate.message?._ === 'message'
+    && candidate.message.id === messageId
+  ));
+  return update ? new Message(update.message, PeersIndex.from(response)) : null;
 }
 
 function coerceApiId(value) {
@@ -1113,6 +1126,7 @@ class TelegramClient {
     const params = buildTextSendParams(options);
     const peerRef = normalizeChannelId(channelId);
     const sent = await this.client.sendText(peerRef, inputText, params);
+    options.onSent?.(sent);
     return { messageId: sent.id };
   }
 
@@ -1136,6 +1150,7 @@ class TelegramClient {
     const media = InputMedia.auto(uploadPath, mediaOptions);
     const peerRef = normalizeChannelId(channelId);
     const sent = await this.client.sendMedia(peerRef, media, buildMediaSendParams(options));
+    options.onSent?.(sent);
     return buildSendMessageResult(sent, { method: 'sendDocument', defaultMediaType: 'document' });
   }
 
@@ -1163,6 +1178,7 @@ class TelegramClient {
       method: 'sendPhoto',
       peerRef: normalizeChannelId(channelId),
       media,
+      onSent: options.onSent,
       request: {
         _: 'messages.sendMedia',
         silent: options.silent ? true : undefined,
@@ -1186,6 +1202,7 @@ class TelegramClient {
     const request = { ...prepared.request, peer, media: normalizedMedia };
     const result = await this.client.call(request);
     this.client.handleClientUpdate(result, true);
+    prepared.onSent?.(parseDeliveredMessage(result, prepared.request.randomId));
     const messageId = extractMessageIdFromSendUpdates(result, prepared.request.randomId);
     if (!messageId) {
       throw new Error('Failed to resolve sent photo message id from Telegram updates.');

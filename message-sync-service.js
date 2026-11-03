@@ -3196,8 +3196,13 @@ export default class MessageSyncService {
     return row.sync_enabled === 1;
   }
 
-  _handleIncomingMessage(message, { isEdit }) {
+  _handleIncomingMessage(message, { isEdit, moveCursors = true }) {
     if (!message?.chat?.id) {
+      return;
+    }
+    // A scheduled message is not in the chat's history yet: its id comes from a
+    // separate sequence, and it arrives again as a normal message once delivered.
+    if (message.isScheduled) {
       return;
     }
 
@@ -3226,6 +3231,10 @@ export default class MessageSyncService {
       this._replaceMessageMedia(record);
     }
 
+    if (!moveCursors) {
+      return;
+    }
+
     const messageDate = toIsoString(serialized.date);
     this._updateChannelCursors(channelId, {
       lastMessageId: serialized.id,
@@ -3233,6 +3242,19 @@ export default class MessageSyncService {
       oldestMessageId: serialized.id,
       oldestMessageDate: messageDate,
     });
+  }
+
+  // mtcute keeps a client's own sends out of onNewMessage, so the send operations
+  // archive them here. The cursors stay put: a send says nothing about messages
+  // that arrived while the server was down, and moving last_message_id past them
+  // would hide them from _syncNewerMessages. Errors stop here because the message
+  // is already delivered, and failing the send would make the caller post it again.
+  archiveSentMessage(message) {
+    try {
+      this._handleIncomingMessage(message, { isEdit: false, moveCursors: false });
+    } catch (error) {
+      console.error(`[archive] Failed to archive sent message ${message?.id} in chat ${message?.chat?.id}: ${error?.message ?? error}`);
+    }
   }
 
   _handleDeleteMessage(update) {

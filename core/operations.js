@@ -620,6 +620,13 @@ async function runSend(sendFn, { method, retries, retryBackoff, timeoutMs }) {
   });
 }
 
+// The realtime handlers never see the client's own sends, so a send hands its
+// message straight to the archive. Passed down as a callback because the send
+// result itself goes back to the caller as JSON.
+function archiveSent(ctx) {
+  return (message) => ctx.messageSyncService?.archiveSentMessage(message);
+}
+
 // args: { chat, text, parseMode?, topicId?, replyToMessageId?, noPreview?, silent?,
 // noforwards?, scheduleDate?, retries?, retryBackoff?, timeoutMs? }.
 // Returns { result, attempts }.
@@ -633,6 +640,7 @@ async function sendText(ctx, args = {}) {
       silent: args.silent || false,
       noforwards: args.noforwards || false,
       scheduleDate: args.scheduleDate,
+      onSent: archiveSent(ctx),
     }),
     { method: 'sendText', retries: args.retries, retryBackoff: args.retryBackoff, timeoutMs: args.timeoutMs },
   );
@@ -651,6 +659,7 @@ async function sendPhoto(ctx, args = {}) {
     captionAbove: args.captionAbove || false,
     spoiler: args.spoiler || false,
     scheduleDate: args.scheduleDate,
+    onSent: archiveSent(ctx),
   });
   return runSend(
     () => ctx.telegramClient.sendPreparedPhotoMessage(prepared),
@@ -674,6 +683,7 @@ async function sendFile(ctx, args = {}) {
       spoiler: args.spoiler || false,
       scheduleDate: args.scheduleDate,
       forceDocument: args.forceDocument || false,
+      onSent: archiveSent(ctx),
     }),
     { method: 'sendFile', retries: args.retries, retryBackoff: args.retryBackoff, timeoutMs: args.timeoutMs },
   );
