@@ -576,22 +576,57 @@ describe('cold start catch-up', () => {
       await vi.waitFor(() => expect(recordedGap(CHANNEL_ID)).toBeNull());
     });
 
-    it('retries a failed gap on the next start without spinning on it now', async () => {
+    async function failFirstGapFill() {
       const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
       telegram.history.set(BARE_CHANNEL_ID, channelHistory(1, 20));
       telegram.dialogs = [dialogWith(CHANNEL_PEER, 20)];
       telegram.failNext.set('messages.getHistory', new Error('history unavailable'));
-      const { ensureConnected, messageSyncService } = startServer();
-      seedCursor(messageSyncService, CHANNEL_ID, 10);
-      await ensureConnected();
-
+      const server = startServer();
+      seedCursor(server.messageSyncService, CHANNEL_ID, 10);
+      await server.ensureConnected();
       await vi.waitFor(() => expect(errorLog).toHaveBeenCalledTimes(1));
-      await vi.waitFor(() => expect(messageSyncService.processing).toBe(false));
+      await vi.waitFor(() => expect(server.messageSyncService.processing).toBe(false));
+      return { ...server, errorLog };
+    }
+
+    it('does not spin on a failed gap, and says when it will try again', async () => {
+      const { messageSyncService, errorLog } = await failFirstGapFill();
       expect(recordedGap(CHANNEL_ID)).toBe(10);
+      expect(errorLog.mock.calls[0][0]).toContain('retrying in 60s');
+      expect(messageSyncService.getQueueStats().gaps).toBe(1);
       const pagesAfterFailure = telegram.historyPages;
 
       await messageSyncService.processQueue();
+
       expect(telegram.historyPages).toBe(pagesAfterFailure);
+    });
+
+    it('retries a failed gap while the server keeps running', async () => {
+      const { messageSyncService } = await failFirstGapFill();
+      messageSyncService.gapRetries.get(CHANNEL_ID).retryAt = Date.now();
+      clearTimeout(messageSyncService.gapRetryTimer);
+      await messageSyncService.processQueue();
+
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual(ID_11_TO_20));
+      await vi.waitFor(() => expect(recordedGap(CHANNEL_ID)).toBeNull());
+      expect(messageSyncService.gapRetries.size).toBe(0);
+      expect(messageSyncService.getQueueStats().gaps).toBe(0);
+    });
+
+    it('wakes the queue by itself when the retry is due, waiting longer after each failure', async () => {
+      const { messageSyncService, errorLog } = await failFirstGapFill();
+      telegram.failNext.set('messages.getHistory', new Error('still unavailable'));
+
+      messageSyncService.gapRetries.get(CHANNEL_ID).retryAt = Date.now() + 5;
+      messageSyncService._scheduleNextGapRetry();
+
+      await vi.waitFor(() => expect(errorLog).toHaveBeenCalledTimes(2));
+      expect(errorLog.mock.calls[1][0]).toContain('retrying in 120s');
+      expect(messageSyncService.gapRetries.get(CHANNEL_ID).attempts).toBe(2);
+    });
+
+    it('retries a failed gap on the next start', async () => {
+      await failFirstGapFill();
 
       await stopServer();
       const restarted = startServer();
@@ -607,7 +642,7 @@ describe('cold start catch-up', () => {
       telegram.dialogsGate = deferred();
       const { ensureConnected, messageSyncService } = startWithGapAfter10();
       await ensureConnected();
-      await vi.waitFor(() => expect(messageSyncService.failedGapChannelIds.size).toBe(1));
+      await vi.waitFor(() => expect(messageSyncService.gapRetries.size).toBe(1));
 
       telegram.dialogsGate.resolve();
 

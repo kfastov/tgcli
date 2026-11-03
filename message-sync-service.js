@@ -563,9 +563,10 @@ export default class MessageSyncService {
     this.realtimeHandlers = null;
     this.unsubscribeChannelTooLong = null;
     this.unsubscribeClientReplaced = null;
-    // Channels whose gap failed in this run. The gap stays recorded and is retried on
-    // the next start, instead of the queue spinning on it now.
-    this.failedGapChannelIds = new Set();
+    // Channels whose gap failed, as { attempts, retryAt }. The gap stays recorded, and
+    // the queue gets on with other work instead of spinning on it.
+    this.gapRetries = new Map();
+    this.gapRetryTimer = null;
     // While set, updates leave last_message_id where it is; see reconcileWithDialogs.
     this.cursorsHeld = false;
     this.reconcilePromise = null;
@@ -1370,13 +1371,31 @@ export default class MessageSyncService {
     `).run(messageId, channelId);
   }
 
-  _getNextGapChannelId() {
-    const rows = this.db.prepare(`
+  _getGapChannelIds() {
+    return this.db.prepare(`
       SELECT channel_id FROM channels
       WHERE gap_after_message_id IS NOT NULL AND sync_enabled = 1
       ORDER BY channel_id
-    `).all();
-    return rows.find((row) => !this.failedGapChannelIds.has(row.channel_id))?.channel_id ?? null;
+    `).all().map((row) => row.channel_id);
+  }
+
+  _getNextGapChannelId() {
+    const now = Date.now();
+    return this._getGapChannelIds().find((id) => (this.gapRetries.get(id)?.retryAt ?? 0) <= now) ?? null;
+  }
+
+  // Everything left has failed recently, so wake the queue when the first retry is due.
+  _scheduleNextGapRetry() {
+    const gapChannelIds = this._getGapChannelIds();
+    if (!gapChannelIds.length) {
+      return;
+    }
+    const nextRetryAt = Math.min(...gapChannelIds.map((id) => this.gapRetries.get(id).retryAt));
+    clearTimeout(this.gapRetryTimer);
+    this.gapRetryTimer = setTimeout(() => {
+      void this.processQueue();
+    }, nextRetryAt - Date.now());
+    this.gapRetryTimer.unref?.();
   }
 
   upsertChannels(dialogs = []) {
@@ -2147,6 +2166,7 @@ export default class MessageSyncService {
     return {
       processing: this.processing,
       ...stats,
+      gaps: this._getGapChannelIds().length,
     };
   }
 
@@ -2274,6 +2294,7 @@ export default class MessageSyncService {
         } else {
           const gapChannelId = this._getNextGapChannelId();
           if (!gapChannelId) {
+            this._scheduleNextGapRetry();
             break;
           }
           await this._fillChannelGap(gapChannelId);
@@ -2287,7 +2308,7 @@ export default class MessageSyncService {
 
   resumePendingJobs() {
     this._resetErroredJobs();
-    this.failedGapChannelIds.clear();
+    this.gapRetries.clear();
     void this.processQueue();
     void this.refetchQueuedSentMessages();
   }
@@ -2295,6 +2316,7 @@ export default class MessageSyncService {
   async _fillChannelGap(channelId) {
     try {
       await this._syncNewerMessages(channelId);
+      this.gapRetries.delete(channelId);
     } catch (error) {
       if (this.stopRequested) {
         return;
@@ -2305,8 +2327,10 @@ export default class MessageSyncService {
         await this._delayUnlessStopped(waitSeconds * 1000);
         return;
       }
-      console.error(`[sync] Channel ${channelId}: failed to fill gap, will retry on next start: ${error?.message ?? error}`);
-      this.failedGapChannelIds.add(channelId);
+      const attempts = (this.gapRetries.get(channelId)?.attempts ?? 0) + 1;
+      const retryMs = Math.min(RETRY_BASE_MS * 2 ** (attempts - 1), RETRY_MAX_MS);
+      this.gapRetries.set(channelId, { attempts, retryAt: Date.now() + retryMs });
+      console.error(`[sync] Channel ${channelId}: failed to fill gap (attempt ${attempts}), retrying in ${retryMs / 1000}s: ${error?.message ?? error}`);
     }
   }
 
@@ -2346,6 +2370,7 @@ export default class MessageSyncService {
   // cannot corrupt the server's in-progress job (#42).
   close() {
     clearInterval(this.outageCheckTimer);
+    clearTimeout(this.gapRetryTimer);
     if (this.realtimeActive && this.realtimeHandlers) {
       this._detachRealtimeHandlers();
       this.realtimeHandlers = null;

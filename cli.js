@@ -2172,7 +2172,7 @@ async function runSyncStatus(globalFlags) {
       return;
     }
 
-    console.log(`QUEUE: pending=${queue.pending} in_progress=${queue.in_progress} idle=${queue.idle} error=${queue.error}`);
+    console.log(`QUEUE: pending=${queue.pending} in_progress=${queue.in_progress} idle=${queue.idle} error=${queue.error} gaps=${queue.gaps}`);
     console.log(`SERVER: ${ping ? `up (pid ${ping.pid})` : 'down'}`);
     if (active.length === 0) {
       console.log('No active backfills.');
@@ -2323,7 +2323,7 @@ async function runDoctor(globalFlags, options = {}) {
     console.log(`AUTHENTICATED: ${payload.authenticated}`);
     console.log(`CONNECTED: ${payload.connected}`);
     console.log(`FTS: ${payload.ftsEnabled}${payload.ftsVersion ? ` (v${payload.ftsVersion})` : ''}`);
-    console.log(`QUEUE: pending=${queue.pending} in_progress=${queue.in_progress} idle=${queue.idle} error=${queue.error}`);
+    console.log(`QUEUE: pending=${queue.pending} in_progress=${queue.in_progress} idle=${queue.idle} error=${queue.error} gaps=${queue.gaps}`);
   });
 }
 
