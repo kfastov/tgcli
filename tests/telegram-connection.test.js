@@ -314,7 +314,6 @@ describe('cold start catch-up', () => {
     await vi.waitFor(async () => expect(await storedPts()).toBe(telegram.pts));
 
     expect(archivedIds(FRIEND_CHAT_ID)).toEqual([11, 12]);
-    expect(cursor(FRIEND_CHAT_ID)).toBe(12);
 
     telegram.dialogsGate.resolve();
   });
@@ -354,7 +353,6 @@ describe('cold start catch-up', () => {
     await ensureConnected();
 
     await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([21, 22]));
-    expect(cursor(CHANNEL_ID)).toBe(22);
 
     telegram.dialogsGate.resolve();
   });
@@ -363,8 +361,10 @@ describe('cold start catch-up', () => {
     telegram.arriveWhileOffline(friendMessage(11));
     telegram.arriveWhileOffline(friendMessage(12));
 
-    const { ensureConnected } = startServer();
+    const { ensureConnected, messageSyncService } = startServer();
+    const reconciled = vi.spyOn(messageSyncService, 'resumePendingJobs');
     await ensureConnected();
+    await vi.waitFor(() => expect(reconciled).toHaveBeenCalled());
     await vi.waitFor(async () => expect(await storedPts()).toBe(telegram.pts));
 
     arriveLive(friendMessage(13));
@@ -392,7 +392,6 @@ describe('cold start catch-up', () => {
     await vi.waitFor(async () => expect(await storedPts()).toBe(telegram.pts));
 
     expect(archivedIds(FRIEND_CHAT_ID)).toEqual([11, 12, 13]);
-    expect(cursor(FRIEND_CHAT_ID)).toBe(13);
   });
 
   it('keeps archiving when login recovery replaces the mtcute client', async () => {
@@ -570,7 +569,7 @@ describe('cold start catch-up', () => {
       await server.ensureConnected();
       expect(recordedGap(CHANNEL_ID)).toBe(12);
       liveChannelMessage(21, 501);
-      await vi.waitFor(() => expect(cursor(CHANNEL_ID)).toBe(21));
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toContain(21));
       telegram.dialogsGate.resolve();
 
       await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([...ID_11_TO_20, 21]));
@@ -729,6 +728,109 @@ describe('cold start catch-up', () => {
       await vi.waitFor(() => expect(archivedIds(FRIEND_CHAT_ID)).toEqual([11, 12, 13, 14, 15]));
       await vi.waitFor(() => expect(recordedGap(FRIEND_CHAT_ID)).toBeNull());
       expect(cursor(FRIEND_CHAT_ID)).toBe(15);
+    });
+
+    it('is not fooled by a message that arrives before the dialog list does', async () => {
+      telegram.pts += 5;
+      telegram.commonDifferenceTooLong = true;
+      telegram.history.set(FRIEND_ID, friendHistory(1, 16));
+      telegram.dialogs = [dialogWith(FRIEND_PEER, 16)];
+      telegram.dialogsGate = deferred();
+
+      const { ensureConnected, messageSyncService } = startServer();
+      seedCursor(messageSyncService, FRIEND_CHAT_ID, 10);
+      await ensureConnected();
+      await vi.waitFor(async () => expect(await storedPts()).toBe(telegram.pts));
+
+      arriveLive(friendMessage(16));
+      await vi.waitFor(() => expect(archivedIds(FRIEND_CHAT_ID)).toEqual([16]));
+      expect(cursor(FRIEND_CHAT_ID)).toBe(10);
+      telegram.dialogsGate.resolve();
+
+      await vi.waitFor(() => expect(archivedIds(FRIEND_CHAT_ID)).toEqual([11, 12, 13, 14, 15, 16]));
+      await vi.waitFor(() => expect(recordedGap(FRIEND_CHAT_ID)).toBeNull());
+      expect(cursor(FRIEND_CHAT_ID)).toBe(16);
+    });
+
+    it('keeps trying when the dialog list fails, and starts the queue after that', async () => {
+      const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+      telegram.pts += 5;
+      telegram.commonDifferenceTooLong = true;
+      telegram.history.set(FRIEND_ID, friendHistory(1, 15));
+      telegram.dialogs = [dialogWith(FRIEND_PEER, 15)];
+      telegram.failNext.set('messages.getDialogs', new Error('dialogs unavailable'));
+
+      const { ensureConnected, messageSyncService } = startServer();
+      vi.spyOn(messageSyncService, '_delayUnlessStopped').mockResolvedValue();
+      seedCursor(messageSyncService, FRIEND_CHAT_ID, 10);
+      await ensureConnected();
+
+      await vi.waitFor(() => expect(archivedIds(FRIEND_CHAT_ID)).toEqual([11, 12, 13, 14, 15]));
+      await vi.waitFor(() => expect(recordedGap(FRIEND_CHAT_ID)).toBeNull());
+      expect(errorLog).toHaveBeenCalledTimes(1);
+    });
+
+    it('looks again after a long disconnect, not after a short one', async () => {
+      telegram.history.set(FRIEND_ID, friendHistory(1, 10));
+      telegram.dialogs = [dialogWith(FRIEND_PEER, 10)];
+      const { ensureConnected, messageSyncService, telegramClient } = startServer();
+      const resumed = vi.spyOn(messageSyncService, 'resumePendingJobs');
+      seedCursor(messageSyncService, FRIEND_CHAT_ID, 10);
+      await ensureConnected();
+      await vi.waitFor(() => expect(resumed).toHaveBeenCalled());
+      await vi.waitFor(async () => expect(await storedPts()).toBe(telegram.pts));
+      const listDialogs = vi.spyOn(telegramClient, 'listDialogs');
+
+      messageSyncService._handleConnectionState('connecting');
+      messageSyncService._handleConnectionState('connected');
+      expect(listDialogs).not.toHaveBeenCalled();
+
+      messageSyncService._handleConnectionState('offline');
+      messageSyncService.disconnectedAt -= 6 * 60 * 1000;
+      telegram.history.set(FRIEND_ID, friendHistory(1, 16));
+      telegram.dialogs = [dialogWith(FRIEND_PEER, 16)];
+      messageSyncService._handleConnectionState('updating');
+      arriveLive(friendMessage(16));
+
+      await vi.waitFor(() => expect(archivedIds(FRIEND_CHAT_ID)).toEqual([11, 12, 13, 14, 15, 16]));
+      await vi.waitFor(() => expect(recordedGap(FRIEND_CHAT_ID)).toBeNull());
+      expect(listDialogs).toHaveBeenCalledTimes(1);
+      expect(cursor(FRIEND_CHAT_ID)).toBe(16);
+    });
+
+    it('treats an overdue timer as an outage, since a sleeping machine reports none', () => {
+      vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
+      try {
+        const { messageSyncService } = startServer();
+        const reconcile = vi.spyOn(messageSyncService, '_reconcileAfterOutage').mockImplementation(() => {});
+        messageSyncService.startRealtimeSync();
+
+        vi.advanceTimersByTime(30 * 1000);
+        expect(reconcile).not.toHaveBeenCalled();
+
+        vi.setSystemTime(Date.now() + 6 * 60 * 1000);
+        vi.advanceTimersByTime(30 * 1000);
+        vi.advanceTimersByTime(30 * 1000);
+        expect(reconcile).toHaveBeenCalledTimes(1);
+        messageSyncService.close();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('logs the chats it found behind, leaving out those that are not synced', () => {
+      const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const { messageSyncService } = startServer();
+      seedCursor(messageSyncService, CHANNEL_ID, 10);
+      seedCursor(messageSyncService, FRIEND_CHAT_ID, 10);
+      messageSyncService.setChannelSync(CHANNEL_ID, false);
+
+      messageSyncService._markGapsBehindDialogs([
+        { id: FRIEND_CHAT_ID, topMessageId: 15 },
+        { id: CHANNEL_ID, topMessageId: 15 },
+      ]);
+
+      expect(log).toHaveBeenCalledWith(`[sync] 1 of 2 dialogs are ahead of the archive: ${FRIEND_CHAT_ID}.`);
     });
 
     it('finds a channel Telegram never named through the dialog list', async () => {

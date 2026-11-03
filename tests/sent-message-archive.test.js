@@ -174,6 +174,7 @@ async function createHarness({ respond, dbPath }) {
     onNewMessage,
     onEditMessage: createEvent(),
     onDeleteMessage: createEvent(),
+    onConnectionState: createEvent(),
   };
   const messageSyncService = new MessageSyncService(telegramClient, {
     dbPath,
@@ -182,6 +183,8 @@ async function createHarness({ respond, dbPath }) {
     interBatchDelayMs: 0,
   });
   messageSyncService.startRealtimeSync();
+  // The comparison with the dialog list at startup is not what these tests are about.
+  messageSyncService.cursorsHeld = false;
 
   await manager.prepare();
   await manager.startLoop();

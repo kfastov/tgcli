@@ -9,7 +9,10 @@ export function createTelegramConnector({ telegramClient, messageSyncService }) 
 
   async function seedArchiveInBackground() {
     try {
-      const dialogCount = await messageSyncService.refreshChannelsFromDialogs();
+      const dialogCount = await messageSyncService.reconcileWithDialogs();
+      if (dialogCount === null) {
+        return;
+      }
       console.log(`[startup] Seeded ${dialogCount} dialogs into archive registry.`);
       messageSyncService.resumePendingJobs();
     } catch (error) {

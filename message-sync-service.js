@@ -17,6 +17,11 @@ const JOB_STATUS = {
   IDLE: 'idle',
   ERROR: 'error',
 };
+// Out of reach for this long, Telegram's catch-up is no longer trusted to be complete.
+const LONG_OUTAGE_MS = 5 * 60 * 1000;
+const OUTAGE_CHECK_INTERVAL_MS = 30 * 1000;
+const RETRY_BASE_MS = 60 * 1000;
+const RETRY_MAX_MS = 60 * 60 * 1000;
 const URL_PATTERN = /https?:\/\/[^\s<>"')]+/giu;
 const FILE_NAME_PATTERN = /\b[\w.\-]+\.[a-z0-9]{2,7}\b/iu;
 const MAX_FILENAME_SCAN_DEPTH = 5;
@@ -561,6 +566,12 @@ export default class MessageSyncService {
     // Channels whose gap failed in this run. The gap stays recorded and is retried on
     // the next start, instead of the queue spinning on it now.
     this.failedGapChannelIds = new Set();
+    // While set, updates leave last_message_id where it is; see reconcileWithDialogs.
+    this.cursorsHeld = false;
+    this.reconcilePromise = null;
+    this.reconcileAgain = false;
+    this.disconnectedAt = null;
+    this.outageCheckTimer = null;
     // Id of the job this instance set to `in_progress` while running the queue.
     // Only the queue worker owns its in-flight job; `shutdown()` requeues just
     // this one so it resumes next run, without touching jobs other processes own.
@@ -649,7 +660,7 @@ export default class MessageSyncService {
     this._ensureChannelColumn('is_forum', 'INTEGER');
     this._ensureChannelColumn('gap_after_message_id', 'INTEGER');
     if (this._ensureChannelColumn('newer_sync_pending', 'INTEGER NOT NULL DEFAULT 0')) {
-      // Jobs queued before this column existed still have their catch-up ahead of them.
+      // Jobs queued before this column existed still have their newer sync ahead of them.
       this.db.prepare(`
         UPDATE channels
         SET newer_sync_pending = 1
@@ -1290,17 +1301,53 @@ export default class MessageSyncService {
 
   // Catch-up cannot report everything: updates.differenceTooLong moves the pts without
   // handing over a single message, and a channel is only fetched if Telegram names it.
-  // A dialog whose newest message is above the cursor shows what was left behind.
-  _markGapsBehindDialogs(dialogs) {
-    const behind = dialogs.filter((dialog) => {
-      const lastMessageId = this._getChannel(String(dialog.id))?.last_message_id;
-      return lastMessageId > 0 && dialog.topMessageId > lastMessageId;
-    });
-    for (const dialog of behind) {
-      this._markChannelGap(String(dialog.id));
+  // A dialog whose newest message is above the cursor shows what was left behind, as
+  // long as no update has moved that cursor since the outage: cursorsHeld sees to that,
+  // from before the first update until this comparison is done. A chat that catch-up did
+  // bring up to date gets one needless history page, which the archive ignores. Runs
+  // until it succeeds, so a failed dialog list cannot leave a hole unnoticed.
+  reconcileWithDialogs() {
+    if (this.reconcilePromise) {
+      this.reconcileAgain = true;
+      return this.reconcilePromise;
     }
+    this.reconcilePromise = this._reconcileUntilDone().finally(() => {
+      this.reconcilePromise = null;
+    });
+    return this.reconcilePromise;
+  }
+
+  async _reconcileUntilDone() {
+    let dialogCount = null;
+    let retryMs = RETRY_BASE_MS;
+    do {
+      this.reconcileAgain = false;
+      try {
+        dialogCount = await this.refreshChannelsFromDialogs();
+      } catch (error) {
+        if (this.stopRequested) {
+          return null;
+        }
+        console.error(`[sync] Could not compare the archive with the dialog list, retrying in ${retryMs / 1000}s: ${error?.message ?? error}`);
+        await this._delayUnlessStopped(retryMs);
+        retryMs = Math.min(retryMs * 2, RETRY_MAX_MS);
+        this.reconcileAgain = true;
+      }
+    } while (this.reconcileAgain && !this.stopRequested);
+    this.cursorsHeld = false;
+    return this.stopRequested ? null : dialogCount;
+  }
+
+  _markGapsBehindDialogs(dialogs) {
+    const behind = dialogs
+      .filter((dialog) => {
+        const channelId = String(dialog.id);
+        const lastMessageId = this._getChannel(channelId)?.last_message_id;
+        return lastMessageId > 0 && dialog.topMessageId > lastMessageId && this._markChannelGap(channelId);
+      })
+      .map((dialog) => dialog.id);
     if (behind.length) {
-      console.log(`[sync] ${behind.length} of ${dialogs.length} dialogs are ahead of the archive.`);
+      console.log(`[sync] ${behind.length} of ${dialogs.length} dialogs are ahead of the archive: ${behind.join(', ')}.`);
     }
   }
 
@@ -2131,13 +2178,19 @@ export default class MessageSyncService {
     const deleteMessageHandler = (update) => {
       this._handleDeleteMessage(update);
     };
+    const connectionStateHandler = (state) => {
+      this._handleConnectionState(state);
+    };
 
     this.realtimeHandlers = {
       newMessageHandler,
       editMessageHandler,
       deleteMessageHandler,
+      connectionStateHandler,
     };
+    this.cursorsHeld = true;
     this._attachRealtimeHandlers();
+    this._startSleepCheck();
     console.log('[sync] Realtime handlers attached.');
 
     this.unsubscribeClientReplaced = this.telegramClient.onClientReplaced(() => {
@@ -2157,6 +2210,49 @@ export default class MessageSyncService {
     client.onNewMessage.add(this.realtimeHandlers.newMessageHandler);
     client.onEditMessage.add(this.realtimeHandlers.editMessageHandler);
     client.onDeleteMessage.add(this.realtimeHandlers.deleteMessageHandler);
+    client.onConnectionState.add(this.realtimeHandlers.connectionStateHandler);
+  }
+
+  _detachRealtimeHandlers() {
+    const { client } = this.telegramClient;
+    client.onNewMessage.remove(this.realtimeHandlers.newMessageHandler);
+    client.onEditMessage.remove(this.realtimeHandlers.editMessageHandler);
+    client.onDeleteMessage.remove(this.realtimeHandlers.deleteMessageHandler);
+    client.onConnectionState.remove(this.realtimeHandlers.connectionStateHandler);
+  }
+
+  // 'updating' and 'connected' both come before the updates they make possible.
+  _handleConnectionState(state) {
+    if (state === 'offline' || state === 'connecting') {
+      this.disconnectedAt ??= Date.now();
+      return;
+    }
+    const disconnectedAt = this.disconnectedAt;
+    this.disconnectedAt = null;
+    if (disconnectedAt !== null && Date.now() - disconnectedAt >= LONG_OUTAGE_MS) {
+      this._reconcileAfterOutage();
+    }
+  }
+
+  // A sleeping machine stops its timers and may report no disconnect at all, so an
+  // overdue timer is the only sign of it. It fires on waking, ahead of the catch-up,
+  // which has to wait for the network.
+  _startSleepCheck() {
+    let lastCheckAt = Date.now();
+    this.outageCheckTimer = setInterval(() => {
+      const now = Date.now();
+      if (now - lastCheckAt >= LONG_OUTAGE_MS) {
+        this._reconcileAfterOutage();
+      }
+      lastCheckAt = now;
+    }, OUTAGE_CHECK_INTERVAL_MS);
+    this.outageCheckTimer.unref?.();
+  }
+
+  _reconcileAfterOutage() {
+    console.log('[sync] Telegram was out of reach for a long time, comparing the archive with the dialog list.');
+    this.cursorsHeld = true;
+    void this.reconcileWithDialogs().then(() => this.processQueue());
   }
 
   async processQueue() {
@@ -2249,10 +2345,9 @@ export default class MessageSyncService {
   // the `jobs` table — so a read-only command run against a live server's store
   // cannot corrupt the server's in-progress job (#42).
   close() {
+    clearInterval(this.outageCheckTimer);
     if (this.realtimeActive && this.realtimeHandlers) {
-      this.telegramClient.client.onNewMessage.remove(this.realtimeHandlers.newMessageHandler);
-      this.telegramClient.client.onEditMessage.remove(this.realtimeHandlers.editMessageHandler);
-      this.telegramClient.client.onDeleteMessage.remove(this.realtimeHandlers.deleteMessageHandler);
+      this._detachRealtimeHandlers();
       this.realtimeHandlers = null;
       if (this.unsubscribeClientReplaced) {
         this.unsubscribeClientReplaced();
@@ -3299,13 +3394,15 @@ export default class MessageSyncService {
     );
   }
 
-  // last_message_id is where a pending catch-up resumes, so until it reaches the newest
+  // last_message_id is where a pending newer sync resumes, so until it reaches the newest
   // message updates leave it alone: their message may be far above what is fetched so far.
-  // The catch-up sees that message again on its way up, and the archive ignores the repeat.
+  // The sync sees that message again on its way up, and the archive ignores the repeat.
+  // The same goes for a cursor waiting to be compared with the dialog list. A chat with no
+  // cursor has nothing to compare, and no reason to wait for its first one.
   _updateChannelCursorsFromUpdate(channelId, { lastMessageId, lastMessageDate, ...oldest }) {
-    const newest = this._getChannel(channelId)?.newer_sync_pending
-      ? {}
-      : { lastMessageId, lastMessageDate };
+    const channel = this._getChannel(channelId);
+    const held = channel?.newer_sync_pending || (this.cursorsHeld && channel?.last_message_id > 0);
+    const newest = held ? {} : { lastMessageId, lastMessageDate };
     this._updateChannelCursors(channelId, { ...newest, ...oldest });
   }
 
