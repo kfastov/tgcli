@@ -19,33 +19,31 @@ whatever a chat's history has and the archive does not.
    came from tgcli, so this list comes from you. The script refuses chats with sync
    disabled.
 4. For each chat, pick `afterMessageId`: the last message before the first possible
-   gap. If you do not know it, the chat's `oldest_message_id` works, at a cost of one
+   gap. `0` walks the whole chat. The walk starts at the newest message and costs one
    page of 100 messages per second.
-5. Stop the server. An auto-started one exits by itself after 60 seconds idle. The
-   script takes the store lock and fails while a server holds it.
+5. Stop the server: `tgcli service stop` if it runs as a service, otherwise kill it. It
+   does not exit by itself while any chat is synced, and the script refuses to run
+   while one answers, printing its pid. Any other tgcli command starts a new server,
+   so run none until you are done.
 6. Run the script from a repository checkout, with the Node version `better-sqlite3`
-   is built for:
+   is built for. So far it has only run against a stubbed Telegram, so start with one
+   chat where you know a message is missing, and check it as in step 7 before going on:
 
    ```bash
    node scripts/recover-archive-gaps.js <chatId> <afterMessageId>
    ```
 
-7. Check a message you know was missing:
+7. Check a message you know was missing. Ask SQLite rather than `tgcli messages show`,
+   which falls back to Telegram when the archive has no such row:
 
    ```bash
-   tgcli messages show --chat <chatId> --id <messageId> --source archive
+   sqlite3 <store>/messages.db "SELECT message_id, text FROM messages WHERE channel_id = '<chatId>' AND message_id = <messageId>;"
    ```
 
 ## What it does
 
-- Walks the history from old to new and writes through `INSERT OR IGNORE`: existing
-  rows do not change and nothing is duplicated.
+- Walks the history from new to old and writes through `INSERT OR IGNORE`: existing
+  rows do not change and nothing is duplicated, so an interrupted run can be repeated.
 - Leaves the sync cursors alone.
 - Adds everything missing in the range, not only your own sends.
 - Runs with updates disabled, so it does not take the catch-up from the server.
-
-## Why not rewind the cursor
-
-Rewinding `last_message_id` and running a sync job fixes a gap only if at most one
-batch (100 messages) came after it. `_syncNewerMessages` takes the newest batch, so an
-older gap stays and the cursor returns to the top with no error.

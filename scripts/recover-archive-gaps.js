@@ -1,10 +1,12 @@
 #!/usr/bin/env node
-// Fills gaps in the local archive by walking one chat's history from old to new.
-// Rows already in the archive and the sync cursors stay as they are.
+// Fills gaps in the local archive by walking one chat's history from new to old,
+// down to a given message. Rows already in the archive and the sync cursors stay as
+// they are.
 // See docs/archive-recovery.md before running this on a real archive.
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
+import { pingServer } from '../core/control-client.js';
 import { createServices } from '../core/services.js';
 import { resolveStoreDir } from '../core/store.js';
 import { acquireStoreLock } from '../store-lock.js';
@@ -24,16 +26,19 @@ export async function recoverArchiveGaps(
     throw new Error(`Chat ${chat} has sync disabled; enable it first if it belongs in the archive.`);
   }
 
-  let lastId = afterId;
+  let offsetId = 0;
   let added = 0;
   for (;;) {
-    const { messages } = await telegramClient.getMessagesByChannelId(chat, PAGE_SIZE, { afterId: lastId });
-    if (!messages.length) {
-      return { added, lastId };
+    const { messages } = await telegramClient.getMessagesByChannelId(chat, PAGE_SIZE, { offsetId });
+    const inRange = messages.filter((message) => message.id > afterId);
+    if (inRange.length) {
+      added += messageSyncService.archiveHistoryMessages(channel.channelId, inRange);
     }
-    added += messageSyncService.archiveHistoryMessages(channel.channelId, messages);
-    lastId = Math.max(...messages.map((message) => message.id));
-    console.log(`Chat ${chat}: reached message ${lastId}, added ${added}.`);
+    if (!messages.length || inRange.length < messages.length) {
+      return { added };
+    }
+    offsetId = Math.min(...messages.map((message) => message.id));
+    console.log(`Chat ${chat}: reached message ${offsetId}, added ${added}.`);
     await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
 }
@@ -48,13 +53,21 @@ async function main() {
   }
 
   const storeDir = resolveStoreDir();
+  // The server takes no store lock, so the lock below would not keep the two apart.
+  const server = await pingServer(storeDir);
+  if (server) {
+    console.error(`A tgcli server (pid ${server.pid}) is running on this store. Stop it first: tgcli service stop, or kill ${server.pid}.`);
+    process.exitCode = 1;
+    return;
+  }
+
   const release = acquireStoreLock(storeDir);
   let services = null;
   try {
     // Without updates: the catch-up belongs to the server, not to this script.
     services = createServices({ storeDir, disableUpdates: true });
-    const { added, lastId } = await recoverArchiveGaps(services, { chat, afterId });
-    console.log(`Chat ${chat}: done at message ${lastId}, added ${added}.`);
+    const { added } = await recoverArchiveGaps(services, { chat, afterId });
+    console.log(`Chat ${chat}: done, added ${added}.`);
   } finally {
     if (services) {
       await services.messageSyncService.close();

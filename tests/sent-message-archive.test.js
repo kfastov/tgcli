@@ -230,8 +230,8 @@ describe('archiving messages sent by tgcli', () => {
     SELECT url FROM message_links WHERE channel_id = ? AND message_id = ?
   `).all(channelId, messageId).map((row) => row.url);
 
-  const incompleteCount = () => harness.messageSyncService.db.prepare(`
-    SELECT COUNT(*) AS count FROM incomplete_sent_messages
+  const refetchQueueSize = () => harness.messageSyncService.db.prepare(`
+    SELECT COUNT(*) AS count FROM sent_messages_to_refetch
   `).get().count;
 
   const cursor = (channelId) => harness.messageSyncService.db.prepare(`
@@ -267,11 +267,12 @@ describe('archiving messages sent by tgcli', () => {
   });
 
   it('keeps a sent text message after the next incoming message moves the cursor', async () => {
-    const { services, messageSyncService } = await start(() => sentToChannel(ownChannelMessage(11, { message: 'mine' })));
+    const { services, telegramClient, messageSyncService } = await start(() => sentToChannel(ownChannelMessage(11, { message: 'mine' })));
     seedChat(CHANNEL_ID);
 
     const { result } = await OPERATIONS.sendText(services, { chat: CHANNEL_ID, text: 'mine' });
     expect(result).toEqual({ messageId: 11 });
+    expect(telegramClient.client.getMessages).not.toHaveBeenCalled();
 
     messageSyncService._handleIncomingMessage(parsed(rawChannelMessage(12)), { isEdit: false });
     liveHistory(parsed(ownChannelMessage(11)), parsed(rawChannelMessage(12)));
@@ -330,12 +331,12 @@ describe('archiving messages sent by tgcli', () => {
   });
 
   describe('a text message answered with updateShortSentMessage', () => {
-    const shortResponse = () => ({
+    const shortResponse = (id = 21, pts = START_PTS + 1) => ({
       _: 'updateShortSentMessage',
-      id: 21,
-      pts: START_PTS + 1,
+      id,
+      pts,
       ptsCount: 1,
-      date: 1700000021,
+      date: 1700000000 + id,
       out: true,
     });
     const fullCopy = () => parsed(ownFriendMessage(21, {
@@ -346,7 +347,7 @@ describe('archiving messages sent by tgcli', () => {
     }));
 
     it('is archived at once and then completed from Telegram', async () => {
-      const { services, telegramClient } = await start(shortResponse);
+      const { services, telegramClient } = await start(() => shortResponse());
       seedChat(FRIEND_CHAT_ID);
       telegramClient.client.getMessages = vi.fn().mockResolvedValue([fullCopy()]);
 
@@ -357,7 +358,7 @@ describe('archiving messages sent by tgcli', () => {
       });
 
       expect(result).toEqual({ messageId: 21 });
-      await vi.waitFor(() => expect(incompleteCount()).toBe(0));
+      await vi.waitFor(() => expect(refetchQueueSize()).toBe(0));
       expect(telegramClient.client.getMessages).toHaveBeenCalledWith(FRIEND_ID, 21);
       expect(archivedIds(FRIEND_CHAT_ID)).toEqual([21]);
       expect(archivedRaw(FRIEND_CHAT_ID, 21).replyTo.replyToMsgId).toBe(20);
@@ -366,7 +367,7 @@ describe('archiving messages sent by tgcli', () => {
     });
 
     it('stays queued when completing it fails, and is completed on the next server start', async () => {
-      const { services, telegramClient, messageSyncService } = await start(shortResponse);
+      const { services, telegramClient, messageSyncService } = await start(() => shortResponse());
       seedChat(FRIEND_CHAT_ID);
       const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
       telegramClient.client.getMessages = vi.fn().mockRejectedValueOnce(new Error('network down'));
@@ -377,35 +378,63 @@ describe('archiving messages sent by tgcli', () => {
       await vi.waitFor(() => expect(errorLog).toHaveBeenCalledWith(expect.stringContaining('network down')));
       expect(archived(FRIEND_CHAT_ID)).toEqual([expect.objectContaining({ message_id: 21, text: 'hello' })]);
       expect(archivedRaw(FRIEND_CHAT_ID, 21).replyTo).toBeUndefined();
-      expect(incompleteCount()).toBe(1);
+      expect(refetchQueueSize()).toBe(1);
 
       telegramClient.client.getMessages = vi.fn().mockResolvedValue([fullCopy()]);
       messageSyncService.resumePendingJobs();
 
-      await vi.waitFor(() => expect(incompleteCount()).toBe(0));
+      await vi.waitFor(() => expect(refetchQueueSize()).toBe(0));
       expect(archivedRaw(FRIEND_CHAT_ID, 21).replyTo.replyToMsgId).toBe(20);
     });
 
+    it('adds no requests to later sends while it stays queued', async () => {
+      const responses = [shortResponse(21, START_PTS + 1), shortResponse(22, START_PTS + 2)];
+      const { services, telegramClient } = await start(() => responses.shift());
+      seedChat(FRIEND_CHAT_ID);
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      telegramClient.client.getMessages = vi.fn().mockRejectedValue(new Error('network down'));
+
+      await OPERATIONS.sendText(services, { chat: FRIEND_CHAT_ID, text: 'first' });
+      await vi.waitFor(() => expect(telegramClient.client.getMessages).toHaveBeenCalledTimes(1));
+      await OPERATIONS.sendText(services, { chat: FRIEND_CHAT_ID, text: 'second' });
+      await vi.waitFor(() => expect(telegramClient.client.getMessages).toHaveBeenCalledTimes(2));
+
+      expect(telegramClient.client.getMessages.mock.calls).toEqual([[FRIEND_ID, 21], [FRIEND_ID, 22]]);
+      expect(refetchQueueSize()).toBe(2);
+    });
+
+    it('survives a closed database when the queue is retried', async () => {
+      const { messageSyncService } = await start(() => shortResponse());
+      const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+      messageSyncService.db.close();
+
+      await messageSyncService.refetchQueuedSentMessages();
+
+      expect(errorLog).toHaveBeenCalled();
+    });
+
     it('is no longer queued once Telegram says it is gone', async () => {
-      const { services, telegramClient } = await start(shortResponse);
+      const { services, telegramClient } = await start(() => shortResponse());
       seedChat(FRIEND_CHAT_ID);
       telegramClient.client.getMessages = vi.fn().mockResolvedValue([null]);
 
       await OPERATIONS.sendText(services, { chat: FRIEND_CHAT_ID, text: 'hello' });
 
-      await vi.waitFor(() => expect(incompleteCount()).toBe(0));
+      await vi.waitFor(() => expect(refetchQueueSize()).toBe(0));
       expect(archivedIds(FRIEND_CHAT_ID)).toEqual([21]);
     });
   });
 
-  it('does not ask Telegram again for a message the send response had in full', async () => {
+  // A text response in full to a user cannot be told apart from a short one, so that
+  // case does get one extra request.
+  it('does not ask Telegram again for a message with media', async () => {
     const { services, telegramClient } = await start(() => sentToFriend(ownFriendMessage(26, { media: PHOTO_MEDIA })));
     seedChat(FRIEND_CHAT_ID);
 
     await OPERATIONS.sendFile(services, { chat: FRIEND_CHAT_ID, file: EXISTING_FILE });
 
     expect(telegramClient.client.getMessages).not.toHaveBeenCalled();
-    expect(incompleteCount()).toBe(0);
+    expect(refetchQueueSize()).toBe(0);
   });
 
   it('archives a sent file with its media and links', async () => {
@@ -521,7 +550,7 @@ describe('archiving messages sent by tgcli', () => {
       expect(result.warning).toBeUndefined();
       expect(archivedIds(CHANNEL_ID)).toEqual([]);
       expect(cursor(CHANNEL_ID)).toBe(10);
-      expect(incompleteCount()).toBe(0);
+      expect(refetchQueueSize()).toBe(0);
 
       messageSyncService._handleIncomingMessage(parsed(ownChannelMessage(11, { message: 'later' })), { isEdit: false });
 

@@ -258,11 +258,11 @@ function readSendResponse(response, randomId) {
 
 // The send has already gone through at this point, so a response that cannot be
 // parsed must not fail it.
-function parseSentMessage(messageUpdate, response) {
+function parseSentMessage(messageUpdate, response, peerRef) {
   try {
     return new Message(messageUpdate.message, PeersIndex.from(response), messageUpdate._ === 'updateNewScheduledMessage');
   } catch (error) {
-    console.error(`[sendPhoto] Failed to parse sent message ${messageUpdate.message?.id}: ${error.message}`);
+    console.error(`[sendPhoto] Failed to parse sent message ${messageUpdate.message?.id} for peer ${peerRef}: ${error.message}`);
     return null;
   }
 }
@@ -1201,7 +1201,7 @@ class TelegramClient {
     const result = await this.client.call(request);
     this.client.handleClientUpdate(result, true);
     const { messageId, messageUpdate } = readSendResponse(result, prepared.request.randomId);
-    const sentMessage = onSent && messageUpdate ? parseSentMessage(messageUpdate, result) : null;
+    const sentMessage = onSent && messageUpdate ? parseSentMessage(messageUpdate, result, prepared.peerRef) : null;
     if (sentMessage) onSent(sentMessage);
     if (!messageId) {
       throw new Error('Failed to resolve sent photo message id from Telegram updates.');

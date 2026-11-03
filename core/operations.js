@@ -618,7 +618,7 @@ async function messagesContext(ctx, args = {}) {
 // send that never reports its message comes back with a warning. onSent must not
 // throw, because an error out of an attempt would retry a send that has already
 // gone through and post the message twice.
-async function runSend(ctx, sendFn, { method, chat, retries, retryBackoff, timeoutMs }) {
+async function runSend(ctx, method, args, sendFn) {
   let archiveWarning = 'Message sent but not archived: the send did not report its message.';
   const onSent = (message) => {
     try {
@@ -626,15 +626,15 @@ async function runSend(ctx, sendFn, { method, chat, retries, retryBackoff, timeo
       archiveWarning = null;
     } catch (error) {
       const reason = formatErrorMessage(error);
-      console.error(`[archive] ${method} to ${chat}: message ${message?.id} was sent but not archived: ${reason}`);
+      console.error(`[archive] ${method} to ${args.chat}: message ${message?.id} was sent but not archived: ${reason}`);
       archiveWarning = `Message sent but not archived: ${reason}`;
     }
   };
   const { result, attempts } = await executeSendWithRetries(() => sendFn(onSent), {
     method,
-    retries,
-    retryBackoff,
-    timeoutMs,
+    retries: args.retries,
+    retryBackoff: args.retryBackoff,
+    timeoutMs: args.timeoutMs,
   });
   if (!archiveWarning) {
     return { result, attempts };
@@ -647,9 +647,8 @@ async function runSend(ctx, sendFn, { method, chat, retries, retryBackoff, timeo
 // noforwards?, scheduleDate?, retries?, retryBackoff?, timeoutMs? }.
 // Returns { result, attempts }.
 async function sendText(ctx, args = {}) {
-  return runSend(
-    ctx,
-    (onSent) => ctx.telegramClient.sendTextMessage(args.chat, args.text, {
+  return runSend(ctx, 'sendText', args, (onSent) => (
+    ctx.telegramClient.sendTextMessage(args.chat, args.text, {
       topicId: args.topicId,
       replyToMessageId: args.replyToMessageId,
       parseMode: args.parseMode,
@@ -658,9 +657,8 @@ async function sendText(ctx, args = {}) {
       noforwards: args.noforwards || false,
       scheduleDate: args.scheduleDate,
       onSent,
-    }),
-    { method: 'sendText', chat: args.chat, retries: args.retries, retryBackoff: args.retryBackoff, timeoutMs: args.timeoutMs },
-  );
+    })
+  ));
 }
 
 // args: like sendText plus { photo, caption?, captionAbove?, spoiler? }.
@@ -677,19 +675,16 @@ async function sendPhoto(ctx, args = {}) {
     spoiler: args.spoiler || false,
     scheduleDate: args.scheduleDate,
   });
-  return runSend(
-    ctx,
-    (onSent) => ctx.telegramClient.sendPreparedPhotoMessage(prepared, { onSent }),
-    { method: 'sendPhoto', chat: args.chat, retries: args.retries, retryBackoff: args.retryBackoff, timeoutMs: args.timeoutMs },
-  );
+  return runSend(ctx, 'sendPhoto', args, (onSent) => (
+    ctx.telegramClient.sendPreparedPhotoMessage(prepared, { onSent })
+  ));
 }
 
 // args: like sendText plus { file, caption?, filename?, captionAbove?, spoiler?,
 // forceDocument? }. Returns { result, attempts }.
 async function sendFile(ctx, args = {}) {
-  return runSend(
-    ctx,
-    (onSent) => ctx.telegramClient.sendFileMessage(args.chat, args.file, {
+  return runSend(ctx, 'sendFile', args, (onSent) => (
+    ctx.telegramClient.sendFileMessage(args.chat, args.file, {
       caption: args.caption,
       filename: args.filename,
       topicId: args.topicId,
@@ -702,9 +697,8 @@ async function sendFile(ctx, args = {}) {
       scheduleDate: args.scheduleDate,
       forceDocument: args.forceDocument || false,
       onSent,
-    }),
-    { method: 'sendFile', chat: args.chat, retries: args.retries, retryBackoff: args.retryBackoff, timeoutMs: args.timeoutMs },
-  );
+    })
+  ));
 }
 
 // --- topics ---

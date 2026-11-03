@@ -725,7 +725,7 @@ export default class MessageSyncService {
     this._ensureMessageColumn('topic', 'TEXT');
 
     this.db.exec(`
-      CREATE TABLE IF NOT EXISTS incomplete_sent_messages (
+      CREATE TABLE IF NOT EXISTS sent_messages_to_refetch (
         channel_id TEXT NOT NULL,
         message_id INTEGER NOT NULL,
         PRIMARY KEY (channel_id, message_id)
@@ -2107,7 +2107,7 @@ export default class MessageSyncService {
   resumePendingJobs() {
     this._resetErroredJobs();
     void this.processQueue();
-    void this.completeSentMessages();
+    void this.refetchQueuedSentMessages();
   }
 
   // Worker-only teardown. Stops the queue loop, requeues *only* the job this
@@ -3253,14 +3253,18 @@ export default class MessageSyncService {
     const serialized = this.telegramClient._serializeMessage(message, message.chat);
     const record = this._buildMessageRecord(channelId, serialized);
 
-    if (isEdit) {
+    this._storeRecord(record, { replace: isEdit });
+    return record;
+  }
+
+  _storeRecord(record, { replace }) {
+    if (replace) {
       this.upsertMessageStmt.run(record);
     } else {
       this.insertMessageStmt.run(record);
     }
     this._replaceMessageLinks(record);
     this._replaceMessageMedia(record);
-    return record;
   }
 
   // mtcute keeps a client's own sends out of onNewMessage, so the send operations
@@ -3271,40 +3275,48 @@ export default class MessageSyncService {
   archiveSentMessage(message) {
     const record = this._writeMessage(message, { isEdit: false });
     if (!record) {
-      console.log(`[archive] Skipped sent message ${message?.id}: scheduled, or its chat is not synced.`);
+      console.log(`[archive] Skipped sent message ${message?.id} in chat ${message?.chat?.id}: scheduled, or the chat is not synced.`);
       return;
     }
     console.log(`[archive] Archived sent message ${record.message_id} in chat ${record.channel_id}.`);
     if (mayLackFullContent(message)) {
       this.db.prepare(`
-        INSERT OR IGNORE INTO incomplete_sent_messages (channel_id, message_id) VALUES (?, ?)
+        INSERT OR IGNORE INTO sent_messages_to_refetch (channel_id, message_id) VALUES (?, ?)
       `).run(record.channel_id, record.message_id);
-      void this.completeSentMessages();
+      void this._refetchSentMessage(record.channel_id, record.message_id);
     }
   }
 
-  // Replaces queued rows with Telegram's full copy. This has to be an explicit
+  // Replaces a queued row with Telegram's full copy. This has to be an explicit
   // request: history goes through INSERT OR IGNORE and would never replace the row,
   // and sync stops reaching it once the next message moves the cursor. Runs apart
-  // from the send, whose result must not wait on it or depend on it, so the queue
-  // lets a failure be retried on the next send or server start.
-  async completeSentMessages() {
-    const queued = this.db.prepare('SELECT channel_id, message_id FROM incomplete_sent_messages').all();
-    for (const { channel_id: channelId, message_id: messageId } of queued) {
-      try {
-        const message = await this.telegramClient.getMessageById(channelId, messageId);
-        if (message) {
-          const record = this._buildMessageRecord(channelId, message);
-          this.upsertMessageStmt.run(record);
-          this._replaceMessageLinks(record);
-          this._replaceMessageMedia(record);
-        }
-        this.db.prepare(`
-          DELETE FROM incomplete_sent_messages WHERE channel_id = ? AND message_id = ?
-        `).run(channelId, messageId);
-      } catch (error) {
-        console.error(`[archive] Could not complete sent message ${messageId} in chat ${channelId}, will retry: ${error?.message ?? error}`);
+  // from the send, whose result must not wait on it or depend on it. A row that
+  // fails stays queued for the next server start.
+  async _refetchSentMessage(channelId, messageId) {
+    try {
+      const message = await this.telegramClient.getMessageById(channelId, messageId);
+      if (message) {
+        this._storeRecord(this._buildMessageRecord(channelId, message), { replace: true });
+        console.log(`[archive] Completed sent message ${messageId} in chat ${channelId}.`);
+      } else {
+        console.log(`[archive] Sent message ${messageId} in chat ${channelId} is gone from Telegram, its row stays as it is.`);
       }
+      this.db.prepare(`
+        DELETE FROM sent_messages_to_refetch WHERE channel_id = ? AND message_id = ?
+      `).run(channelId, messageId);
+    } catch (error) {
+      console.error(`[archive] Could not refetch sent message ${messageId} in chat ${channelId}, will retry on the next server start: ${error?.message ?? error}`);
+    }
+  }
+
+  async refetchQueuedSentMessages() {
+    try {
+      const queued = this.db.prepare('SELECT channel_id, message_id FROM sent_messages_to_refetch').all();
+      for (const { channel_id: channelId, message_id: messageId } of queued) {
+        await this._refetchSentMessage(channelId, messageId);
+      }
+    } catch (error) {
+      console.error(`[archive] Could not read the queue of sent messages to refetch: ${error?.message ?? error}`);
     }
   }
 
