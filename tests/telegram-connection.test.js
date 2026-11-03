@@ -474,6 +474,23 @@ describe('cold start catch-up', () => {
     expect(recordedGap(CHANNEL_ID)).toBe(10);
   });
 
+  it('does not move the cursors on an edit, whatever the age of the message', async () => {
+    const { ensureConnected, messageSyncService } = startServer();
+    seedCursor(messageSyncService, FRIEND_CHAT_ID, 20);
+    await ensureConnected();
+    await vi.waitFor(async () => expect(await storedPts()).toBe(telegram.pts));
+
+    telegram.pts += 1;
+    deliverLive({ _: 'updateEditMessage', message: friendMessage(5), pts: telegram.pts, ptsCount: 1 });
+    telegram.pts += 1;
+    deliverLive({ _: 'updateEditMessage', message: friendMessage(30), pts: telegram.pts, ptsCount: 1 });
+
+    await vi.waitFor(() => expect(archivedIds(FRIEND_CHAT_ID)).toEqual([5, 30]));
+    const channel = messageSyncService._getChannel(FRIEND_CHAT_ID);
+    expect(channel.last_message_id).toBe(20);
+    expect(channel.oldest_message_id).toBe(20);
+  });
+
   describe('when a channel missed more than catch-up can carry', () => {
     const channelHistory = (from, to) => {
       const messages = [];

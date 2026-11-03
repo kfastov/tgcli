@@ -3321,6 +3321,9 @@ export default class MessageSyncService {
       this.upsertMessageStmt.run(record);
       this._replaceMessageLinks(record);
       this._replaceMessageMedia(record);
+      // An edit can touch a message of any age, so it says nothing about what is
+      // archived around it. Moving a cursor here would hide history from later syncs.
+      return;
     } else {
       this.insertMessageStmt.run(record);
       this._replaceMessageLinks(record);
