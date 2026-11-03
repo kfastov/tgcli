@@ -76,6 +76,8 @@ class FakeTelegram {
     this.history = new Map();
     this.dialogsGate = null;
     this.failNext = new Map();
+    this.historyPages = 0;
+    this.onHistoryPage = null;
   }
 
   arriveWhileOffline(message) {
@@ -136,6 +138,8 @@ class FakeTelegram {
   // messages.getHistory for a known chat: the slice starts at offsetId, addOffset
   // moves it towards newer messages when negative, and minId bounds it from below.
   _historySlice({ peer, offsetId, addOffset, limit, minId }) {
+    this.historyPages += 1;
+    this.onHistoryPage?.(this.historyPages);
     const messages = this.history.get(peer.channelId ?? peer.userId) ?? [];
     const descending = [...messages].sort((a, b) => b.id - a.id);
     const start = offsetId
@@ -389,5 +393,142 @@ describe('cold start catch-up', () => {
     expect(telegramClient.client.onEditMessage.length).toBe(0);
     expect(telegramClient.client.onDeleteMessage.length).toBe(0);
     expect(telegramClient.updateEmitter.listenerCount('clientReplaced')).toBe(0);
+  });
+
+  describe('when a channel missed more than catch-up can carry', () => {
+    const channelHistory = (from, to) => {
+      const messages = [];
+      for (let id = from; id <= to; id += 1) {
+        messages.push(channelMessage(id));
+      }
+      return messages;
+    };
+
+    function channelTooLong(newest) {
+      telegram.channelTooLong = 50;
+      telegram.channelDifference = {
+        _: 'updates.channelDifferenceTooLong',
+        final: true,
+        dialog: {
+          _: 'dialog',
+          peer: { _: 'peerChannel', channelId: BARE_CHANNEL_ID },
+          topMessage: newest[newest.length - 1].id,
+          readInboxMaxId: 0,
+          readOutboxMaxId: 0,
+          unreadCount: 0,
+          unreadMentionsCount: 0,
+          unreadReactionsCount: 0,
+          notifySettings: { _: 'peerNotifySettings' },
+          pts: 500,
+        },
+        messages: newest,
+        ...PEERS,
+      };
+    }
+
+    function seedCursor(service, id) {
+      service.upsertChannels([{ id: CHANNEL_ID, title: 'Group', type: 'channel' }]);
+      service._updateChannelCursors(CHANNEL_ID, { lastMessageId: id, oldestMessageId: id });
+    }
+
+    it('fills the gap between the cursor and the messages the diff carried', async () => {
+      telegram.history.set(BARE_CHANNEL_ID, channelHistory(1, 20));
+      channelTooLong(channelHistory(19, 20));
+
+      const { ensureConnected, messageSyncService } = startServer();
+      seedCursor(messageSyncService, 10);
+      await ensureConnected();
+
+      await vi.waitFor(() => expect(cursor(CHANNEL_ID)).toBe(20));
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+    });
+
+    it('keeps the cursor before the gap when fetching it fails, so a later sync can retry', async () => {
+      const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+      telegram.history.set(BARE_CHANNEL_ID, channelHistory(1, 20));
+      channelTooLong(channelHistory(19, 20));
+      telegram.failNext.set('messages.getHistory', new Error('history unavailable'));
+
+      const { ensureConnected, messageSyncService } = startServer();
+      seedCursor(messageSyncService, 10);
+      await ensureConnected();
+      await vi.waitFor(() => expect(errorLog).toHaveBeenCalled());
+
+      expect(archivedIds(CHANNEL_ID)).toEqual([19, 20]);
+      expect(cursor(CHANNEL_ID)).toBe(10);
+
+      await messageSyncService._syncNewerMessages(CHANNEL_ID);
+
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+      expect(cursor(CHANNEL_ID)).toBe(20);
+    });
+
+    it('does not let a live message hide a gap that is waiting for its turn', async () => {
+      telegram.history.set(BARE_CHANNEL_ID, channelHistory(1, 20));
+      channelTooLong(channelHistory(19, 20));
+
+      const { ensureConnected, messageSyncService, telegramClient } = startServer();
+      seedCursor(messageSyncService, 10);
+      const earlierGap = deferred();
+      messageSyncService.channelGapSyncs = earlierGap.promise;
+      await ensureConnected();
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([19, 20]));
+
+      const update = channelHistory(21, 21)[0];
+      telegram.history.get(BARE_CHANNEL_ID).push(update);
+      telegramClient.client._client.onServerUpdate.emit({
+        _: 'updates',
+        updates: [{ _: 'updateNewChannelMessage', message: update, pts: 501, ptsCount: 1 }],
+        ...PEERS,
+        date: 1700000000,
+        seq: 0,
+      });
+      await vi.waitFor(() => expect(cursor(CHANNEL_ID)).toBe(21));
+
+      earlierGap.resolve();
+
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual(
+        [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+      ));
+      expect(cursor(CHANNEL_ID)).toBe(21);
+    });
+
+    it('resumes a stopped sync from where the archive is continuous', async () => {
+      telegram.history.set(BARE_CHANNEL_ID, channelHistory(1, 16));
+
+      const { ensureConnected, messageSyncService } = startServer();
+      seedCursor(messageSyncService, 10);
+      await ensureConnected();
+      await messageSyncService.refreshChannelsFromDialogs();
+      telegram.onHistoryPage = (page) => {
+        if (page === 2) messageSyncService.stopRequested = true;
+      };
+
+      const stopped = await messageSyncService._syncNewerMessages(CHANNEL_ID);
+
+      expect(stopped.stoppedEarly).toBe(true);
+      expect(cursor(CHANNEL_ID)).toBe(12);
+
+      messageSyncService.stopRequested = false;
+      telegram.onHistoryPage = null;
+      await messageSyncService._syncNewerMessages(CHANNEL_ID);
+
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 13, 14, 15, 16]);
+      expect(cursor(CHANNEL_ID)).toBe(16);
+    });
+
+    it('takes only the newest batch for a chat with nothing archived yet', async () => {
+      telegram.history.set(BARE_CHANNEL_ID, channelHistory(1, 20));
+
+      const { ensureConnected, messageSyncService } = startServer();
+      messageSyncService.upsertChannels([{ id: CHANNEL_ID, title: 'Group', type: 'channel' }]);
+      await ensureConnected();
+      await messageSyncService.refreshChannelsFromDialogs();
+
+      await messageSyncService._syncNewerMessages(CHANNEL_ID);
+
+      expect(archivedIds(CHANNEL_ID)).toEqual([19, 20]);
+      expect(cursor(CHANNEL_ID)).toBe(20);
+    });
   });
 });

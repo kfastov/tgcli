@@ -966,7 +966,10 @@ class TelegramClient {
       reverse: useAfterIdPagination ? true : reverse,
     };
 
-    if (effectiveMinId) {
+    if (useAfterIdPagination) {
+      // Without an offset a reverse walk starts from the chat's oldest message.
+      iterOptions.offset = { id: effectiveAfterId + 1, date: 0 };
+    } else if (effectiveMinId) {
       iterOptions.minId = effectiveMinId;
     }
 

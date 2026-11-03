@@ -543,6 +543,7 @@ export default class MessageSyncService {
     this.processing = false;
     this.stopRequested = false;
     this.realtimeActive = false;
+    this.channelGapSyncs = Promise.resolve();
     this.realtimeHandlers = null;
     this.unsubscribeChannelTooLong = null;
     // Id of the job this instance set to `in_progress` while running the queue.
@@ -3304,8 +3305,6 @@ export default class MessageSyncService {
     const records = [];
     const userRecords = new Map();
     let batchChannelId = null;
-    let latestMessageId = null;
-    let latestMessageDate = null;
     let oldestMessageId = null;
     let oldestMessageDate = null;
 
@@ -3333,10 +3332,6 @@ export default class MessageSyncService {
 
       const messageDateIso = toIsoString(serialized.date);
       if (Number.isFinite(serialized.id)) {
-        if (!latestMessageId || serialized.id > latestMessageId) {
-          latestMessageId = serialized.id;
-          latestMessageDate = messageDateIso;
-        }
         if (!oldestMessageId || serialized.id < oldestMessageId) {
           oldestMessageId = serialized.id;
           oldestMessageDate = messageDateIso;
@@ -3354,24 +3349,33 @@ export default class MessageSyncService {
 
     this.insertMessagesTx(records);
 
+    // The diff holds only the newest messages, so everything between the cursor and
+    // them is still missing. A live message can move the cursor before this channel's
+    // turn comes, so the start of the gap is captured now.
+    const gapStartId = this._getChannel(batchChannelId)?.last_message_id || 0;
+    console.log(`[sync] Channel ${batchChannelId}: update gap after message ${gapStartId}, fetching history.`);
+
     this._updateChannelCursors(batchChannelId, {
-      lastMessageId: latestMessageId,
-      lastMessageDate: latestMessageDate,
       oldestMessageId: oldestMessageId,
       oldestMessageDate: oldestMessageDate,
     });
 
-    void this._syncNewerMessages(batchChannelId);
+    // One at a time: after downtime many channels can land here at once.
+    this.channelGapSyncs = this.channelGapSyncs
+      .then(() => this._syncNewerMessages(batchChannelId, { afterId: gapStartId }))
+      .catch((error) => {
+        console.error(`[sync] Channel ${batchChannelId}: failed to fetch history after message ${gapStartId}: ${error?.message ?? error}`);
+      });
   }
 
-  async _syncNewerMessages(channelId) {
+  async _syncNewerMessages(channelId, { afterId } = {}) {
     const normalizedId = normalizeChannelKey(channelId);
     const channel = this._getChannel(normalizedId);
     if (!channel || channel.sync_enabled !== 1) {
       return { hasMoreNewer: false, stoppedEarly: false };
     }
 
-    let minId = channel.last_message_id || 0;
+    let minId = afterId ?? (channel.last_message_id || 0);
     let lastMessageId = channel.last_message_id || 0;
     let lastMessageDate = channel.last_message_date || null;
     let oldestMessageId = channel.oldest_message_id || null;
@@ -3389,7 +3393,7 @@ export default class MessageSyncService {
       const { peerTitle: title, peerType: type, messages } = await this.telegramClient.getMessagesByChannelId(
         normalizedId,
         this.batchSize,
-        { minId },
+        { afterId: minId },
       );
 
       if (this.stopRequested) {
