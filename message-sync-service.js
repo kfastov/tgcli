@@ -3167,6 +3167,20 @@ export default class MessageSyncService {
     );
   }
 
+  // last_message_id is where an unfinished job resumes, so while one exists only the
+  // job moves it: an update's message may be far above what the job has fetched so far.
+  // The job sees that message again on its way up, and the archive ignores the repeat.
+  _updateChannelCursorsFromUpdate(channelId, { lastMessageId, lastMessageDate, oldestMessageId, oldestMessageDate }) {
+    const newest = this._hasUnfinishedJob(channelId) ? {} : { lastMessageId, lastMessageDate };
+    this._updateChannelCursors(channelId, { ...newest, oldestMessageId, oldestMessageDate });
+  }
+
+  _hasUnfinishedJob(channelId) {
+    return Boolean(this.db.prepare(`
+      SELECT 1 FROM jobs WHERE channel_id = ? AND status != ?
+    `).get(channelId, JOB_STATUS.IDLE));
+  }
+
   _ensureChannelFromPeer(channelId, peer) {
     const peerTitle = peer?.displayName ?? null;
     const peerType = normalizePeerType(peer);
@@ -3227,7 +3241,7 @@ export default class MessageSyncService {
     }
 
     const messageDate = toIsoString(serialized.date);
-    this._updateChannelCursors(channelId, {
+    this._updateChannelCursorsFromUpdate(channelId, {
       lastMessageId: serialized.id,
       lastMessageDate: messageDate,
       oldestMessageId: serialized.id,
@@ -3342,7 +3356,7 @@ export default class MessageSyncService {
 
     this.insertMessagesTx(records);
 
-    this._updateChannelCursors(batchChannelId, {
+    this._updateChannelCursorsFromUpdate(batchChannelId, {
       lastMessageId: latestMessageId,
       lastMessageDate: latestMessageDate,
       oldestMessageId: oldestMessageId,
@@ -3359,11 +3373,8 @@ export default class MessageSyncService {
       return { hasMoreNewer: false, stoppedEarly: false };
     }
 
-    let minId = channel.last_message_id || 0;
     let lastMessageId = channel.last_message_id || 0;
-    let lastMessageDate = channel.last_message_date || null;
     let oldestMessageId = channel.oldest_message_id || null;
-    let oldestMessageDate = channel.oldest_message_date || null;
     let hasMoreNewer = false;
     let stoppedEarly = false;
     let peerTitle = channel.peer_title;
@@ -3374,10 +3385,13 @@ export default class MessageSyncService {
         stoppedEarly = true;
         break;
       }
+      // Pages go oldest first and the cursor moves after each one, so it only ever
+      // passes archived messages and an interrupted run resumes without a hole. With no
+      // cursor yet this returns the newest batch: older history is _backfillHistory's.
       const { peerTitle: title, peerType: type, messages } = await this.telegramClient.getMessagesByChannelId(
         normalizedId,
         this.batchSize,
-        { minId },
+        { afterId: lastMessageId },
       );
 
       if (this.stopRequested) {
@@ -3389,7 +3403,7 @@ export default class MessageSyncService {
       peerType = type ?? peerType;
 
       const newMessages = messages
-        .filter((msg) => msg.id > minId)
+        .filter((msg) => msg.id > lastMessageId)
         .sort((a, b) => a.id - b.id);
 
       if (!newMessages.length) {
@@ -3415,14 +3429,17 @@ export default class MessageSyncService {
       const oldest = newMessages[0];
 
       lastMessageId = newest.id;
-      lastMessageDate = toIsoString(newest.date) || lastMessageDate;
-
       if (!oldestMessageId || oldest.id < oldestMessageId) {
         oldestMessageId = oldest.id;
-        oldestMessageDate = toIsoString(oldest.date) || oldestMessageDate;
       }
 
-      minId = newest.id;
+      this._updateChannelCursors(normalizedId, {
+        lastMessageId: newest.id,
+        lastMessageDate: toIsoString(newest.date),
+        oldestMessageId: oldest.id,
+        oldestMessageDate: toIsoString(oldest.date),
+      });
+
       hasMoreNewer = newMessages.length >= this.batchSize;
 
       if (!hasMoreNewer || this.stopRequested) {
@@ -3445,13 +3462,6 @@ export default class MessageSyncService {
         username: channel.username ?? null,
       });
     }
-
-    this._updateChannelCursors(normalizedId, {
-      lastMessageId,
-      lastMessageDate,
-      oldestMessageId,
-      oldestMessageDate,
-    });
 
     return {
       hasMoreNewer,

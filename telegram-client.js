@@ -940,7 +940,6 @@ class TelegramClient {
     await this.ensureLogin();
 
     const {
-      minId = 0,
       maxId = 0,
       reverse = false,
       offsetId = 0,
@@ -954,7 +953,6 @@ class TelegramClient {
     const effectiveBeforeId = normalizePositiveMessageId(beforeId)
       || normalizePositiveMessageId(offsetId);
     const effectiveAfterId = normalizePositiveMessageId(afterId);
-    const effectiveMinId = effectiveAfterId || normalizePositiveMessageId(minId);
     const effectiveMaxId = normalizePositiveMessageId(maxId);
     const useAfterIdPagination = Boolean(effectiveAfterId);
     const messages = [];
@@ -965,20 +963,23 @@ class TelegramClient {
       reverse: useAfterIdPagination ? true : reverse,
     };
 
-    if (effectiveMinId) {
-      iterOptions.minId = effectiveMinId;
-    }
-
     if (effectiveMaxId) {
       iterOptions.maxId = effectiveMaxId;
     }
 
+    if (useAfterIdPagination) {
+      // Telegram slices the history by offset before it applies min_id, so the slice
+      // has to start right above afterId. mtcute's default reverse offset starts at the
+      // chat's oldest messages, and min_id would then filter that whole slice away.
+      iterOptions.offset = { id: effectiveAfterId + 1, date: 0 };
+    }
+
     if (effectiveBeforeId) {
       if (useAfterIdPagination || iterOptions.maxId) {
-        const boundedMaxId = Math.max(0, effectiveBeforeId - 1);
+        // max_id excludes its own id, as beforeId does.
         iterOptions.maxId = iterOptions.maxId
-          ? Math.min(iterOptions.maxId, boundedMaxId)
-          : boundedMaxId;
+          ? Math.min(iterOptions.maxId, effectiveBeforeId)
+          : effectiveBeforeId;
       } else {
         iterOptions.offset = { id: effectiveBeforeId, date: 0 };
         iterOptions.addOffset = 0;
