@@ -323,4 +323,27 @@ describe('send command default timeout (CLI integration)', () => {
     expect(stderrText).not.toContain('Connecting to Telegram');
     expect(logSpy.mock.calls.flat().join(' ')).toContain('Message sent (12).');
   });
+
+  it.each([
+    ['text', ['--message', 'hi'], 'Message'],
+    ['photo', ['--photo', 'x.png'], 'Photo'],
+    ['file', ['--file', 'x.pdf'], 'File'],
+  ])('send %s --schedule reports scheduled instead of sent', async (kind, extra, noun) => {
+    control.invoke = vi.fn().mockResolvedValue({ result: { messageId: 13, scheduled: true }, attempts: 1 });
+    const schedule = new Date(Date.now() + 3600000).toISOString();
+
+    await runProgram(['send', kind, '--to', '@x', ...extra, '--schedule', schedule]);
+
+    expect(process.exitCode).toBeUndefined();
+    expect(logSpy.mock.calls.flat().join(' ')).toContain(`${noun} scheduled (13).`);
+  });
+
+  it('send --schedule reports sent when the server did not schedule it', async () => {
+    control.invoke = makeInvoke({ resultMessageId: 14 });
+    const schedule = new Date(Date.now() + 3600000).toISOString();
+
+    await runProgram(['send', 'text', '--to', '@x', '--message', 'hi', '--schedule', schedule]);
+
+    expect(logSpy.mock.calls.flat().join(' ')).toContain('Message sent (14).');
+  });
 });

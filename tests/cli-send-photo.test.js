@@ -88,6 +88,17 @@ describe('buildSendPhotoSuccessPayload with warning', () => {
     expect(payload.ok).toBe(true);
   });
 
+  it('reports scheduled only when the result says so', () => {
+    const build = (result) => buildSendPhotoSuccessPayload({
+      method: 'sendPhoto',
+      inputChatId: '@chat',
+      result: { chatId: '999', messageId: 505, media: { type: 'photo' }, ...result },
+      attempts: 1,
+    });
+    expect(build({ scheduled: true }).scheduled).toBe(true);
+    expect(build({})).not.toHaveProperty('scheduled');
+  });
+
   it('omits warning when result has no warning', () => {
     const payload = buildSendPhotoSuccessPayload({
       method: 'sendPhoto',

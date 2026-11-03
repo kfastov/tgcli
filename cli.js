@@ -2633,7 +2633,14 @@ function buildSendPhotoSuccessPayload({ method, inputChatId, result, attempts })
     media: result?.media ?? { type: 'photo' },
     attempts,
     warning: result?.warning,
+    scheduled: result?.scheduled,
   });
+}
+
+// The label comes from the server's result, not from --schedule: a server on an
+// older version may have ignored the flag and sent the message right away.
+function sendOutcome(result) {
+  return result?.scheduled ? 'scheduled' : 'sent';
 }
 
 // Map a client-side invoke timeout (AbortSignal.timeout fires a TimeoutError, an
@@ -2694,7 +2701,7 @@ async function runSendText(globalFlags, options = {}) {
     if (globalFlags.json) {
       writeJson(payload);
     } else {
-      console.log(`Message sent (${result.messageId}).`);
+      console.log(`Message ${sendOutcome(result)} (${result.messageId}).`);
     }
   } catch (error) {
     throw normalizeSendCommandError(error, { method, retries });
@@ -2732,7 +2739,7 @@ async function runSendPhoto(globalFlags, options = {}) {
     if (globalFlags.json) {
       writeJson(buildSendPhotoSuccessPayload({ method, inputChatId: options.to, result, attempts }));
     } else {
-      console.log(`Photo sent (${result.messageId}).`);
+      console.log(`Photo ${sendOutcome(result)} (${result.messageId}).`);
     }
   } catch (error) {
     throw normalizeSendCommandError(error, { method, retries });
@@ -2776,7 +2783,7 @@ async function runSendFile(globalFlags, options = {}) {
     if (globalFlags.json) {
       writeJson(payload);
     } else {
-      console.log(`File sent (${result.messageId}).`);
+      console.log(`File ${sendOutcome(result)} (${result.messageId}).`);
     }
   } catch (error) {
     throw normalizeSendCommandError(error, { method, retries });

@@ -175,7 +175,7 @@ function buildTextSendParams(options = {}) {
   if (options.silent) params.silent = true;
   if (options.noForwards || options.noforwards) params.forbidForwards = true;
   const scheduleDate = resolveScheduleDate(options);
-  if (scheduleDate) params.scheduleDate = scheduleDate;
+  if (scheduleDate) params.schedule = new Date(scheduleDate * 1000);
   return Object.keys(params).length ? params : undefined;
 }
 
@@ -186,7 +186,7 @@ function buildMediaSendParams(options = {}) {
   if (options.silent) params.silent = true;
   if (options.noForwards || options.noforwards) params.forbidForwards = true;
   const scheduleDate = resolveScheduleDate(options);
-  if (scheduleDate) params.scheduleDate = scheduleDate;
+  if (scheduleDate) params.schedule = new Date(scheduleDate * 1000);
   if (options.captionAbove) params.invert = true;
   return Object.keys(params).length ? params : undefined;
 }
@@ -210,6 +210,7 @@ function resolveOptionalCaption(caption) {
 
 function buildSendMessageResult(sent, { method, defaultMediaType } = {}) {
   const result = { messageId: sent?.id ?? null };
+  if (sent?.isScheduled) result.scheduled = true;
   if (method) result.method = method;
   const media = summarizeMedia(sent?.media) ?? (defaultMediaType ? { type: defaultMediaType } : null);
   if (media) result.media = media;
@@ -1113,7 +1114,7 @@ class TelegramClient {
     const params = buildTextSendParams(options);
     const peerRef = normalizeChannelId(channelId);
     const sent = await this.client.sendText(peerRef, inputText, params);
-    return { messageId: sent.id };
+    return sent.isScheduled ? { messageId: sent.id, scheduled: true } : { messageId: sent.id };
   }
 
   async sendFileMessage(channelId, filePath, options = {}) {
@@ -1190,18 +1191,23 @@ class TelegramClient {
     if (!messageId) {
       throw new Error('Failed to resolve sent photo message id from Telegram updates.');
     }
+    const scheduled = prepared.request.scheduleDate ? { scheduled: true } : {};
     let sent;
     try {
-      [sent] = await this.client.getMessages(prepared.peerRef, Number(messageId));
+      // Scheduled messages have their own id space; getMessages would miss them or hit an unrelated message.
+      [sent] = prepared.request.scheduleDate
+        ? await this.client.getScheduledMessages(prepared.peerRef, Number(messageId))
+        : await this.client.getMessages(prepared.peerRef, Number(messageId));
     } catch (error) {
-      console.error(`[sendPhoto] getMessages enrichment failed for peer ${prepared.peerRef}, message ${messageId}: ${error.message}`);
+      console.error(`[sendPhoto] message lookup for enrichment failed for peer ${prepared.peerRef}, message ${messageId}: ${error.message}`);
     }
     if (sent) {
-      return { chatId, ...buildSendMessageResult(sent, { method: 'sendPhoto', defaultMediaType: 'photo' }) };
+      return { chatId, ...buildSendMessageResult(sent, { method: 'sendPhoto', defaultMediaType: 'photo' }), ...scheduled };
     }
     return {
       chatId,
       messageId: Number(messageId),
+      ...scheduled,
       method: 'sendPhoto',
       media: { type: 'photo' },
       warning: 'Media enrichment failed; file_id unavailable',

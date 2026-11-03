@@ -342,7 +342,7 @@ export async function executeSendWithRetries(sendFn, options = {}) {
 /**
  * Build a structured JSON success payload for send results.
  */
-export function buildSendSuccessPayload({ method, chatId, messageId, media, attempts, warning }) {
+export function buildSendSuccessPayload({ method, chatId, messageId, media, attempts, warning, scheduled }) {
   const payload = {
     ok: true,
     method,
@@ -358,6 +358,10 @@ export function buildSendSuccessPayload({ method, chatId, messageId, media, atte
     if (Object.keys(mediaPayload).length > 0) {
       payload.media = mediaPayload;
     }
+  }
+
+  if (scheduled) {
+    payload.scheduled = true;
   }
 
   if (warning) {

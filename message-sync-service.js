@@ -3200,6 +3200,11 @@ export default class MessageSyncService {
     if (!message?.chat?.id) {
       return;
     }
+    // A scheduled message is not in the chat's history yet: its id comes from a
+    // separate sequence, and it arrives again as a normal message once delivered.
+    if (message.isScheduled) {
+      return;
+    }
 
     const channelId = String(message.chat.id);
     const channelRow = this._ensureChannelFromPeer(channelId, message.chat);

@@ -174,10 +174,10 @@ describe('sendTextMessage new send parameters', () => {
     expect(tc.client.sendText).toHaveBeenCalledWith('@chat', 'hello', { forbidForwards: true });
   });
 
-  it('--schedule passes scheduleDate as unix timestamp in params', async () => {
+  it('--schedule passes schedule as Date in params', async () => {
     const scheduleDate = Math.floor(Date.now() / 1000) + 3600;
     await tc.sendTextMessage('@chat', 'hello', { scheduleDate });
-    expect(tc.client.sendText).toHaveBeenCalledWith('@chat', 'hello', { scheduleDate });
+    expect(tc.client.sendText).toHaveBeenCalledWith('@chat', 'hello', { schedule: new Date(scheduleDate * 1000) });
   });
 
   it('combined silent + replyTo passes both in params', async () => {
@@ -190,11 +190,10 @@ describe('sendTextMessage new send parameters', () => {
     expect(tc.client.sendText).toHaveBeenCalledWith('@chat', 'hello', { forbidForwards: true });
   });
 
-  it('schedule (ISO string) passes scheduleDate as unix timestamp', async () => {
+  it('schedule (ISO string) passes schedule as Date', async () => {
     const iso = '2027-01-15T09:00:00Z';
-    const expected = Math.floor(new Date(iso).getTime() / 1000);
     await tc.sendTextMessage('@chat', 'hello', { schedule: iso });
-    expect(tc.client.sendText).toHaveBeenCalledWith('@chat', 'hello', { scheduleDate: expected });
+    expect(tc.client.sendText).toHaveBeenCalledWith('@chat', 'hello', { schedule: new Date(iso) });
   });
 
   it('no new params still sends undefined params (backward compat)', async () => {
@@ -214,6 +213,12 @@ describe('sendFileMessage new send parameters', () => {
 
   afterEach(() => {
     fs.rmSync(temp.dir, { recursive: true, force: true });
+  });
+
+  it('--schedule passes schedule as Date to sendMedia', async () => {
+    const scheduleDate = Math.floor(Date.now() / 1000) + 3600;
+    await tc.sendFileMessage('@chat', temp.filePath, { scheduleDate });
+    expect(tc.client.sendMedia).toHaveBeenCalledWith('@chat', expect.anything(), { schedule: new Date(scheduleDate * 1000) });
   });
 
   it('--silent passes silent: true in params', async () => {
@@ -294,6 +299,29 @@ describe('sendPhotoMessage', () => {
         caption: { text: '**caption**', entities: [{ type: 'bold' }] },
       }),
     );
+  });
+
+  it('looks up a scheduled photo among scheduled messages, not history', async () => {
+    tc.client.getScheduledMessages = vi.fn().mockResolvedValue([{ id: 202, media: { type: 'photo', fileId: 'scheduled-file-id' } }]);
+    const scheduleDate = Math.floor(Date.now() / 1000) + 1800;
+    const result = await tc.sendPhotoMessage('@chat', png.filePath, { scheduleDate });
+    expect(tc.client.getScheduledMessages).toHaveBeenCalledWith('@chat', 202);
+    expect(tc.client.getMessages).not.toHaveBeenCalled();
+    expect(result.scheduled).toBe(true);
+  });
+
+  it('reports a scheduled photo as scheduled even when its lookup fails', async () => {
+    tc.client.getScheduledMessages = vi.fn().mockRejectedValue(new Error('boom'));
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const result = await tc.sendPhotoMessage('@chat', png.filePath, { scheduleDate: Math.floor(Date.now() / 1000) + 1800 });
+    errSpy.mockRestore();
+    expect(result.scheduled).toBe(true);
+    expect(result.warning).toBeTruthy();
+  });
+
+  it('does not report a photo without a schedule as scheduled', async () => {
+    const result = await tc.sendPhotoMessage('@chat', png.filePath, {});
+    expect(result).not.toHaveProperty('scheduled');
   });
 
   it('passes send params to low-level sendMedia request', async () => {
