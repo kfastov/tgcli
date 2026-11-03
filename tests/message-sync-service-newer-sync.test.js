@@ -461,6 +461,36 @@ describe('catching up on messages newer than the cursor', () => {
       expect(jobStatus()).toBe('error');
     });
 
+    it('leaves a failed job alone while its chat is turned off, and runs it once turned on', () => {
+      seedChat();
+      addJob();
+      service.db.prepare('UPDATE jobs SET status = ? WHERE channel_id = ?').run('error', CHANNEL_ID);
+      service.setChannelSync(CHANNEL_ID, false);
+      vi.spyOn(service, 'processQueue').mockResolvedValue();
+
+      service._resetErroredJobs();
+      expect(jobStatus()).toBe('error');
+
+      service.setChannelSync(CHANNEL_ID, true);
+      service.queueResyncJob(CHANNEL_ID);
+      expect(jobStatus()).toBe('pending');
+    });
+
+    it('does not lose an outage that ends just as a comparison finishes', async () => {
+      const refresh = vi.spyOn(service, 'refreshChannelsFromDialogs').mockResolvedValue(1);
+      vi.spyOn(service, 'resumePendingJobs').mockImplementation(() => {});
+      const finishComparison = service._reconcileUntilDone.bind(service);
+      vi.spyOn(service, '_reconcileUntilDone').mockImplementationOnce(() => finishComparison().then((count) => {
+        service._reconcileAfterOutage();
+        return count;
+      }));
+
+      await service.reconcileWithDialogs();
+
+      await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(service.reconcileNeeded).toBe(false));
+    });
+
     it('a job canceled before its first sync does not stop updates from setting a cursor', () => {
       seedChat({ lastMessageId: 0 });
       addJob();

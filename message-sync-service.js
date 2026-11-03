@@ -1314,31 +1314,34 @@ export default class MessageSyncService {
       this.reconcileAgain = true;
       return this.reconcilePromise;
     }
-    this.reconcilePromise = this._reconcileUntilDone().finally(() => {
-      this.reconcilePromise = null;
-    });
+    this.reconcilePromise = this._reconcileUntilDone();
     return this.reconcilePromise;
   }
 
   async _reconcileUntilDone() {
     let dialogCount = null;
     let retryMs = RETRY_BASE_MS;
-    do {
-      this.reconcileAgain = false;
-      try {
-        dialogCount = await this.refreshChannelsFromDialogs();
-      } catch (error) {
-        if (this.stopRequested) {
-          return null;
+    try {
+      do {
+        this.reconcileAgain = false;
+        try {
+          dialogCount = await this.refreshChannelsFromDialogs();
+        } catch (error) {
+          if (this.stopRequested) {
+            return null;
+          }
+          console.error(`[sync] Could not compare the archive with the dialog list, retrying in ${retryMs / 1000}s: ${error?.message ?? error}`);
+          await this._delayUnlessStopped(retryMs);
+          retryMs = Math.min(retryMs * 2, RETRY_MAX_MS);
+          this.reconcileAgain = true;
         }
-        console.error(`[sync] Could not compare the archive with the dialog list, retrying in ${retryMs / 1000}s: ${error?.message ?? error}`);
-        await this._delayUnlessStopped(retryMs);
-        retryMs = Math.min(retryMs * 2, RETRY_MAX_MS);
-        this.reconcileAgain = true;
-      }
-    } while (this.reconcileAgain && !this.stopRequested);
-    this.reconcileNeeded = false;
-    return this.stopRequested ? null : dialogCount;
+      } while (this.reconcileAgain && !this.stopRequested);
+      this.reconcileNeeded = false;
+      return this.stopRequested ? null : dialogCount;
+    } finally {
+      // In the same tick as the last look at reconcileAgain, so no request falls between.
+      this.reconcilePromise = null;
+    }
   }
 
   _markGapsBehindDialogs(dialogs) {
@@ -2483,11 +2486,13 @@ export default class MessageSyncService {
     `).get();
   }
 
+  // A chat the user has turned off keeps its failed job until it is turned on again.
   _resetErroredJobs() {
     this.db.prepare(`
       UPDATE jobs
       SET status = ?, error = NULL, updated_at = CURRENT_TIMESTAMP
       WHERE status = ?
+        AND channel_id IN (SELECT channel_id FROM channels WHERE sync_enabled = 1)
     `).run(JOB_STATUS.PENDING, JOB_STATUS.ERROR);
   }
 
