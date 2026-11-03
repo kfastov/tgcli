@@ -1954,7 +1954,8 @@ export default class MessageSyncService {
     const minDate = options.minDate ? parseIsoDate(options.minDate) : null;
     const minDateIso = minDate ? new Date(minDate * 1000).toISOString() : null;
 
-    // Stays set until a catch-up reaches the newest message, even if this job is canceled.
+    // Stays set until a newer sync reaches the newest message, even if this job is canceled
+    // with a cursor in place: what lies above that cursor is still to be fetched.
     this.db.prepare(`
       INSERT INTO channels (channel_id, newer_sync_pending, updated_at)
       VALUES (?, 1, CURRENT_TIMESTAMP)
@@ -2121,6 +2122,15 @@ export default class MessageSyncService {
       for (const id of entries) {
         this.db.prepare('DELETE FROM jobs WHERE id = ?').run(id);
       }
+      // With no cursor there is nothing to resume from, and the flag would only keep
+      // updates from ever setting one.
+      this.db.prepare(`
+        UPDATE channels
+        SET newer_sync_pending = 0, updated_at = CURRENT_TIMESTAMP
+        WHERE newer_sync_pending = 1
+          AND COALESCE(last_message_id, 0) = 0
+          AND channel_id NOT IN (SELECT channel_id FROM jobs)
+      `).run();
     });
     tx(ids);
 

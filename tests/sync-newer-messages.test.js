@@ -429,6 +429,26 @@ describe('catching up on messages newer than the cursor', () => {
 
       expect(cursor()).toBe(16);
     });
+
+    it('a job canceled before its first sync does not stop updates from setting a cursor', () => {
+      seedChat({ lastMessageId: 0 });
+      addJob();
+      service.cancelJobs({ channelId: CHANNEL_ID });
+
+      service._handleIncomingMessage(parsed(16), { isEdit: false });
+
+      expect(cursor()).toBe(16);
+    });
+
+    it('a job canceled with a cursor in place still holds it for the next sync', () => {
+      seedChat();
+      addJob();
+      service.cancelJobs({ channelId: CHANNEL_ID });
+
+      service._handleIncomingMessage(parsed(16), { isEdit: false });
+
+      expect(cursor()).toBe(10);
+    });
   });
 
   it('an edit of an old message leaves the cursors, so backfill does not skip below them', async () => {
