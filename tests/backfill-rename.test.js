@@ -136,7 +136,7 @@ describe('backfill is a canonical alias of sync', () => {
   it('`backfill jobs add` resolves the nested subcommand and queues a job on the server (like `sync jobs add`)', async () => {
     services.current = makeFakeServices();
     await runProgram(['backfill', 'jobs', 'add', '--chat', '@chan']);
-    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { idleExit: '60s', quiet: false });
+    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: false });
     expect(control.enqueueBackfill).toHaveBeenCalledWith('/tmp/tgcli-test-store', {
       chatId: '@chan',
       depth: null,

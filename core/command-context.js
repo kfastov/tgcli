@@ -107,7 +107,7 @@ export async function runOperation(globalFlags, { op, args, invokeTimeoutMs } = 
     if (!(error instanceof ServerUnavailableError)) {
       throw error;
     }
-    await ensureServer(storeDir, { idleExit: '60s', quiet });
+    await ensureServer(storeDir, { quiet });
     return invoke(storeDir, { op, args, timeoutMs: invokeTimeoutMs, quiet });
   }
 }

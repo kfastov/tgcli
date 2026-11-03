@@ -30,10 +30,11 @@ const SERVER_STOP_TIMEOUT_MS = 15000;
 const SERVER_POLL_INTERVAL_MS = 250;
 
 const CLI_VERSION = readVersion();
-// What ensureServer's `tgcli server --idle-exit 60s` looks like on the server
-// process. A server started by hand with the same window is equivalent to the one
-// that would replace it; any other command line belongs to the user.
-const AUTO_STARTED_SERVER_ARGS = /--idle-exit 60000(\s|$)/;
+const AUTO_STARTED_IDLE_EXIT = '60s';
+// Servers older than control.json's autoStarted field do not say who started them.
+// ensureServer's ran with this window and, being detached, with no terminal.
+const LEGACY_AUTO_STARTED_ARGS = /--idle-exit 60000(\s|$)/;
+const NO_TERMINAL = /^\?+$/;
 const REQUEST_LOST_CODES = new Set(['UND_ERR_SOCKET', 'ECONNRESET', 'EPIPE']);
 
 // Raised when the control server cannot be reached at all: no control.json, a
@@ -242,9 +243,17 @@ function isOlderVersion(version, than) {
   return version.localeCompare(than, undefined, { numeric: true }) < 0;
 }
 
-function serverCommandLine(pid) {
-  const result = spawnSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8' });
-  return result.status === 0 ? result.stdout : '';
+function readProcessField(pid, field) {
+  const result = spawnSync('ps', ['-o', `${field}=`, '-p', String(pid)], { encoding: 'utf8' });
+  return result.status === 0 ? result.stdout.trim() : '';
+}
+
+function isAutoStarted(control, pid) {
+  if (typeof control.autoStarted === 'boolean') {
+    return control.autoStarted;
+  }
+  return LEGACY_AUTO_STARTED_ARGS.test(readProcessField(pid, 'command'))
+    && NO_TERMINAL.test(readProcessField(pid, 'tty'));
 }
 
 async function waitForExit(pid) {
@@ -287,8 +296,7 @@ async function reconcileServerVersion(storeDir, { quiet = false } = {}) {
   }
 
   const { pid } = ping;
-  const replaceable = isOlderVersion(control.version, CLI_VERSION)
-    && AUTO_STARTED_SERVER_ARGS.test(serverCommandLine(pid));
+  const replaceable = isOlderVersion(control.version, CLI_VERSION) && isAutoStarted(control, pid);
   if (replaceable && !hasQueuedJobs(ping.jobs)) {
     const stopped = await stopServer(pid);
     if (!quiet) {
@@ -307,11 +315,11 @@ async function reconcileServerVersion(storeDir, { quiet = false } = {}) {
   }
 }
 
-// Spawn `tgcli server --idle-exit <idleExit>` fully detached so it outlives this
-// one-shot CLI process. We ignore its stdio and unref the child; the server writes
-// its own control.json once it is listening.
-function spawnDetachedServer(idleExit) {
-  const child = spawn(process.execPath, [CLI_ENTRYPOINT, 'server', '--idle-exit', idleExit], {
+// Spawn `tgcli server --idle-exit 60s --auto-started` fully detached so it outlives
+// this one-shot CLI process. We ignore its stdio and unref the child; the server
+// writes its own control.json once it is listening.
+function spawnDetachedServer() {
+  const child = spawn(process.execPath, [CLI_ENTRYPOINT, 'server', '--idle-exit', AUTO_STARTED_IDLE_EXIT, '--auto-started'], {
     detached: true,
     stdio: 'ignore',
     env: process.env,
@@ -326,10 +334,10 @@ function spawnDetachedServer(idleExit) {
 //     and reconcileServerVersion stopped it.
 //   - A server that is shutting down no longer answers but keeps its control.json
 //     and the DB until it exits, so let it finish rather than start beside it.
-//   - Otherwise spawn a detached `tgcli server --idle-exit <idleExit>` and poll
-//     pingServer for up to ~10s. The idle-exit window lets the auto-started server
-//     shut itself down once the queue drains and nothing is being watched.
-export async function ensureServer(storeDir, { idleExit = '60s', quiet } = {}) {
+//   - Otherwise spawn a detached server and poll pingServer for up to ~10s. The
+//     idle-exit window lets it shut itself down once the queue drains and nothing
+//     is being watched.
+export async function ensureServer(storeDir, { quiet } = {}) {
   await reconcileServerVersion(storeDir, { quiet });
   const existing = await pingServer(storeDir);
   if (existing) {
@@ -337,11 +345,11 @@ export async function ensureServer(storeDir, { idleExit = '60s', quiet } = {}) {
   }
 
   const previousPid = readControlFile(storeDir)?.pid;
-  if (previousPid && serverCommandLine(previousPid).includes('mcp-server.js')) {
+  if (previousPid && readProcessField(previousPid, 'command').includes('mcp-server.js')) {
     await waitForExit(previousPid);
   }
 
-  spawnDetachedServer(idleExit);
+  spawnDetachedServer();
 
   const deadline = Date.now() + SERVER_START_TIMEOUT_MS;
   while (Date.now() < deadline) {

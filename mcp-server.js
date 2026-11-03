@@ -51,6 +51,9 @@ const CONTROL_PORT = Number.isFinite(controlPortRaw) && controlPortRaw > 0 ? con
 // via argv or the TGCLI_IDLE_EXIT env var. When unset/zero the server stays up
 // forever. See resolveIdleExitMs for the ms-vs-duration-string handling.
 const IDLE_EXIT_MS = resolveIdleExitMs(readIdleExitArg());
+// Set by ensureServer on the servers it starts, which a newer CLI may then replace.
+// Any other server belongs to the user.
+const AUTO_STARTED = process.argv.includes("--auto-started");
 const IDLE_CHECK_INTERVAL_MS = 5000;
 
 const { telegramClient, messageSyncService } = createServices({ storeDir, config });
@@ -1756,7 +1759,7 @@ if (controlEnabled) {
     // Two CLIs raced to auto-start a server and the other one won. Staying up here
     // would leave a second writer that no CLI can reach or replace. A server started
     // by hand keeps running, since its other work does not need the control port.
-    if (error.code === "EADDRINUSE" && IDLE_EXIT_MS > 0) {
+    if (error.code === "EADDRINUSE" && AUTO_STARTED) {
       process.exit(1);
     }
   });
@@ -1771,6 +1774,7 @@ if (controlEnabled) {
         token: controlToken,
         startedAt,
         version: serviceState.version,
+        autoStarted: AUTO_STARTED,
       });
       controlFileWritten = true;
     } catch (error) {

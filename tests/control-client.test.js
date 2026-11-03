@@ -219,7 +219,7 @@ describe('ensureServer', () => {
   it('uses an existing server when ping succeeds (no spawn)', async () => {
     writeControl({ pid: 9, port: 8765, token: 'secret', startedAt: 's' });
     global.fetch.mockResolvedValue(jsonResponse(200, { ok: true, pid: 9 }));
-    const result = await ensureServer(storeDir, { idleExit: '60s' });
+    const result = await ensureServer(storeDir);
     expect(result).toMatchObject({ ok: true, pid: 9 });
     expect(spawnMock).not.toHaveBeenCalled();
   });
@@ -240,13 +240,14 @@ describe('ensureServer', () => {
       return Promise.resolve(jsonResponse(200, { ok: true, pid: 42 }));
     });
 
-    const result = await ensureServer(storeDir, { idleExit: '60s' });
+    const result = await ensureServer(storeDir);
     expect(result).toMatchObject({ ok: true, pid: 42 });
     expect(spawnMock).toHaveBeenCalledTimes(1);
     const [, args, opts] = spawnMock.mock.calls[0];
     expect(args).toContain('server');
     expect(args).toContain('--idle-exit');
     expect(args).toContain('60s');
+    expect(args).toContain('--auto-started');
     expect(opts).toMatchObject({ detached: true, stdio: 'ignore' });
   });
 
@@ -271,13 +272,19 @@ describe('server older or newer than this CLI', () => {
   let killSpy;
   let serverAlive;
 
-  function runningServer({ version = OLD_VERSION, jobs = { pending: 0, inProgress: 0 }, args = '--idle-exit 60000' } = {}) {
+  function runningServer({
+    version = OLD_VERSION,
+    jobs = { pending: 0, inProgress: 0 },
+    args = '--idle-exit 60000',
+    tty = '??',
+    owner = {},
+  } = {}) {
     pid += 1;
-    writeControl({ pid, port: 8765, token: 'secret', startedAt: 's', version });
-    spawnSyncMock.mockReturnValue({
+    writeControl({ pid, port: 8765, token: 'secret', startedAt: 's', version, ...owner });
+    spawnSyncMock.mockImplementation((_command, psArgs) => ({
       status: 0,
-      stdout: `node /x/mcp-server.js ${args}\n`,
-    });
+      stdout: psArgs.includes('tty=') ? `${tty}\n` : `node /x/mcp-server.js ${args}\n`,
+    }));
     global.fetch.mockImplementation((url) => Promise.resolve(url.endsWith('/control/ping')
       ? jsonResponse(200, { ok: true, pid, version, startedAt: 's', jobs })
       : jsonResponse(200, { result: 'done' })));
@@ -317,6 +324,26 @@ describe('server older or newer than this CLI', () => {
     expect(errSpy).not.toHaveBeenCalled();
   });
 
+  it('replaces a server that says it was auto-started, whatever its window', async () => {
+    const serverPid = runningServer({ args: '--idle-exit 120000', owner: { autoStarted: true } });
+    await invoke(storeDir, { op: 'listChannels', args: {} }).catch(() => {});
+    expect(killSpy).toHaveBeenCalledWith(serverPid, 'SIGTERM');
+  });
+
+  it('leaves a server started by hand alone, even with the auto-started window', async () => {
+    const serverPid = runningServer({ tty: '??', owner: { autoStarted: false } });
+    await expect(invoke(storeDir, { op: 'listChannels', args: {} })).resolves.toBe('done');
+    expect(killSpy).not.toHaveBeenCalledWith(serverPid, 'SIGTERM');
+    expect(stderr()).toContain('Restart it to use this version.');
+  });
+
+  it('leaves an older server alone when it has a terminal, whatever its window', async () => {
+    const serverPid = runningServer({ tty: 'ttys003' });
+    await expect(invoke(storeDir, { op: 'listChannels', args: {} })).resolves.toBe('done');
+    expect(killSpy).not.toHaveBeenCalledWith(serverPid, 'SIGTERM');
+    expect(stderr()).toContain('Restart it to use this version.');
+  });
+
   it('invoke stops an idle auto-started older server and reports it as unavailable', async () => {
     const serverPid = runningServer();
     const error = await invoke(storeDir, { op: 'listChannels', args: {} }).catch((e) => e);
@@ -333,7 +360,7 @@ describe('server older or newer than this CLI', () => {
       writeControl({ pid: serverPid + 1, port: 8765, token: 'secret', startedAt: 's', version: CLI_VERSION });
       return { unref: vi.fn() };
     });
-    const result = await ensureServer(storeDir, { idleExit: '60s' });
+    const result = await ensureServer(storeDir);
     expect(killSpy).toHaveBeenCalledWith(serverPid, 'SIGTERM');
     expect(spawnMock).toHaveBeenCalledTimes(1);
     expect(result).toMatchObject({ ok: true });

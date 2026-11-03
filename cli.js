@@ -204,6 +204,7 @@ function buildProgram() {
     .command('server')
     .description('Run background sync service (MCP optional)')
     .option('--idle-exit <duration>', 'Exit after this idle period with no jobs or watched channels')
+    .addOption(new Option('--auto-started').hideHelp())
     .action(withGlobalOptions((globalFlags, options) => runServer(globalFlags, options)));
 
   const service = program.command('service').description('Manage background service');
@@ -1573,14 +1574,14 @@ function writeProgress(globalFlags, line) {
   }
 }
 
+function ensureAutoStartedServer(globalFlags, storeDir) {
+  return ensureServer(storeDir, { quiet: globalFlags.quiet });
+}
+
 // With `--chat`, enqueue a single-chat backfill on the always-on control server
 // (auto-starting it) and either return the job id (`--background`) or follow
 // progress in the foreground. Without `--chat`, delegate to the queue-draining
 // path (`--follow`/`--once`/bare usage).
-function ensureAutoStartedServer(globalFlags, storeDir) {
-  return ensureServer(storeDir, { idleExit: '60s', quiet: globalFlags.quiet });
-}
-
 async function runBackfill(globalFlags, options = {}) {
   if (!options.chat) {
     return runSync(globalFlags, options);
@@ -1779,6 +1780,9 @@ async function runServer(globalFlags, options = {}) {
     const childArgs = [serverPath];
     if (Number.isFinite(idleExitMs) && idleExitMs > 0) {
       childArgs.push('--idle-exit', String(idleExitMs));
+    }
+    if (options.autoStarted) {
+      childArgs.push('--auto-started');
     }
 
     child = spawn(process.execPath, childArgs, {

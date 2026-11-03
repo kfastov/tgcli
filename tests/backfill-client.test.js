@@ -96,7 +96,7 @@ describe('backfill --chat (server-executed)', () => {
     services.current = makeFakeServices();
     await runProgram(['--json', 'backfill', '--chat', '@chan', '--depth', '50', '--background']);
 
-    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { idleExit: '60s', quiet: false });
+    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: false });
     expect(control.enqueueBackfill).toHaveBeenCalledWith('/tmp/tgcli-test-store', {
       chatId: '@chan',
       depth: 50,
@@ -211,7 +211,7 @@ describe('backfill cancel', () => {
     services.current = makeFakeServices();
 
     await runProgram(['backfill', 'cancel', '--chat', '@chan']);
-    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { idleExit: '60s', quiet: false });
+    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: false });
     expect(control.cancelBackfill).toHaveBeenCalledWith('/tmp/tgcli-test-store', { chatId: '@chan' });
     expect(control.pingServer).not.toHaveBeenCalled();
     expect(services.current.messageSyncService.cancelJobs).not.toHaveBeenCalled();
@@ -224,7 +224,7 @@ describe('backfill (no --chat): queue draining via the server', () => {
       getJobCounts: vi.fn(() => ({ pending: 0, inProgress: 0 })),
     });
     await runProgram(['backfill', '--once']);
-    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { idleExit: '60s', quiet: false });
+    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: false });
     // No in-process worker: never created services for queue processing, only the
     // brief read snapshot the drain poll uses.
     expect(services.current.messageSyncService.processQueue).toBeUndefined();
@@ -243,7 +243,7 @@ describe('backfill (no --chat): queue draining via the server', () => {
         : [])),
     });
     await runProgram(['sync', '--follow']);
-    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { idleExit: '60s', quiet: false });
+    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: false });
     expect(stderrText()).toContain('Backfilling Chan');
     expect(logSpy.mock.calls.flat().join(' ')).toContain('Backfill queue drained.');
   });
@@ -260,7 +260,7 @@ describe('backfill jobs add / retry / cancel route through the control API', () 
   it('jobs add enqueues via the control client (no in-process queue)', async () => {
     services.current = makeFakeServices();
     await runProgram(['backfill', 'jobs', 'add', '--chat', '@chan', '--depth', '5']);
-    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { idleExit: '60s', quiet: false });
+    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: false });
     expect(control.enqueueBackfill).toHaveBeenCalledWith('/tmp/tgcli-test-store', {
       chatId: '@chan',
       depth: 5,
@@ -272,7 +272,7 @@ describe('backfill jobs add / retry / cancel route through the control API', () 
   it('jobs retry resets via the control client and lets the server process', async () => {
     services.current = makeFakeServices();
     await runProgram(['backfill', 'jobs', 'retry', '--all-errors']);
-    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { idleExit: '60s', quiet: false });
+    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: false });
     expect(control.retryBackfill).toHaveBeenCalledWith('/tmp/tgcli-test-store', {
       jobId: null,
       channelId: null,
@@ -294,7 +294,7 @@ describe('backfill jobs add / retry / cancel route through the control API', () 
   it('jobs cancel by job id auto-starts and routes through the control client', async () => {
     services.current = makeFakeServices();
     await runProgram(['backfill', 'jobs', 'cancel', '--job-id', '42']);
-    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { idleExit: '60s', quiet: false });
+    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: false });
     expect(control.cancelBackfill).toHaveBeenCalledWith('/tmp/tgcli-test-store', {
       jobId: 42,
       chatId: null,
@@ -305,7 +305,7 @@ describe('backfill jobs add / retry / cancel route through the control API', () 
   it('jobs cancel by channel auto-starts and routes through the control client', async () => {
     services.current = makeFakeServices();
     await runProgram(['backfill', 'jobs', 'cancel', '--channel', '@chan']);
-    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { idleExit: '60s', quiet: false });
+    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: false });
     expect(control.cancelBackfill).toHaveBeenCalledWith('/tmp/tgcli-test-store', {
       jobId: null,
       chatId: '@chan',

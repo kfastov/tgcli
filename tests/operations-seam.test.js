@@ -236,7 +236,7 @@ describe('runOperation seam', () => {
 
     const result = await runOperation({}, { op: 'listChannels', args: { limit: 3 } });
 
-    expect(hooks.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-seam-store', { idleExit: '60s' });
+    expect(hooks.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-seam-store', {});
     expect(hooks.invoke).toHaveBeenCalledTimes(2);
     expect(result).toEqual([{ id: 'warm' }]);
   });
