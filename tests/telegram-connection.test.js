@@ -925,11 +925,13 @@ describe('cold start catch-up', () => {
         const { messageSyncService } = startServer();
         const reconcile = vi.spyOn(messageSyncService, '_reconcileAfterOutage').mockImplementation(() => {});
         const confirm = vi.spyOn(messageSyncService, '_confirmConnection').mockResolvedValue();
+        const retryJobs = vi.spyOn(messageSyncService, '_retryErroredJobsWhenDue').mockImplementation(() => {});
         messageSyncService.startRealtimeSync();
 
         vi.advanceTimersByTime(30 * 1000);
         expect(reconcile).not.toHaveBeenCalled();
         expect(confirm).toHaveBeenCalledTimes(1);
+        expect(retryJobs).toHaveBeenCalledTimes(1);
 
         vi.setSystemTime(Date.now() + 6 * 60 * 1000);
         vi.advanceTimersByTime(30 * 1000);

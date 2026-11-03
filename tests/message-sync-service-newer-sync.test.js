@@ -442,6 +442,25 @@ describe('catching up on messages newer than the cursor', () => {
       expect(reconcile).toHaveBeenCalledTimes(1);
     });
 
+    it('runs a failed job again within the hour, once per hour', () => {
+      seedChat();
+      addJob();
+      service.db.prepare('UPDATE jobs SET status = ? WHERE channel_id = ?').run('error', CHANNEL_ID);
+      const processQueue = vi.spyOn(service, 'processQueue').mockResolvedValue();
+
+      service._retryErroredJobsWhenDue();
+      expect(jobStatus()).toBe('error');
+
+      service.lastErroredJobsRetryAt = Date.now() - 60 * 60 * 1000;
+      service._retryErroredJobsWhenDue();
+      expect(jobStatus()).toBe('pending');
+      expect(processQueue).toHaveBeenCalledTimes(1);
+
+      service.db.prepare('UPDATE jobs SET status = ? WHERE channel_id = ?').run('error', CHANNEL_ID);
+      service._retryErroredJobsWhenDue();
+      expect(jobStatus()).toBe('error');
+    });
+
     it('a job canceled before its first sync does not stop updates from setting a cursor', () => {
       seedChat({ lastMessageId: 0 });
       addJob();

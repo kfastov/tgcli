@@ -573,6 +573,7 @@ export default class MessageSyncService {
     this.disconnectCount = 0;
     this.confirmingConnection = false;
     this.lastCheckAt = Date.now();
+    this.lastErroredJobsRetryAt = Date.now();
     this.periodicCheckTimer = null;
     // Id of the job this instance set to `in_progress` while running the queue.
     // Only the queue worker owns its in-flight job; `shutdown()` requeues just
@@ -2320,6 +2321,7 @@ export default class MessageSyncService {
     this.periodicCheckTimer = setInterval(() => {
       this._checkForSleep();
       void this._confirmConnection();
+      this._retryErroredJobsWhenDue();
     }, PERIODIC_CHECK_INTERVAL_MS);
     this.periodicCheckTimer.unref?.();
   }
@@ -2344,6 +2346,17 @@ export default class MessageSyncService {
         this.resumePendingJobs();
       }
     });
+  }
+
+  // A failed job keeps its chat's cursor held, on a server that may not restart for weeks.
+  _retryErroredJobsWhenDue() {
+    const now = Date.now();
+    if (now - this.lastErroredJobsRetryAt < RETRY_MAX_MS) {
+      return;
+    }
+    this.lastErroredJobsRetryAt = now;
+    this._resetErroredJobs();
+    void this.processQueue();
   }
 
   async processQueue() {
