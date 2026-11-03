@@ -27,13 +27,13 @@ export function createTelegramConnector({ telegramClient, messageSyncService }) 
         // client.start() and persists the new pts once it has dispatched the missed
         // updates, so whatever it dispatches to nobody is gone for good.
         messageSyncService.startRealtimeSync();
-        console.log("[startup] Connecting Telegram client...");
+        console.log('[startup] Connecting Telegram client...');
         const dialogsReady = await telegramClient.initializeDialogCache();
         if (!dialogsReady) {
-          throw new Error("Failed to initialize Telegram dialog list");
+          throw new Error('Failed to initialize Telegram dialog list');
         }
         telegramReady = true;
-        console.log("[startup] Telegram client connected.");
+        console.log('[startup] Telegram client connected.');
         // Seed the archive registry and start queue work in the background; ops do
         // their own live fetches and must not wait on the full dialog refresh, which
         // is slow on large accounts.

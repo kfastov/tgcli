@@ -837,6 +837,7 @@ class TelegramClient {
           isGroup,
           unreadCount: typeof dialog.unreadCount === 'number' ? dialog.unreadCount : 0,
           unreadMentionsCount: typeof dialog.unreadMentionsCount === 'number' ? dialog.unreadMentionsCount : 0,
+          topMessageId: dialog.raw.topMessage,
         });
 
         if (results.length >= effectiveLimit) {

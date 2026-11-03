@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { Long } from '@mtcute/core';
+import { Long, tl } from '@mtcute/core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createTelegramConnector } from '../core/telegram-connection.js';
@@ -57,6 +57,24 @@ function channelMessage(id) {
   };
 }
 
+function dialogWith(peer, topMessage) {
+  return {
+    _: 'dialog',
+    peer,
+    topMessage,
+    readInboxMaxId: 0,
+    readOutboxMaxId: 0,
+    unreadCount: 0,
+    unreadMentionsCount: 0,
+    unreadReactionsCount: 0,
+    notifySettings: { _: 'peerNotifySettings' },
+    pts: 500,
+  };
+}
+
+const FRIEND_PEER = { _: 'peerUser', userId: FRIEND_ID };
+const CHANNEL_PEER = { _: 'peerChannel', channelId: BARE_CHANNEL_ID };
+
 function deferred() {
   let resolve;
   const promise = new Promise((res) => {
@@ -72,12 +90,17 @@ class FakeTelegram {
   constructor() {
     this.pts = STORED_PTS;
     this.missed = [];
+    this.commonDifferenceTooLong = false;
+    this.channelTooLongPts = null;
     this.channelDifference = null;
     this.history = new Map();
+    this.historyGate = null;
+    this.historyPages = 0;
+    this.maxHistoryPage = Infinity;
+    this.onHistoryPage = null;
+    this.dialogs = [];
     this.dialogsGate = null;
     this.failNext = new Map();
-    this.historyPages = 0;
-    this.onHistoryPage = null;
   }
 
   arriveWhileOffline(message) {
@@ -95,43 +118,53 @@ class FakeTelegram {
       case 'users.getUsers':
         return [SELF];
       case 'updates.getState':
-        return { _: 'updates.state', pts: this.pts, qts: 0, date: 1700000000, seq: 0, unreadCount: 0 };
+        return this._state();
       case 'updates.getDifference':
         return this._difference(request);
       case 'updates.getChannelDifference':
         return this.channelDifference ?? {
           _: 'updates.channelDifferenceEmpty', final: true, pts: request.pts,
         };
-      case 'messages.getPinnedDialogs':
-        await this.dialogsGate?.promise;
-        return { _: 'messages.peerDialogs', dialogs: [], messages: [], ...PEERS, state: {} };
       case 'messages.getDialogs':
         await this.dialogsGate?.promise;
-        return { _: 'messages.dialogs', dialogs: [], messages: [], ...PEERS };
+        return {
+          _: 'messages.dialogs',
+          dialogs: request.offsetPeer._ === 'inputPeerEmpty' ? this.dialogs : [],
+          messages: [],
+          ...PEERS,
+        };
       case 'messages.getHistory':
+        await this.historyGate?.promise;
         return this._historySlice(request);
       default:
         throw new Error(`FakeTelegram has no answer for ${request._}`);
     }
   }
 
+  _state() {
+    return { _: 'updates.state', pts: this.pts, qts: 0, date: 1700000000, seq: 0, unreadCount: 0 };
+  }
+
   _difference(request) {
+    if (this.commonDifferenceTooLong) {
+      this.commonDifferenceTooLong = false;
+      return { _: 'updates.differenceTooLong', pts: this.pts };
+    }
     const pending = this.missed.filter((entry) => entry.pts > request.pts);
-    const state = { _: 'updates.state', pts: this.pts, qts: 0, date: 1700000000, seq: 0, unreadCount: 0 };
-    if (!pending.length && !this.channelTooLong) {
+    if (!pending.length && !this.channelTooLongPts) {
       return { _: 'updates.differenceEmpty', date: 1700000000, seq: 0 };
     }
-    const otherUpdates = this.channelTooLong
-      ? [{ _: 'updateChannelTooLong', channelId: BARE_CHANNEL_ID, pts: this.channelTooLong }]
+    const otherUpdates = this.channelTooLongPts
+      ? [{ _: 'updateChannelTooLong', channelId: BARE_CHANNEL_ID, pts: this.channelTooLongPts }]
       : [];
-    this.channelTooLong = null;
+    this.channelTooLongPts = null;
     return {
       _: 'updates.difference',
       newMessages: pending.map((entry) => entry.message),
       newEncryptedMessages: [],
       otherUpdates,
       ...PEERS,
-      state,
+      state: this._state(),
     };
   }
 
@@ -147,9 +180,11 @@ class FakeTelegram {
       : 0;
     const anchor = start === -1 ? descending.length : start;
     const from = Math.max(0, anchor + addOffset);
+    // A page nearest the offset, which is its tail when walking towards newer messages.
     const slice = descending
       .slice(from, anchor + addOffset + limit)
-      .filter((message) => message.id > minId);
+      .filter((message) => message.id > minId)
+      .slice(-this.maxHistoryPage);
     return { _: 'messages.channelMessages', messages: slice, count: messages.length, ...PEERS };
   }
 }
@@ -227,15 +262,28 @@ describe('cold start catch-up', () => {
   }
 
   // Delivered while the server runs, the way the connection hands updates to mtcute.
-  function arriveLive(message, pts) {
-    telegram.pts = pts;
+  function deliverLive(update) {
     running.telegramClient.client._client.onServerUpdate.emit({
       _: 'updates',
-      updates: [{ _: 'updateNewMessage', message, pts, ptsCount: 1 }],
+      updates: [update],
       ...PEERS,
       date: 1700000000,
       seq: 0,
     });
+  }
+
+  function arriveLive(message) {
+    telegram.pts += 1;
+    deliverLive({ _: 'updateNewMessage', message, pts: telegram.pts, ptsCount: 1 });
+  }
+
+  function seedCursor(service, channelId, id) {
+    service.upsertChannels([{ id: channelId, title: 'Seeded', type: 'channel' }]);
+    service._updateChannelCursors(channelId, { lastMessageId: id, oldestMessageId: id });
+  }
+
+  function recordedGap(channelId) {
+    return running.messageSyncService._getChannel(channelId)?.gap_after_message_id;
   }
 
   beforeEach(async () => {
@@ -271,8 +319,27 @@ describe('cold start catch-up', () => {
     telegram.dialogsGate.resolve();
   });
 
+  it('archives catch-up that mtcute dispatches before login returns', async () => {
+    telegram.arriveWhileOffline(friendMessage(11));
+
+    // mtcute starts the updates loop inside client.start(), so nothing says the batch
+    // waits for the connect to finish. This pins the order instead of a timing.
+    const { ensureConnected, telegramClient } = startServer();
+    const login = telegramClient.login.bind(telegramClient);
+    let archivedWhenLoginReturned;
+    telegramClient.login = async (...args) => {
+      const loggedIn = await login(...args);
+      await vi.waitFor(async () => expect(await storedPts()).toBe(telegram.pts));
+      archivedWhenLoginReturned = archivedIds(FRIEND_CHAT_ID);
+      return loggedIn;
+    };
+    await ensureConnected();
+
+    expect(archivedWhenLoginReturned).toEqual([11]);
+  });
+
   it('archives channel messages that catch-up fetches as a channel difference', async () => {
-    telegram.channelTooLong = 50;
+    telegram.channelTooLongPts = 50;
     telegram.channelDifference = {
       _: 'updates.channelDifference',
       final: true,
@@ -300,7 +367,7 @@ describe('cold start catch-up', () => {
     await ensureConnected();
     await vi.waitFor(async () => expect(await storedPts()).toBe(telegram.pts));
 
-    arriveLive(friendMessage(13), telegram.pts + 1);
+    arriveLive(friendMessage(13));
 
     await vi.waitFor(() => expect(archivedIds(FRIEND_CHAT_ID)).toEqual([11, 12, 13]));
     expect(cursor(FRIEND_CHAT_ID)).toBe(13);
@@ -345,12 +412,12 @@ describe('cold start catch-up', () => {
 
     const { ensureConnected, messageSyncService, telegramClient } = startServer();
     const firstClient = telegramClient.client;
-    const seeded = vi.spyOn(messageSyncService, 'resumePendingJobs');
+    const jobsResumed = vi.spyOn(messageSyncService, 'resumePendingJobs');
     await ensureConnected();
-    await vi.waitFor(() => expect(seeded).toHaveBeenCalled());
+    await vi.waitFor(() => expect(jobsResumed).toHaveBeenCalled());
     expect(telegramClient.client).not.toBe(firstClient);
 
-    arriveLive(friendMessage(11), telegram.pts + 1);
+    arriveLive(friendMessage(11));
 
     await vi.waitFor(() => expect(archivedIds(FRIEND_CHAT_ID)).toEqual([11]));
   });
@@ -395,6 +462,18 @@ describe('cold start catch-up', () => {
     expect(telegramClient.updateEmitter.listenerCount('clientReplaced')).toBe(0);
   });
 
+  it('adds the gap column to an archive created before it existed', async () => {
+    const { messageSyncService } = startServer();
+    messageSyncService.db.exec('ALTER TABLE channels DROP COLUMN gap_after_message_id');
+    await stopServer();
+
+    const reopened = startServer();
+    seedCursor(reopened.messageSyncService, CHANNEL_ID, 10);
+    reopened.messageSyncService._markChannelGap(CHANNEL_ID);
+
+    expect(recordedGap(CHANNEL_ID)).toBe(10);
+  });
+
   describe('when a channel missed more than catch-up can carry', () => {
     const channelHistory = (from, to) => {
       const messages = [];
@@ -404,100 +483,178 @@ describe('cold start catch-up', () => {
       return messages;
     };
 
-    function channelTooLong(newest) {
-      telegram.channelTooLong = 50;
+    function channelDifferenceTooLong(newest) {
+      telegram.channelTooLongPts = 50;
       telegram.channelDifference = {
         _: 'updates.channelDifferenceTooLong',
         final: true,
-        dialog: {
-          _: 'dialog',
-          peer: { _: 'peerChannel', channelId: BARE_CHANNEL_ID },
-          topMessage: newest[newest.length - 1].id,
-          readInboxMaxId: 0,
-          readOutboxMaxId: 0,
-          unreadCount: 0,
-          unreadMentionsCount: 0,
-          unreadReactionsCount: 0,
-          notifySettings: { _: 'peerNotifySettings' },
-          pts: 500,
-        },
+        dialog: dialogWith(CHANNEL_PEER, newest[newest.length - 1].id),
         messages: newest,
         ...PEERS,
       };
     }
 
-    function seedCursor(service, id) {
-      service.upsertChannels([{ id: CHANNEL_ID, title: 'Group', type: 'channel' }]);
-      service._updateChannelCursors(CHANNEL_ID, { lastMessageId: id, oldestMessageId: id });
+    function liveChannelMessage(id, pts) {
+      const message = channelMessage(id);
+      telegram.history.get(BARE_CHANNEL_ID).push(message);
+      deliverLive({ _: 'updateNewChannelMessage', message, pts, ptsCount: 1 });
     }
 
+    // 19 and 20 arrive in the diff, and 11..18 are only reachable through history.
+    function startWithGapAfter10() {
+      telegram.history.set(BARE_CHANNEL_ID, channelHistory(1, 20));
+      channelDifferenceTooLong(channelHistory(19, 20));
+      const server = startServer();
+      seedCursor(server.messageSyncService, CHANNEL_ID, 10);
+      return server;
+    }
+
+    const ID_11_TO_20 = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+
     it('fills the gap between the cursor and the messages the diff carried', async () => {
-      telegram.history.set(BARE_CHANNEL_ID, channelHistory(1, 20));
-      channelTooLong(channelHistory(19, 20));
-
-      const { ensureConnected, messageSyncService } = startServer();
-      seedCursor(messageSyncService, 10);
+      const { ensureConnected } = startWithGapAfter10();
       await ensureConnected();
 
-      await vi.waitFor(() => expect(cursor(CHANNEL_ID)).toBe(20));
-      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
-    });
-
-    it('keeps the cursor before the gap when fetching it fails, so a later sync can retry', async () => {
-      const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
-      telegram.history.set(BARE_CHANNEL_ID, channelHistory(1, 20));
-      channelTooLong(channelHistory(19, 20));
-      telegram.failNext.set('messages.getHistory', new Error('history unavailable'));
-
-      const { ensureConnected, messageSyncService } = startServer();
-      seedCursor(messageSyncService, 10);
-      await ensureConnected();
-      await vi.waitFor(() => expect(errorLog).toHaveBeenCalled());
-
-      expect(archivedIds(CHANNEL_ID)).toEqual([19, 20]);
-      expect(cursor(CHANNEL_ID)).toBe(10);
-
-      await messageSyncService._syncNewerMessages(CHANNEL_ID);
-
-      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual(ID_11_TO_20));
+      await vi.waitFor(() => expect(recordedGap(CHANNEL_ID)).toBeNull());
       expect(cursor(CHANNEL_ID)).toBe(20);
     });
 
-    it('does not let a live message hide a gap that is waiting for its turn', async () => {
-      telegram.history.set(BARE_CHANNEL_ID, channelHistory(1, 20));
-      channelTooLong(channelHistory(19, 20));
-
-      const { ensureConnected, messageSyncService, telegramClient } = startServer();
-      seedCursor(messageSyncService, 10);
-      const earlierGap = deferred();
-      messageSyncService.channelGapSyncs = earlierGap.promise;
+    it('does not let a live message hide a gap', async () => {
+      telegram.historyGate = deferred();
+      const { ensureConnected } = startWithGapAfter10();
       await ensureConnected();
       await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([19, 20]));
 
-      const update = channelHistory(21, 21)[0];
-      telegram.history.get(BARE_CHANNEL_ID).push(update);
-      telegramClient.client._client.onServerUpdate.emit({
-        _: 'updates',
-        updates: [{ _: 'updateNewChannelMessage', message: update, pts: 501, ptsCount: 1 }],
-        ...PEERS,
-        date: 1700000000,
-        seq: 0,
-      });
+      liveChannelMessage(21, 501);
       await vi.waitFor(() => expect(cursor(CHANNEL_ID)).toBe(21));
+      telegram.historyGate.resolve();
 
-      earlierGap.resolve();
-
-      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual(
-        [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
-      ));
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([...ID_11_TO_20, 21]));
       expect(cursor(CHANNEL_ID)).toBe(21);
+    });
+
+    it('keeps the gap across a shutdown, and a live message before the refill does not hide it', async () => {
+      const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const { ensureConnected } = startWithGapAfter10();
+      let stopping;
+      telegram.onHistoryPage = (page) => {
+        if (page === 2) stopping = stopServer();
+      };
+      await ensureConnected();
+      await vi.waitFor(() => expect(stopping).toBeDefined());
+      await stopping;
+      expect(errorLog).not.toHaveBeenCalled();
+
+      // mtcute has moved past this channel, so the restart gets no second report of it.
+      telegram.onHistoryPage = null;
+      telegram.dialogsGate = deferred();
+      const server = startServer();
+      await server.ensureConnected();
+      expect(recordedGap(CHANNEL_ID)).toBe(12);
+      liveChannelMessage(21, 501);
+      await vi.waitFor(() => expect(cursor(CHANNEL_ID)).toBe(21));
+      telegram.dialogsGate.resolve();
+
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([...ID_11_TO_20, 21]));
+      await vi.waitFor(() => expect(recordedGap(CHANNEL_ID)).toBeNull());
+    });
+
+    it('retries a failed gap on the next start without spinning on it now', async () => {
+      const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+      telegram.history.set(BARE_CHANNEL_ID, channelHistory(1, 20));
+      telegram.dialogs = [dialogWith(CHANNEL_PEER, 20)];
+      telegram.failNext.set('messages.getHistory', new Error('history unavailable'));
+      const { ensureConnected, messageSyncService } = startServer();
+      seedCursor(messageSyncService, CHANNEL_ID, 10);
+      await ensureConnected();
+
+      await vi.waitFor(() => expect(errorLog).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(messageSyncService.processing).toBe(false));
+      expect(recordedGap(CHANNEL_ID)).toBe(10);
+      const pagesAfterFailure = telegram.historyPages;
+
+      await messageSyncService.processQueue();
+      expect(telegram.historyPages).toBe(pagesAfterFailure);
+
+      await stopServer();
+      const restarted = startServer();
+      await restarted.ensureConnected();
+
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual(ID_11_TO_20));
+      await vi.waitFor(() => expect(recordedGap(CHANNEL_ID)).toBeNull());
+    });
+
+    it('retries a gap that failed before the dialog refresh once the refresh is done', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      telegram.failNext.set('messages.getHistory', new Error('client is being replaced'));
+      telegram.dialogsGate = deferred();
+      const { ensureConnected, messageSyncService } = startWithGapAfter10();
+      await ensureConnected();
+      await vi.waitFor(() => expect(messageSyncService.failedGapChannelIds.size).toBe(1));
+
+      telegram.dialogsGate.resolve();
+
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual(ID_11_TO_20));
+    });
+
+    it('keeps the lower start when a second gap opens before the first is filled', async () => {
+      const { messageSyncService } = startServer();
+      seedCursor(messageSyncService, CHANNEL_ID, 10);
+
+      messageSyncService._markChannelGap(CHANNEL_ID);
+      messageSyncService._updateChannelCursors(CHANNEL_ID, { lastMessageId: 20 });
+      messageSyncService._markChannelGap(CHANNEL_ID);
+
+      expect(recordedGap(CHANNEL_ID)).toBe(10);
+    });
+
+    it('waits out a flood wait and carries on', async () => {
+      const floodWait = tl.RpcError.fromTl({ _: 'rpc_error', errorCode: 420, errorMessage: 'FLOOD_WAIT_1' });
+      telegram.failNext.set('messages.getHistory', floodWait);
+      const { ensureConnected } = startWithGapAfter10();
+      await ensureConnected();
+
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual(ID_11_TO_20), { timeout: 3000 });
+    });
+
+    it('does not hold up a shutdown for a long flood wait', async () => {
+      const floodWait = tl.RpcError.fromTl({ _: 'rpc_error', errorCode: 420, errorMessage: 'FLOOD_WAIT_3600' });
+      telegram.failNext.set('messages.getHistory', floodWait);
+      const { ensureConnected, messageSyncService } = startWithGapAfter10();
+      const waited = vi.spyOn(messageSyncService, '_delayUnlessStopped');
+      await ensureConnected();
+      await vi.waitFor(() => expect(waited).toHaveBeenCalledWith(3600000));
+
+      await stopServer();
+    }, 3000);
+
+    it('does not take a short page for the end of a gap', async () => {
+      telegram.maxHistoryPage = 1;
+      const { ensureConnected } = startWithGapAfter10();
+      await ensureConnected();
+
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual(ID_11_TO_20));
+    });
+
+    it('records no gap and fetches nothing for a chat with no cursor yet', async () => {
+      telegram.history.set(BARE_CHANNEL_ID, channelHistory(1, 20));
+      channelDifferenceTooLong(channelHistory(19, 20));
+      const { ensureConnected, messageSyncService } = startServer();
+      await ensureConnected();
+
+      await vi.waitFor(() => expect(cursor(CHANNEL_ID)).toBe(20));
+      await vi.waitFor(() => expect(messageSyncService.processing).toBe(false));
+      expect(archivedIds(CHANNEL_ID)).toEqual([19, 20]);
+      expect(recordedGap(CHANNEL_ID)).toBeNull();
+      expect(telegram.historyPages).toBe(0);
     });
 
     it('resumes a stopped sync from where the archive is continuous', async () => {
       telegram.history.set(BARE_CHANNEL_ID, channelHistory(1, 16));
 
       const { ensureConnected, messageSyncService } = startServer();
-      seedCursor(messageSyncService, 10);
+      seedCursor(messageSyncService, CHANNEL_ID, 10);
       await ensureConnected();
       await messageSyncService.refreshChannelsFromDialogs();
       telegram.onHistoryPage = (page) => {
@@ -529,6 +686,70 @@ describe('cold start catch-up', () => {
 
       expect(archivedIds(CHANNEL_ID)).toEqual([19, 20]);
       expect(cursor(CHANNEL_ID)).toBe(20);
+    });
+  });
+
+  describe('when catch-up reports nothing about what a chat missed', () => {
+    function friendHistory(from, to) {
+      const messages = [];
+      for (let id = from; id <= to; id += 1) {
+        messages.push(friendMessage(id));
+      }
+      return messages;
+    }
+
+    it('finds a gap left by updates.differenceTooLong through the dialog list', async () => {
+      // mtcute moves the pts past these and hands over nothing.
+      telegram.pts += 5;
+      telegram.commonDifferenceTooLong = true;
+      telegram.history.set(FRIEND_ID, friendHistory(1, 15));
+      telegram.dialogs = [dialogWith(FRIEND_PEER, 15)];
+
+      const { ensureConnected, messageSyncService } = startServer();
+      seedCursor(messageSyncService, FRIEND_CHAT_ID, 10);
+      await ensureConnected();
+
+      await vi.waitFor(() => expect(archivedIds(FRIEND_CHAT_ID)).toEqual([11, 12, 13, 14, 15]));
+      await vi.waitFor(() => expect(recordedGap(FRIEND_CHAT_ID)).toBeNull());
+      expect(cursor(FRIEND_CHAT_ID)).toBe(15);
+    });
+
+    it('finds a channel Telegram never named through the dialog list', async () => {
+      telegram.history.set(BARE_CHANNEL_ID, [channelMessage(11), channelMessage(12)]);
+      telegram.dialogs = [dialogWith(CHANNEL_PEER, 12)];
+
+      const { ensureConnected, messageSyncService } = startServer();
+      seedCursor(messageSyncService, CHANNEL_ID, 10);
+      await ensureConnected();
+
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([11, 12]));
+    });
+
+    it('fetches nothing for chats that are current, have no cursor, or are not synced', async () => {
+      telegram.history.set(FRIEND_ID, friendHistory(1, 15));
+      telegram.history.set(BARE_CHANNEL_ID, [channelMessage(11), channelMessage(12)]);
+      telegram.dialogs = [dialogWith(FRIEND_PEER, 15), dialogWith(CHANNEL_PEER, 12)];
+
+      const first = startServer();
+      seedCursor(first.messageSyncService, FRIEND_CHAT_ID, 15);
+      first.messageSyncService.upsertChannels([{ id: CHANNEL_ID, title: 'Group', type: 'channel' }]);
+      const jobsResumed = vi.spyOn(first.messageSyncService, 'resumePendingJobs');
+      await first.ensureConnected();
+      await vi.waitFor(() => expect(jobsResumed).toHaveBeenCalled());
+      await vi.waitFor(() => expect(first.messageSyncService.processing).toBe(false));
+      expect(telegram.historyPages).toBe(0);
+      await stopServer();
+
+      const second = startServer();
+      seedCursor(second.messageSyncService, CHANNEL_ID, 10);
+      second.messageSyncService.setChannelSync(CHANNEL_ID, false);
+      const resumed = vi.spyOn(second.messageSyncService, 'resumePendingJobs');
+      await second.ensureConnected();
+      await vi.waitFor(() => expect(resumed).toHaveBeenCalled());
+      await vi.waitFor(() => expect(second.messageSyncService.processing).toBe(false));
+
+      expect(telegram.historyPages).toBe(0);
+      expect(recordedGap(CHANNEL_ID)).toBeNull();
     });
   });
 });
