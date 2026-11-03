@@ -134,6 +134,10 @@ describe('catching up on messages newer than the cursor', () => {
     SELECT status FROM jobs WHERE channel_id = ?
   `).get(CHANNEL_ID).status;
 
+  const oldestCursor = () => service.db.prepare(`
+    SELECT oldest_message_id FROM channels WHERE channel_id = ?
+  `).get(CHANNEL_ID).oldest_message_id;
+
   const addJob = () => service.addJob(CHANNEL_ID, { depth: 1 });
 
   const stopOnPage = (stopPage) => {
@@ -321,6 +325,21 @@ describe('catching up on messages newer than the cursor', () => {
 
       expect(cursor()).toBe(16);
     });
+  });
+
+  it('an edit of an old message leaves the cursors, so backfill does not skip below them', async () => {
+    seedChat({ lastMessageId: 30 });
+    service.db.prepare('UPDATE channels SET oldest_message_id = 21 WHERE channel_id = ?').run(CHANNEL_ID);
+    historyIds = range(1, 30);
+
+    service._handleIncomingMessage(parsed(5), { isEdit: true });
+
+    expect(oldestCursor()).toBe(21);
+    expect(cursor()).toBe(30);
+
+    await service._processJob(service.addJob(CHANNEL_ID, { depth: 1000 }));
+
+    expect(archivedIds()).toEqual(range(1, 20));
   });
 
   describe('getMessagesByChannelId afterId', () => {

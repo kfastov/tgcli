@@ -3240,6 +3240,12 @@ export default class MessageSyncService {
       this._replaceMessageMedia(record);
     }
 
+    // An edit can be of any old message, which says nothing about what is archived
+    // around it: taking it as the oldest would make backfill skip down to it.
+    if (isEdit) {
+      return;
+    }
+
     const messageDate = toIsoString(serialized.date);
     this._updateChannelCursorsFromUpdate(channelId, {
       lastMessageId: serialized.id,
