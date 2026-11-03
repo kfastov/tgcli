@@ -599,6 +599,7 @@ describe('cold start catch-up', () => {
       expect(recordedGap(CHANNEL_ID)).toBe(10);
       expect(errorLog.mock.calls[0][0]).toContain('retrying in 60s');
       expect(messageSyncService.getQueueStats().gaps).toBe(1);
+      expect(messageSyncService.gapRetryTimer).not.toBeNull();
       const pagesAfterFailure = telegram.historyPages;
 
       await messageSyncService.processQueue();
@@ -823,6 +824,7 @@ describe('cold start catch-up', () => {
 
       messageSyncService._handleConnectionState('connecting');
       messageSyncService._handleConnectionState('connected');
+      await vi.waitFor(() => expect(messageSyncService.disconnectedAt).toBeNull());
       expect(listDialogs).not.toHaveBeenCalled();
 
       messageSyncService._handleConnectionState('offline');
@@ -836,6 +838,70 @@ describe('cold start catch-up', () => {
       await vi.waitFor(() => expect(recordedGap(FRIEND_CHAT_ID)).toBeNull());
       expect(listDialogs).toHaveBeenCalledTimes(1);
       expect(cursor(FRIEND_CHAT_ID)).toBe(16);
+      expect(resumed).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not take an open socket for the end of an outage', async () => {
+      telegram.history.set(FRIEND_ID, friendHistory(1, 10));
+      telegram.dialogs = [dialogWith(FRIEND_PEER, 10)];
+      const { ensureConnected, messageSyncService } = startServer();
+      const resumed = vi.spyOn(messageSyncService, 'resumePendingJobs');
+      seedCursor(messageSyncService, FRIEND_CHAT_ID, 10);
+      await ensureConnected();
+      await vi.waitFor(() => expect(resumed).toHaveBeenCalled());
+      await vi.waitFor(async () => expect(await storedPts()).toBe(telegram.pts));
+
+      // A proxy accepts the connection every couple of minutes, and Telegram stays silent.
+      const confirmed = vi.spyOn(messageSyncService, '_confirmConnection');
+      telegram.failNext.set('updates.getState', new Error('no answer'));
+      messageSyncService._handleConnectionState('connecting');
+      const outageStart = messageSyncService.disconnectedAt;
+      messageSyncService._handleConnectionState('connected');
+      await confirmed.mock.results[0].value;
+      expect(messageSyncService.disconnectedAt).toBe(outageStart);
+
+      messageSyncService._handleConnectionState('connecting');
+      expect(messageSyncService.disconnectedAt).toBe(outageStart);
+      arriveLive(friendMessage(16));
+      await vi.waitFor(() => expect(archivedIds(FRIEND_CHAT_ID)).toEqual([16]));
+      expect(cursor(FRIEND_CHAT_ID)).toBe(10);
+
+      messageSyncService.disconnectedAt -= 6 * 60 * 1000;
+      telegram.history.set(FRIEND_ID, friendHistory(1, 16));
+      telegram.dialogs = [dialogWith(FRIEND_PEER, 16)];
+      messageSyncService._handleConnectionState('connected');
+
+      await vi.waitFor(() => expect(archivedIds(FRIEND_CHAT_ID)).toEqual([11, 12, 13, 14, 15, 16]));
+      await vi.waitFor(() => expect(recordedGap(FRIEND_CHAT_ID)).toBeNull());
+      expect(cursor(FRIEND_CHAT_ID)).toBe(16);
+    });
+
+    it('asks Telegram nothing before the first comparison, which may be before login', () => {
+      const { messageSyncService, telegramClient } = startServer();
+      const call = vi.spyOn(telegramClient.client, 'call');
+      messageSyncService.startRealtimeSync();
+
+      messageSyncService._handleConnectionState('connecting');
+      messageSyncService._handleConnectionState('connected');
+
+      expect(call).not.toHaveBeenCalled();
+      expect(messageSyncService.disconnectedAt).toBeNull();
+      messageSyncService.close();
+    });
+
+    it('does not end an outage on an answer to a connection that has dropped since', async () => {
+      const { ensureConnected, messageSyncService } = startServer();
+      const resumed = vi.spyOn(messageSyncService, 'resumePendingJobs');
+      await ensureConnected();
+      await vi.waitFor(() => expect(resumed).toHaveBeenCalled());
+      messageSyncService._handleConnectionState('connecting');
+      const outageStart = messageSyncService.disconnectedAt;
+
+      const confirming = messageSyncService._confirmConnection();
+      messageSyncService._handleConnectionState('offline');
+      await confirming;
+
+      expect(messageSyncService.disconnectedAt).toBe(outageStart);
     });
 
     it('finds a gap in an archived chat, which the dialog list leaves out by default', async () => {
@@ -858,10 +924,12 @@ describe('cold start catch-up', () => {
       try {
         const { messageSyncService } = startServer();
         const reconcile = vi.spyOn(messageSyncService, '_reconcileAfterOutage').mockImplementation(() => {});
+        const confirm = vi.spyOn(messageSyncService, '_confirmConnection').mockResolvedValue();
         messageSyncService.startRealtimeSync();
 
         vi.advanceTimersByTime(30 * 1000);
         expect(reconcile).not.toHaveBeenCalled();
+        expect(confirm).toHaveBeenCalledTimes(1);
 
         vi.setSystemTime(Date.now() + 6 * 60 * 1000);
         vi.advanceTimersByTime(30 * 1000);

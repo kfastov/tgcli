@@ -430,6 +430,18 @@ describe('catching up on messages newer than the cursor', () => {
       expect(cursor()).toBe(16);
     });
 
+    it('an update after a long pause holds the cursor, without waiting for the periodic check', () => {
+      seedChat();
+      const reconcile = vi.spyOn(service, 'reconcileWithDialogs').mockResolvedValue(null);
+      service.realtimeActive = true;
+      service.lastCheckAt = Date.now() - 6 * 60 * 1000;
+
+      service._handleIncomingMessage(parsed(16), { isEdit: false });
+
+      expect(cursor()).toBe(10);
+      expect(reconcile).toHaveBeenCalledTimes(1);
+    });
+
     it('a job canceled before its first sync does not stop updates from setting a cursor', () => {
       seedChat({ lastMessageId: 0 });
       addJob();

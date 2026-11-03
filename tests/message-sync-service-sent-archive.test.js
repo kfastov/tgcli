@@ -184,7 +184,7 @@ async function createHarness({ respond, dbPath }) {
   });
   messageSyncService.startRealtimeSync();
   // The comparison with the dialog list at startup is not what these tests are about.
-  messageSyncService.cursorsHeld = false;
+  messageSyncService.reconcileNeeded = false;
 
   await manager.prepare();
   await manager.startLoop();

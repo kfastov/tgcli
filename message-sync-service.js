@@ -20,7 +20,8 @@ const JOB_STATUS = {
 };
 // Out of reach for this long, Telegram's catch-up is no longer trusted to be complete.
 const LONG_OUTAGE_MS = 5 * 60 * 1000;
-const OUTAGE_CHECK_INTERVAL_MS = 30 * 1000;
+const PERIODIC_CHECK_INTERVAL_MS = 30 * 1000;
+const CONNECTION_CHECK_TIMEOUT_MS = 20 * 1000;
 const RETRY_BASE_MS = 60 * 1000;
 const RETRY_MAX_MS = 60 * 60 * 1000;
 const URL_PATTERN = /https?:\/\/[^\s<>"')]+/giu;
@@ -563,12 +564,16 @@ export default class MessageSyncService {
     // the queue gets on with other work instead of spinning on it.
     this.gapRetries = new Map();
     this.gapRetryTimer = null;
-    // While set, updates leave last_message_id where it is; see reconcileWithDialogs.
-    this.cursorsHeld = false;
+    // Until the next comparison with the dialog list, and from the first sign of a lost
+    // connection until Telegram answers again, updates leave last_message_id where it is.
+    this.reconcileNeeded = false;
     this.reconcilePromise = null;
     this.reconcileAgain = false;
     this.disconnectedAt = null;
-    this.outageCheckTimer = null;
+    this.disconnectCount = 0;
+    this.confirmingConnection = false;
+    this.lastCheckAt = Date.now();
+    this.periodicCheckTimer = null;
     // Id of the job this instance set to `in_progress` while running the queue.
     // Only the queue worker owns its in-flight job; `shutdown()` requeues just
     // this one so it resumes next run, without touching jobs other processes own.
@@ -1299,7 +1304,7 @@ export default class MessageSyncService {
   // Catch-up cannot report everything: updates.differenceTooLong moves the pts without
   // handing over a single message, and a channel is only fetched if Telegram names it.
   // A dialog whose newest message is above the cursor shows what was left behind, as
-  // long as no update has moved that cursor since the outage: cursorsHeld sees to that,
+  // long as no update has moved that cursor since the outage: _cursorsHeld sees to that,
   // from before the first update until this comparison is done. A chat that catch-up did
   // bring up to date gets one needless history page, which the archive ignores. Runs
   // until it succeeds, so a failed dialog list cannot leave a hole unnoticed.
@@ -1331,7 +1336,7 @@ export default class MessageSyncService {
         this.reconcileAgain = true;
       }
     } while (this.reconcileAgain && !this.stopRequested);
-    this.cursorsHeld = false;
+    this.reconcileNeeded = false;
     return this.stopRequested ? null : dialogCount;
   }
 
@@ -2232,9 +2237,9 @@ export default class MessageSyncService {
       deleteMessageHandler,
       connectionStateHandler,
     };
-    this.cursorsHeld = true;
+    this.reconcileNeeded = true;
     this._attachRealtimeHandlers();
-    this._startSleepCheck();
+    this._startPeriodicChecks();
     console.log('[sync] Realtime handlers attached.');
 
     this.unsubscribeClientReplaced = this.telegramClient.onClientReplaced(() => {
@@ -2265,38 +2270,80 @@ export default class MessageSyncService {
     client.onConnectionState.remove(this.realtimeHandlers.connectionStateHandler);
   }
 
-  // 'updating' and 'connected' both come before the updates they make possible.
+  _cursorsHeld() {
+    return this.reconcileNeeded || this.disconnectedAt !== null;
+  }
+
   _handleConnectionState(state) {
+    this._checkForSleep();
     if (state === 'offline' || state === 'connecting') {
       this.disconnectedAt ??= Date.now();
+      this.disconnectCount += 1;
       return;
     }
-    const disconnectedAt = this.disconnectedAt;
-    this.disconnectedAt = null;
-    if (disconnectedAt !== null && Date.now() - disconnectedAt >= LONG_OUTAGE_MS) {
-      this._reconcileAfterOutage();
+    void this._confirmConnection();
+  }
+
+  // 'connected' only says a socket opened, which a VPN or a captive portal also allows
+  // with Telegram out of reach. The outage lasts until Telegram answers. Whatever goes
+  // wrong here, the periodic check asks again.
+  async _confirmConnection() {
+    if (this.disconnectedAt === null || this.confirmingConnection || this.stopRequested) {
+      return;
+    }
+    // A comparison that has yet to start will cover this outage, and before it starts
+    // the client may not even be logged in.
+    if (this.reconcileNeeded && !this.reconcilePromise) {
+      this.disconnectedAt = null;
+      return;
+    }
+    this.confirmingConnection = true;
+    const disconnectCount = this.disconnectCount;
+    try {
+      await this.telegramClient.client.call({ _: 'updates.getState' }, { timeout: CONNECTION_CHECK_TIMEOUT_MS });
+      if (disconnectCount !== this.disconnectCount || this.stopRequested) {
+        return;
+      }
+      if (Date.now() - this.disconnectedAt >= LONG_OUTAGE_MS) {
+        this._reconcileAfterOutage();
+      }
+      this.disconnectedAt = null;
+    } catch {
+      // Still out of reach.
+    } finally {
+      this.confirmingConnection = false;
     }
   }
 
-  // A sleeping machine stops its timers and may report no disconnect at all, so an
-  // overdue timer is the only sign of it. It fires on waking, ahead of the catch-up,
-  // which has to wait for the network.
-  _startSleepCheck() {
-    let lastCheckAt = Date.now();
-    this.outageCheckTimer = setInterval(() => {
-      const now = Date.now();
-      if (now - lastCheckAt >= LONG_OUTAGE_MS) {
-        this._reconcileAfterOutage();
-      }
-      lastCheckAt = now;
-    }, OUTAGE_CHECK_INTERVAL_MS);
-    this.outageCheckTimer.unref?.();
+  _startPeriodicChecks() {
+    this.lastCheckAt = Date.now();
+    this.periodicCheckTimer = setInterval(() => {
+      this._checkForSleep();
+      void this._confirmConnection();
+    }, PERIODIC_CHECK_INTERVAL_MS);
+    this.periodicCheckTimer.unref?.();
+  }
+
+  // A sleeping machine may report no disconnect at all, so a long pause between checks
+  // is the only sign of it. The timer can fire well after waking where timers do not
+  // count sleep, as on Linux, so connection changes and updates check as well, ahead of
+  // any cursor they could move.
+  _checkForSleep() {
+    const now = Date.now();
+    if (this.realtimeActive && now - this.lastCheckAt >= LONG_OUTAGE_MS) {
+      this._reconcileAfterOutage();
+    }
+    this.lastCheckAt = now;
   }
 
   _reconcileAfterOutage() {
     console.log('[sync] Telegram was out of reach for a long time, comparing the archive with the dialog list.');
-    this.cursorsHeld = true;
-    void this.reconcileWithDialogs().then(() => this.processQueue());
+    this.reconcileNeeded = true;
+    void this.reconcileWithDialogs().then((dialogCount) => {
+      if (dialogCount !== null) {
+        this.resumePendingJobs();
+      }
+    });
   }
 
   async processQueue() {
@@ -2393,7 +2440,7 @@ export default class MessageSyncService {
   // the `jobs` table — so a read-only command run against a live server's store
   // cannot corrupt the server's in-progress job (#42).
   close() {
-    clearInterval(this.outageCheckTimer);
+    clearInterval(this.periodicCheckTimer);
     clearTimeout(this.gapRetryTimer);
     if (this.realtimeActive && this.realtimeHandlers) {
       this._detachRealtimeHandlers();
@@ -3450,7 +3497,7 @@ export default class MessageSyncService {
   // cursor has nothing to compare, and no reason to wait for its first one.
   _updateChannelCursorsFromUpdate(channelId, { lastMessageId, lastMessageDate, ...oldest }) {
     const channel = this._getChannel(channelId);
-    const held = channel?.newer_sync_pending || (this.cursorsHeld && channel?.last_message_id > 0);
+    const held = channel?.newer_sync_pending || (this._cursorsHeld() && channel?.last_message_id > 0);
     const newest = held ? {} : { lastMessageId, lastMessageDate };
     this._updateChannelCursors(channelId, { ...newest, ...oldest });
   }
@@ -3485,6 +3532,7 @@ export default class MessageSyncService {
   }
 
   _handleIncomingMessage(message, { isEdit }) {
+    this._checkForSleep();
     const record = this._writeMessage(message, { isEdit });
     // An edit can touch a message of any age, so it says nothing about what is
     // archived around it. Moving a cursor here would hide history from later syncs.
