@@ -575,6 +575,7 @@ export default class MessageSyncService {
         last_message_date TEXT,
         oldest_message_id INTEGER,
         oldest_message_date TEXT,
+        newer_sync_pending INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
@@ -629,6 +630,14 @@ export default class MessageSyncService {
 
     this._ensureChannelColumn('chat_type', 'TEXT');
     this._ensureChannelColumn('is_forum', 'INTEGER');
+    if (this._ensureChannelColumn('newer_sync_pending', 'INTEGER NOT NULL DEFAULT 0')) {
+      // Jobs queued before this column existed still have their catch-up ahead of them.
+      this.db.prepare(`
+        UPDATE channels
+        SET newer_sync_pending = 1
+        WHERE channel_id IN (SELECT channel_id FROM jobs WHERE status != ?)
+      `).run(JOB_STATUS.IDLE);
+    }
     this._ensureJobColumn('target_message_count', `INTEGER DEFAULT ${DEFAULT_TARGET_MESSAGES}`);
     this._ensureJobColumn('message_count', 'INTEGER DEFAULT 0');
     this._ensureJobColumn('cursor_message_id', 'INTEGER');
@@ -1225,9 +1234,11 @@ export default class MessageSyncService {
 
   _ensureChannelColumn(column, definition) {
     const existing = this.db.prepare('PRAGMA table_info(channels)').all();
-    if (!existing.some((col) => col.name === column)) {
-      this.db.exec(`ALTER TABLE channels ADD COLUMN ${column} ${definition}`);
+    if (existing.some((col) => col.name === column)) {
+      return false;
     }
+    this.db.exec(`ALTER TABLE channels ADD COLUMN ${column} ${definition}`);
+    return true;
   }
 
   _ensureMessageColumn(column, definition) {
@@ -1806,10 +1817,13 @@ export default class MessageSyncService {
     const minDate = options.minDate ? parseIsoDate(options.minDate) : null;
     const minDateIso = minDate ? new Date(minDate * 1000).toISOString() : null;
 
+    // Stays set until a catch-up reaches the newest message, even if this job is canceled.
     this.db.prepare(`
-      INSERT INTO channels (channel_id, updated_at)
-      VALUES (?, CURRENT_TIMESTAMP)
-      ON CONFLICT(channel_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
+      INSERT INTO channels (channel_id, newer_sync_pending, updated_at)
+      VALUES (?, 1, CURRENT_TIMESTAMP)
+      ON CONFLICT(channel_id) DO UPDATE SET
+        newer_sync_pending = 1,
+        updated_at = CURRENT_TIMESTAMP
     `).run(normalizedId);
 
     const stmt = this.db.prepare(`
@@ -3096,7 +3110,8 @@ export default class MessageSyncService {
   _getChannel(channelId) {
     return this.db.prepare(`
       SELECT channel_id, peer_title, peer_type, username, sync_enabled,
-             last_message_id, last_message_date, oldest_message_id, oldest_message_date
+             last_message_id, last_message_date, oldest_message_id, oldest_message_date,
+             newer_sync_pending
       FROM channels
       WHERE channel_id = ?
     `).get(channelId);
@@ -3167,18 +3182,14 @@ export default class MessageSyncService {
     );
   }
 
-  // last_message_id is where an unfinished job resumes, so while one exists only the
-  // job moves it: an update's message may be far above what the job has fetched so far.
-  // The job sees that message again on its way up, and the archive ignores the repeat.
-  _updateChannelCursorsFromUpdate(channelId, { lastMessageId, lastMessageDate, oldestMessageId, oldestMessageDate }) {
-    const newest = this._hasUnfinishedJob(channelId) ? {} : { lastMessageId, lastMessageDate };
-    this._updateChannelCursors(channelId, { ...newest, oldestMessageId, oldestMessageDate });
-  }
-
-  _hasUnfinishedJob(channelId) {
-    return Boolean(this.db.prepare(`
-      SELECT 1 FROM jobs WHERE channel_id = ? AND status != ?
-    `).get(channelId, JOB_STATUS.IDLE));
+  // last_message_id is where a pending catch-up resumes, so until it reaches the newest
+  // message updates leave it alone: their message may be far above what is fetched so far.
+  // The catch-up sees that message again on its way up, and the archive ignores the repeat.
+  _updateChannelCursorsFromUpdate(channelId, { lastMessageId, lastMessageDate, ...oldest }) {
+    const newest = this._getChannel(channelId)?.newer_sync_pending
+      ? {}
+      : { lastMessageId, lastMessageDate };
+    this._updateChannelCursors(channelId, { ...newest, ...oldest });
   }
 
   _ensureChannelFromPeer(channelId, peer) {
@@ -3453,6 +3464,10 @@ export default class MessageSyncService {
 
       console.log(`[sync] Channel ${normalizedId}: archived up to message ${newest.id}, fetching newer.`);
       await delay(this.interBatchDelayMs);
+    }
+
+    if (!stoppedEarly) {
+      this.db.prepare('UPDATE channels SET newer_sync_pending = 0 WHERE channel_id = ?').run(normalizedId);
     }
 
     if (peerTitle || peerType) {

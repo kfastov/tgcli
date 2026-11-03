@@ -10,6 +10,7 @@ import { Long, Message, PeersIndex } from '@mtcute/core';
 import { iterHistory, resolvePeer } from '@mtcute/core/methods.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { OPERATIONS } from '../core/operations.js';
 import MessageSyncService from '../message-sync-service.js';
 import TelegramClient from '../telegram-client.js';
 
@@ -304,6 +305,109 @@ describe('catching up on messages newer than the cursor', () => {
 
       expect(archivedIds()).toEqual(range(11, 15));
       expect(cursor()).toBe(15);
+    });
+
+    it('a new message does not lift the cursor after the unfinished job is canceled', async () => {
+      seedChat();
+      historyIds = range(1, 15);
+      const job = addJob();
+      stopOnPage(2);
+
+      await service._processJob(job);
+      expect(cursor()).toBe(12);
+
+      resume();
+      service.cancelJobs({ channelId: CHANNEL_ID });
+      historyIds = range(1, 16);
+      service._handleIncomingMessage(parsed(16), { isEdit: false });
+
+      expect(cursor()).toBe(12);
+
+      await service._processJob(addJob());
+
+      expect(archivedIds()).toEqual(range(11, 16));
+      expect(cursor()).toBe(16);
+    });
+
+    it('a new message does not lift the cursor after a stopped chat is turned off and on', async () => {
+      seedChat();
+      historyIds = range(1, 15);
+      const job = addJob();
+      stopOnPage(2);
+
+      await service._processJob(job);
+      expect(cursor()).toBe(12);
+
+      resume();
+      service.setChannelSync(CHANNEL_ID, false);
+      await service._processJob(service._getNextJob());
+      expect(jobStatus()).toBe('idle');
+
+      historyIds = range(1, 16);
+      const result = await OPERATIONS.channelSetSync(
+        { messageSyncService: service },
+        { chat: CHANNEL_ID, enable: true },
+      );
+      expect(result.jobQueued).toBe(true);
+      service._handleIncomingMessage(parsed(16), { isEdit: false });
+
+      expect(cursor()).toBe(12);
+
+      await vi.waitFor(() => expect(jobStatus()).toBe('idle'));
+      expect(archivedIds()).toEqual(range(11, 16));
+      expect(cursor()).toBe(16);
+    });
+
+    it('turning a chat back on fetches what arrived while it was off and keeps the depth', async () => {
+      seedChat();
+      historyIds = range(1, 15);
+      await service._processJob(addJob());
+      expect(cursor()).toBe(15);
+
+      service.setChannelSync(CHANNEL_ID, false);
+      historyIds = range(1, 18);
+      await OPERATIONS.channelSetSync(
+        { messageSyncService: service },
+        { chat: CHANNEL_ID, enable: true },
+      );
+
+      await vi.waitFor(() => expect(jobStatus()).toBe('idle'));
+      expect(archivedIds()).toEqual(range(11, 18));
+      expect(cursor()).toBe(18);
+    });
+
+    it('a new message moves the cursor once only backfill is left', async () => {
+      seedChat();
+      historyIds = range(1, 15);
+      const job = service.addJob(CHANNEL_ID, { depth: 1000 });
+      // The third page of catch-up takes two requests: its short answer, then an empty one.
+      stopOnPage(5);
+
+      await service._processJob(job);
+      expect(jobStatus()).toBe('pending');
+      expect(cursor()).toBe(15);
+
+      service._handleIncomingMessage(parsed(16), { isEdit: false });
+
+      expect(cursor()).toBe(16);
+    });
+
+    it('holds the cursor for a job queued before the archive had the pending flag', () => {
+      seedChat();
+      addJob();
+      const dbPath = service.db.name;
+      service.db.exec('ALTER TABLE channels DROP COLUMN newer_sync_pending');
+      service.db.close();
+      service = new MessageSyncService(telegramClient, {
+        dbPath,
+        batchSize: 2,
+        interJobDelayMs: 0,
+        interBatchDelayMs: 1,
+      });
+
+      service._handleIncomingMessage(parsed(16), { isEdit: false });
+
+      expect(cursor()).toBe(10);
     });
 
     it('a new message moves the cursor once the job is finished', async () => {
