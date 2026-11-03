@@ -322,6 +322,7 @@ describe('send command default timeout (CLI integration)', () => {
     const stderrText = errSpy.mock.calls.map((c) => c[0]).join('');
     expect(stderrText).not.toContain('Connecting to Telegram');
     expect(logSpy.mock.calls.flat().join(' ')).toContain('Message sent (12).');
+    expect(control.invoke.mock.calls[0][1].quiet).toBe(true);
   });
 
   it.each([
@@ -345,5 +346,16 @@ describe('send command default timeout (CLI integration)', () => {
     await runProgram(['send', 'text', '--to', '@x', '--message', 'hi', '--schedule', schedule]);
 
     expect(logSpy.mock.calls.flat().join(' ')).toContain('Message sent (14).');
+  });
+
+  it('surfaces a request lost midway without starting a server', async () => {
+    control.invoke = vi.fn().mockRejectedValue(new Error('Lost the connection to tgcli server during sendText; it may or may not have completed, so it was not retried.'));
+
+    await runProgram(['send', 'text', '--to', '@x', '--message', 'hi']);
+
+    expect(process.exitCode).toBe(1);
+    expect(control.invoke).toHaveBeenCalledTimes(1);
+    expect(control.ensureServer).not.toHaveBeenCalled();
+    expect(errSpy.mock.calls.map((c) => c[0]).join('')).toContain('may or may not have completed');
   });
 });

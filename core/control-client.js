@@ -6,14 +6,19 @@
 // We deliberately use Node's built-in global `fetch` (Node 18+) — no http.request
 // hand-rolling — and reuse the server's existing control endpoints, so enqueue and
 // cancel logic is never reimplemented client-side.
+//
+// Because a server outlives upgrades, starting and calling one also keeps it on
+// this CLI's version; see reconcileServerVersion.
 
 import fs from 'fs';
 import path from 'path';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
-import { CONTROL_FILE, CONTROL_TOKEN_HEADER } from './control-server.js';
+import { isPidAlive } from '../store-lock.js';
+import { CONTROL_FILE, CONTROL_TOKEN_HEADER, hasQueuedJobs } from './control-server.js';
 import { SendCommandError } from './send-utils.js';
+import { readVersion } from './version.js';
 
 // Path to this package's CLI, used to (re)spawn `tgcli server`.
 const CLI_ENTRYPOINT = fileURLToPath(new URL('../cli.js', import.meta.url));
@@ -21,7 +26,15 @@ const CLI_ENTRYPOINT = fileURLToPath(new URL('../cli.js', import.meta.url));
 const PING_TIMEOUT_MS = 1500;
 const ENQUEUE_TIMEOUT_MS = 30000;
 const SERVER_START_TIMEOUT_MS = 10000;
+const SERVER_STOP_TIMEOUT_MS = 15000;
 const SERVER_POLL_INTERVAL_MS = 250;
+
+const CLI_VERSION = readVersion();
+// What ensureServer's `tgcli server --idle-exit 60s` looks like on the server
+// process. A server started by hand with the same window is equivalent to the one
+// that would replace it; any other command line belongs to the user.
+const AUTO_STARTED_SERVER_ARGS = /--idle-exit 60000(\s|$)/;
+const REQUEST_LOST_CODES = new Set(['UND_ERR_SOCKET', 'ECONNRESET', 'EPIPE']);
 
 // Raised when the control server cannot be reached at all: no control.json, a
 // refused/failed loopback connection, etc. This is distinct from an operation
@@ -49,6 +62,13 @@ function isFetchConnectionFailure(error) {
     return false;
   }
   return error instanceof TypeError || typeof error.code === 'string';
+}
+
+// The socket died after the request went out, so the server may already have run
+// the operation: a shutdown closes connections mid-request. Retrying could send a
+// message twice, so this must not look like an unreachable server.
+function isRequestLostMidway(error) {
+  return REQUEST_LOST_CODES.has(error?.cause?.code);
 }
 
 // Parse <store>/control.json, returning the descriptor or null when absent.
@@ -178,7 +198,8 @@ export async function retryBackfill(storeDir, { jobId, channelId, allErrors } = 
 // `sendError`, which we re-throw as a SendCommandError so the CLI renders the
 // same human/JSON error as a local send would. Other non-2xx responses surface
 // the server's error message.
-export async function invoke(storeDir, { op, args, timeoutMs } = {}) {
+export async function invoke(storeDir, { op, args, timeoutMs, quiet } = {}) {
+  await reconcileServerVersion(storeDir, { quiet });
   const control = readControlFile(storeDir);
   if (!control) {
     throw new ServerUnavailableError('No control server is running.');
@@ -195,6 +216,9 @@ export async function invoke(storeDir, { op, args, timeoutMs } = {}) {
     // A refused/failed loopback connection means the server is not actually up;
     // surface it as unavailable so the caller can start one and retry. A request
     // timeout (TimeoutError/AbortError) reaches a live server and is re-thrown.
+    if (isRequestLostMidway(error)) {
+      throw new Error(`Lost the connection to tgcli server during ${op}; it may or may not have completed, so it was not retried.`, { cause: error });
+    }
     if (isFetchConnectionFailure(error)) {
       throw new ServerUnavailableError('Could not reach the control server.', { cause: error });
     }
@@ -214,6 +238,75 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function isOlderVersion(version, than) {
+  return version.localeCompare(than, undefined, { numeric: true }) < 0;
+}
+
+function serverCommandLine(pid) {
+  const result = spawnSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8' });
+  return result.status === 0 ? result.stdout : '';
+}
+
+async function waitForExit(pid) {
+  const deadline = Date.now() + SERVER_STOP_TIMEOUT_MS;
+  while (isPidAlive(pid)) {
+    if (Date.now() >= deadline) {
+      return false;
+    }
+    await sleep(SERVER_POLL_INTERVAL_MS);
+  }
+  return true;
+}
+
+// SIGTERM runs the server's graceful shutdown. Resolves true once the process is
+// gone, so the replacement does not start beside it.
+async function stopServer(pid) {
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch (error) {
+    return error.code === 'ESRCH';
+  }
+  return waitForExit(pid);
+}
+
+// A server outlives upgrades: it never idles out while channels are watched, and
+// every command runs on it, so without this check an upgraded CLI keeps executing
+// the old code. An idle auto-started server older than this CLI is stopped, and the
+// callers' cold-start path brings up the new version. Anything else keeps serving,
+// with a warning: a user-owned server is not ours to stop, stopping a busy one
+// interrupts its backfill, and replacing a newer one would make two installed
+// versions keep restarting each other.
+async function reconcileServerVersion(storeDir, { quiet = false } = {}) {
+  const control = readControlFile(storeDir);
+  if (!control?.version || control.version === CLI_VERSION) {
+    return;
+  }
+  const ping = await pingServer(storeDir);
+  if (!ping) {
+    return;
+  }
+
+  const { pid } = ping;
+  const replaceable = isOlderVersion(control.version, CLI_VERSION)
+    && AUTO_STARTED_SERVER_ARGS.test(serverCommandLine(pid));
+  if (replaceable && !hasQueuedJobs(ping.jobs)) {
+    const stopped = await stopServer(pid);
+    if (!quiet) {
+      console.error(stopped
+        ? `Restarting tgcli server (${control.version} -> ${CLI_VERSION}).`
+        : `Warning: tgcli server (pid ${pid}) was sent SIGTERM to move from ${control.version} to ${CLI_VERSION} but has not exited.`);
+    }
+    return;
+  }
+
+  if (!quiet) {
+    const nextStep = replaceable
+      ? 'It will be replaced once its backfill queue is empty.'
+      : 'Restart it to use this version.';
+    console.error(`Warning: tgcli server (pid ${pid}) runs ${control.version}, this CLI is ${CLI_VERSION}; commands use the server's code. ${nextStep}`);
+  }
+}
+
 // Spawn `tgcli server --idle-exit <idleExit>` fully detached so it outlives this
 // one-shot CLI process. We ignore its stdio and unref the child; the server writes
 // its own control.json once it is listening.
@@ -229,14 +322,23 @@ function spawnDetachedServer(idleExit) {
 
 // Ensure a control server is reachable, returning its ping body.
 //   - If one is already up, use it (covers the race where another CLI invocation,
-//     or the user's own `tgcli server`, started it first).
+//     or the user's own `tgcli server`, started it first), unless it is outdated
+//     and reconcileServerVersion stopped it.
+//   - A server that is shutting down no longer answers but keeps its control.json
+//     and the DB until it exits, so let it finish rather than start beside it.
 //   - Otherwise spawn a detached `tgcli server --idle-exit <idleExit>` and poll
 //     pingServer for up to ~10s. The idle-exit window lets the auto-started server
 //     shut itself down once the queue drains and nothing is being watched.
-export async function ensureServer(storeDir, { idleExit = '60s' } = {}) {
+export async function ensureServer(storeDir, { idleExit = '60s', quiet } = {}) {
+  await reconcileServerVersion(storeDir, { quiet });
   const existing = await pingServer(storeDir);
   if (existing) {
     return existing;
+  }
+
+  const previousPid = readControlFile(storeDir)?.pid;
+  if (previousPid && serverCommandLine(previousPid).includes('mcp-server.js')) {
+    await waitForExit(previousPid);
   }
 
   spawnDetachedServer(idleExit);

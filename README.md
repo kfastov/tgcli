@@ -57,6 +57,8 @@ tgcli groups         Group management
 tgcli doctor         Diagnostics and sanity checks
 ```
 
+Commands run through `tgcli server`, which the CLI starts on demand. After an upgrade, the CLI replaces a server it started itself as soon as its backfill queue is empty. A server you started yourself with `tgcli server` or `tgcli service` keeps running the old code until you restart it; the CLI warns about this on stderr.
+
 Use `tgcli [command] --help` for details. Add `--json` for machine-readable output.
 
 ## MCP (optional)

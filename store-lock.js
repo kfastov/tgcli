@@ -25,7 +25,7 @@ export function readStoreLock(storeDir) {
   }
 }
 
-function isPidAlive(pid) {
+export function isPidAlive(pid) {
   try {
     process.kill(pid, 0);
     return true;

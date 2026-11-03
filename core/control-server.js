@@ -37,6 +37,10 @@ export function removeControlFile(storeDir) {
   }
 }
 
+export function hasQueuedJobs(jobCounts) {
+  return (jobCounts?.pending ?? 0) > 0 || (jobCounts?.inProgress ?? 0) > 0;
+}
+
 // Pure idle predicate, shared by the server idle monitor and its unit tests.
 // Idle = no queued/in-flight jobs AND no watched channels AND control API has
 // been quiet longer than the configured window.
@@ -44,9 +48,7 @@ export function isIdle({ jobCounts, watchedCount, lastActivityAt, now, idleExitM
   if (!Number.isFinite(idleExitMs) || idleExitMs <= 0) {
     return false;
   }
-  const pending = jobCounts?.pending ?? 0;
-  const inProgress = jobCounts?.inProgress ?? 0;
-  if (pending > 0 || inProgress > 0) {
+  if (hasQueuedJobs(jobCounts)) {
     return false;
   }
   if ((watchedCount ?? 0) > 0) {

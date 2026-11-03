@@ -136,7 +136,7 @@ describe('backfill is a canonical alias of sync', () => {
   it('`backfill jobs add` resolves the nested subcommand and queues a job on the server (like `sync jobs add`)', async () => {
     services.current = makeFakeServices();
     await runProgram(['backfill', 'jobs', 'add', '--chat', '@chan']);
-    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { idleExit: '60s' });
+    expect(control.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-test-store', { idleExit: '60s', quiet: false });
     expect(control.enqueueBackfill).toHaveBeenCalledWith('/tmp/tgcli-test-store', {
       chatId: '@chan',
       depth: null,
@@ -187,6 +187,7 @@ describe('channels watch / unwatch', () => {
       op: 'channelSetSync',
       args: { chat: '@chan', enable: true },
       timeoutMs: undefined,
+      quiet: false,
     });
   });
 
@@ -196,6 +197,7 @@ describe('channels watch / unwatch', () => {
       op: 'channelSetSync',
       args: { chat: '@chan', enable: false },
       timeoutMs: undefined,
+      quiet: false,
     });
   });
 
@@ -216,6 +218,7 @@ describe('channels watch / unwatch', () => {
       op: 'channelSetSync',
       args: { chat: '@chan', enable: true },
       timeoutMs: undefined,
+      quiet: false,
     });
 
     control.invoke.mockClear();
@@ -224,6 +227,7 @@ describe('channels watch / unwatch', () => {
       op: 'channelSetSync',
       args: { chat: '@chan', enable: false },
       timeoutMs: undefined,
+      quiet: false,
     });
   });
 });

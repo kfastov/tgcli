@@ -12,6 +12,7 @@ import { acquireStoreLock, acquireReadLock, readStoreLock } from './store-lock.j
 import { loadConfig, normalizeConfig, saveConfig, validateConfig } from './core/config.js';
 import { createServices, createTelegramClient } from './core/services.js';
 import { withCommand, runWithTimeout, runOperation } from './core/command-context.js';
+import { readVersion } from './core/version.js';
 import {
   buildSendErrorPayload,
   buildSendSuccessPayload,
@@ -1100,16 +1101,6 @@ function resolveServiceManager() {
   return { manager: 'unsupported', brewInfo };
 }
 
-function readVersion() {
-  try {
-    const pkgPath = new URL('./package.json', import.meta.url);
-    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-    return pkg.version || '0.0.0';
-  } catch (error) {
-    return '0.0.0';
-  }
-}
-
 function promptInput(question) {
   const rl = readline.createInterface({
     input: process.stdin,
@@ -1586,6 +1577,10 @@ function writeProgress(globalFlags, line) {
 // (auto-starting it) and either return the job id (`--background`) or follow
 // progress in the foreground. Without `--chat`, delegate to the queue-draining
 // path (`--follow`/`--once`/bare usage).
+function ensureAutoStartedServer(globalFlags, storeDir) {
+  return ensureServer(storeDir, { idleExit: '60s', quiet: globalFlags.quiet });
+}
+
 async function runBackfill(globalFlags, options = {}) {
   if (!options.chat) {
     return runSync(globalFlags, options);
@@ -1598,7 +1593,7 @@ async function runBackfill(globalFlags, options = {}) {
     const depth = parsePositiveInt(options.depth, '--depth');
     const minDate = options.minDate ?? null;
 
-    await ensureServer(storeDir, { idleExit: '60s' });
+    await ensureAutoStartedServer(globalFlags, storeDir);
     const enqueued = await enqueueBackfill(storeDir, {
       chatId: options.chat,
       depth,
@@ -1695,7 +1690,7 @@ async function runBackfillCount(globalFlags) {
 // progress to stderr along the way. The server keeps running on its own (realtime
 // continues while it is up / has watched chats); this only tracks the queue.
 async function drainBackfillQueue(globalFlags, storeDir) {
-  await ensureServer(storeDir, { idleExit: '60s' });
+  await ensureAutoStartedServer(globalFlags, storeDir);
   while (true) {
     const { active, jobs } = withReadSnapshot(storeDir, (service) => {
       const counts = service.getJobCounts();
@@ -1733,7 +1728,7 @@ async function runBackfillCancel(globalFlags, options = {}) {
       throw new Error('--chat is required');
     }
     const storeDir = resolveStoreDir();
-    await ensureServer(storeDir, { idleExit: '60s' });
+    await ensureAutoStartedServer(globalFlags, storeDir);
     const result = await cancelBackfill(storeDir, { chatId: options.chat });
     if (globalFlags.json) {
       writeJson(result);
@@ -2227,7 +2222,7 @@ async function runSyncJobsAdd(globalFlags, options = {}) {
   return runWithTimeout(async () => {
     const storeDir = resolveStoreDir();
     const depth = parsePositiveInt(options.depth, '--depth');
-    await ensureServer(storeDir, { idleExit: '60s' });
+    await ensureAutoStartedServer(globalFlags, storeDir);
     const job = await enqueueBackfill(storeDir, {
       chatId: options.chat,
       depth,
@@ -2255,7 +2250,7 @@ async function runSyncJobsRetry(globalFlags, options = {}) {
   }
   return runWithTimeout(async () => {
     const storeDir = resolveStoreDir();
-    await ensureServer(storeDir, { idleExit: '60s' });
+    await ensureAutoStartedServer(globalFlags, storeDir);
     const result = await retryBackfill(storeDir, { jobId, channelId, allErrors });
     if (globalFlags.json) {
       writeJson(result);
@@ -2276,7 +2271,7 @@ async function runSyncJobsCancel(globalFlags, options = {}) {
   }
   return runWithTimeout(async () => {
     const storeDir = resolveStoreDir();
-    await ensureServer(storeDir, { idleExit: '60s' });
+    await ensureAutoStartedServer(globalFlags, storeDir);
     const result = await cancelBackfill(storeDir, {
       jobId,
       chatId: channelId,

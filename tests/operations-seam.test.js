@@ -265,6 +265,17 @@ describe('runOperation seam', () => {
     });
   });
 
+  it('passes --quiet to both the invoke and the server start', async () => {
+    hooks.invoke
+      .mockRejectedValueOnce(new ServerUnavailableError('none'))
+      .mockResolvedValueOnce([]);
+
+    await runOperation({ quiet: true }, { op: 'listChannels', args: {} });
+
+    expect(hooks.invoke).toHaveBeenCalledWith('/tmp/tgcli-seam-store', expect.objectContaining({ quiet: true }));
+    expect(hooks.ensureServer).toHaveBeenCalledWith('/tmp/tgcli-seam-store', expect.objectContaining({ quiet: true }));
+  });
+
   it('rejects an unknown operation before reaching the server', async () => {
     await expect(runOperation({}, { op: 'nope', args: {} })).rejects.toThrow(/unknown operation/);
     expect(hooks.ensureServer).not.toHaveBeenCalled();

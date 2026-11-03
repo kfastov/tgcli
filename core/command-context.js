@@ -86,8 +86,9 @@ export async function withCommand(globalFlags, opts, fn) {
 //
 // The common case — a server already running — costs a single round-trip: invoke
 // the op directly. Only when that fails because the server is unreachable
-// (ServerUnavailableError: no control.json or a refused loopback connection) do
-// we start one (ensureServer) and retry the invoke once. An operation that runs
+// (ServerUnavailableError: no control.json, a refused loopback connection, or an
+// outdated server that invoke just stopped) do we start one (ensureServer) and
+// retry the invoke once. An operation that runs
 // and fails (a 4xx/5xx, including a send error) never triggers a server start.
 //
 // invokeTimeoutMs bounds the client's wait on each request (e.g. the 30s send
@@ -99,14 +100,15 @@ export async function runOperation(globalFlags, { op, args, invokeTimeoutMs } = 
     throw new Error(`runOperation: unknown operation "${op}"`);
   }
   const storeDir = resolveStoreDir();
+  const quiet = globalFlags?.quiet;
   try {
-    return await invoke(storeDir, { op, args, timeoutMs: invokeTimeoutMs });
+    return await invoke(storeDir, { op, args, timeoutMs: invokeTimeoutMs, quiet });
   } catch (error) {
     if (!(error instanceof ServerUnavailableError)) {
       throw error;
     }
-    await ensureServer(storeDir, { idleExit: '60s' });
-    return invoke(storeDir, { op, args, timeoutMs: invokeTimeoutMs });
+    await ensureServer(storeDir, { idleExit: '60s', quiet });
+    return invoke(storeDir, { op, args, timeoutMs: invokeTimeoutMs, quiet });
   }
 }
 

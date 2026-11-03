@@ -17,6 +17,7 @@ import {
   removeControlFile,
   isIdle,
 } from "./core/control-server.js";
+import { readVersion } from "./core/version.js";
 import { readJsonBody } from "./core/http-util.js";
 import { parseDuration } from "./core/duration.js";
 import { OPERATIONS } from "./core/operations.js";
@@ -58,6 +59,7 @@ let telegramConnectPromise = null;
 let serviceState = null;
 let controlToken = null;
 let controlServer = null;
+let controlFileWritten = false;
 let idleTimer = null;
 let lastControlActivityAt = Date.now();
 
@@ -94,16 +96,6 @@ function resolveIdleExitMs(value) {
     return parseDuration(raw) ?? 0;
   } catch (error) {
     return 0;
-  }
-}
-
-function readVersion() {
-  try {
-    const pkgPath = new URL("./package.json", import.meta.url);
-    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
-    return pkg.version || "0.0.0";
-  } catch (error) {
-    return "0.0.0";
   }
 }
 
@@ -1803,6 +1795,12 @@ if (controlEnabled) {
 
   controlServer.on("error", (error) => {
     console.error(`[control] server error: ${error.message}`);
+    // Two CLIs raced to auto-start a server and the other one won. Staying up here
+    // would leave a second writer that no CLI can reach or replace. A server started
+    // by hand keeps running, since its other work does not need the control port.
+    if (error.code === "EADDRINUSE" && IDLE_EXIT_MS > 0) {
+      process.exit(1);
+    }
   });
 
   controlServer.listen(CONTROL_PORT, CONTROL_HOST, () => {
@@ -1816,6 +1814,7 @@ if (controlEnabled) {
         startedAt,
         version: serviceState.version,
       });
+      controlFileWritten = true;
     } catch (error) {
       console.error(`[control] failed to write control.json: ${error?.message ?? error}`);
     }
@@ -1896,14 +1895,6 @@ async function shutdown() {
     controlServer = null;
   }
 
-  if (controlEnabled) {
-    try {
-      removeControlFile(storeDir);
-    } catch (error) {
-      console.error(`[shutdown] failed to remove control.json: ${error?.message ?? error}`);
-    }
-  }
-
   try {
     await messageSyncService.shutdown();
   } catch (error) {
@@ -1914,6 +1905,15 @@ async function shutdown() {
     await telegramClient.destroy();
   } catch (error) {
     console.error(`[shutdown] error while closing Telegram client: ${error?.message ?? error}`);
+  }
+
+  // Last, so a CLI that arrives mid-shutdown can see this process and wait for it.
+  if (controlFileWritten) {
+    try {
+      removeControlFile(storeDir);
+    } catch (error) {
+      console.error(`[shutdown] failed to remove control.json: ${error?.message ?? error}`);
+    }
   }
 
   updateServiceState({
