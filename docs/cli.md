@@ -210,3 +210,7 @@ Legacy `--offset-id` is accepted as a hidden alias for `--before-id`.
 - folders join <link>
 
 `<folder>` can be a numeric folder ID or folder title.
+
+## Recovering archive gaps
+`scripts/recover-archive-gaps.js` fills gaps that older versions left in the archive.
+See [archive-recovery.md](archive-recovery.md).

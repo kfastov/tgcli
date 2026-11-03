@@ -3308,6 +3308,16 @@ export default class MessageSyncService {
     }
   }
 
+  // Writes messages fetched from history without touching the cursors, and returns
+  // how many were not in the archive yet.
+  archiveHistoryMessages(channelId, messages) {
+    const userRecords = messages.map((message) => this._buildUserRecordFromSerialized(message)).filter(Boolean);
+    if (userRecords.length) {
+      this.upsertUsersTx(userRecords);
+    }
+    return this.insertMessagesTx(messages.map((message) => this._buildMessageRecord(channelId, message)));
+  }
+
   _handleDeleteMessage(update) {
     if (!update?.messageIds?.length) {
       return;
