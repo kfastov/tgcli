@@ -595,6 +595,7 @@ class TelegramClient {
     this.client = this._createClient();
     this.updatesRunning = false;
     this.rawUpdateHandler = null;
+    this.updateEmitter.emit('clientReplaced');
   }
 
   async _resetSessionAndClient() {
@@ -848,6 +849,7 @@ class TelegramClient {
           isGroup,
           unreadCount: typeof dialog.unreadCount === 'number' ? dialog.unreadCount : 0,
           unreadMentionsCount: typeof dialog.unreadMentionsCount === 'number' ? dialog.unreadMentionsCount : 0,
+          topMessageId: dialog.raw.topMessage,
         });
 
         if (results.length >= effectiveLimit) {
@@ -977,7 +979,10 @@ class TelegramClient {
       reverse: useAfterIdPagination ? true : reverse,
     };
 
-    if (effectiveMinId) {
+    if (useAfterIdPagination) {
+      // Without an offset a reverse walk starts from the chat's oldest message.
+      iterOptions.offset = { id: effectiveAfterId + 1, date: 0 };
+    } else if (effectiveMinId) {
       iterOptions.minId = effectiveMinId;
     }
 
@@ -1600,6 +1605,13 @@ class TelegramClient {
   onChannelTooLong(listener) {
     this.updateEmitter.on('channelTooLong', listener);
     return () => this.updateEmitter.off('channelTooLong', listener);
+  }
+
+  // Listeners on the mtcute client die with it. Fires before the new client logs in,
+  // so whoever re-subscribes here is in time for its catch-up.
+  onClientReplaced(listener) {
+    this.updateEmitter.on('clientReplaced', listener);
+    return () => this.updateEmitter.off('clientReplaced', listener);
   }
 
   async startUpdates() {

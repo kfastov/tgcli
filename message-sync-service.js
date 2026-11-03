@@ -192,6 +192,11 @@ const TAG_RULES = [
   },
 ];
 
+function parseFloodWaitSeconds(error) {
+  const match = /wait of (\d+) seconds is required/i.exec(error?.message || '');
+  return match ? Number(match[1]) : null;
+}
+
 function normalizeChannelKey(channelId) {
   return String(normalizeChannelId(channelId));
 }
@@ -552,6 +557,10 @@ export default class MessageSyncService {
     this.realtimeActive = false;
     this.realtimeHandlers = null;
     this.unsubscribeChannelTooLong = null;
+    this.unsubscribeClientReplaced = null;
+    // Channels whose gap failed in this run. The gap stays recorded and is retried on
+    // the next start, instead of the queue spinning on it now.
+    this.failedGapChannelIds = new Set();
     // Id of the job this instance set to `in_progress` while running the queue.
     // Only the queue worker owns its in-flight job; `shutdown()` requeues just
     // this one so it resumes next run, without touching jobs other processes own.
@@ -582,6 +591,7 @@ export default class MessageSyncService {
         last_message_date TEXT,
         oldest_message_id INTEGER,
         oldest_message_date TEXT,
+        gap_after_message_id INTEGER,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
@@ -636,6 +646,7 @@ export default class MessageSyncService {
 
     this._ensureChannelColumn('chat_type', 'TEXT');
     this._ensureChannelColumn('is_forum', 'INTEGER');
+    this._ensureChannelColumn('gap_after_message_id', 'INTEGER');
     this._ensureJobColumn('target_message_count', `INTEGER DEFAULT ${DEFAULT_TARGET_MESSAGES}`);
     this._ensureJobColumn('message_count', 'INTEGER DEFAULT 0');
     this._ensureJobColumn('cursor_message_id', 'INTEGER');
@@ -1262,7 +1273,52 @@ export default class MessageSyncService {
   async refreshChannelsFromDialogs() {
     const dialogs = await this.telegramClient.listDialogs(0);
     this.upsertChannels(dialogs);
+    this._markGapsBehindDialogs(dialogs);
     return dialogs.length;
+  }
+
+  // Catch-up cannot report everything: updates.differenceTooLong moves the pts without
+  // handing over a single message, and a channel is only fetched if Telegram names it.
+  // A dialog whose newest message is above the cursor shows what was left behind.
+  _markGapsBehindDialogs(dialogs) {
+    const behind = dialogs.filter((dialog) => {
+      const lastMessageId = this._getChannel(String(dialog.id))?.last_message_id;
+      return lastMessageId > 0 && dialog.topMessageId > lastMessageId;
+    });
+    for (const dialog of behind) {
+      this._markChannelGap(String(dialog.id));
+    }
+    if (behind.length) {
+      console.log(`[sync] ${behind.length} of ${dialogs.length} dialogs are ahead of the archive.`);
+    }
+  }
+
+  // Everything above the cursor may be missing from here on, wherever the cursor goes
+  // next. An existing gap keeps its start, which is the lower of the two. A chat with no
+  // cursor has nothing to be continuous with, so it gets no gap: returns whether it did.
+  _markChannelGap(channelId) {
+    const { changes } = this.db.prepare(`
+      UPDATE channels
+      SET gap_after_message_id = COALESCE(gap_after_message_id, last_message_id),
+          updated_at = CURRENT_TIMESTAMP
+      WHERE channel_id = ? AND sync_enabled = 1 AND last_message_id > 0
+    `).run(channelId);
+    return changes > 0;
+  }
+
+  _setChannelGapStart(channelId, messageId) {
+    this.db.prepare(`
+      UPDATE channels SET gap_after_message_id = ?, updated_at = CURRENT_TIMESTAMP WHERE channel_id = ?
+    `).run(messageId, channelId);
+  }
+
+  _getNextGapChannelId() {
+    const rows = this.db.prepare(`
+      SELECT channel_id FROM channels
+      WHERE gap_after_message_id IS NOT NULL AND sync_enabled = 1
+      ORDER BY channel_id
+    `).all();
+    return rows.find((row) => !this.failedGapChannelIds.has(row.channel_id))?.channel_id ?? null;
   }
 
   upsertChannels(dialogs = []) {
@@ -2062,21 +2118,31 @@ export default class MessageSyncService {
       this._handleDeleteMessage(update);
     };
 
-    this.telegramClient.client.onNewMessage.add(newMessageHandler);
-    this.telegramClient.client.onEditMessage.add(editMessageHandler);
-    this.telegramClient.client.onDeleteMessage.add(deleteMessageHandler);
-
     this.realtimeHandlers = {
       newMessageHandler,
       editMessageHandler,
       deleteMessageHandler,
     };
+    this._attachRealtimeHandlers();
+    console.log('[sync] Realtime handlers attached.');
+
+    this.unsubscribeClientReplaced = this.telegramClient.onClientReplaced(() => {
+      this._attachRealtimeHandlers();
+      console.log('[sync] Realtime handlers moved to the new Telegram client.');
+    });
 
     this.unsubscribeChannelTooLong = this.telegramClient.onChannelTooLong((payload) => {
       this._handleChannelTooLong(payload);
     });
 
     this.realtimeActive = true;
+  }
+
+  _attachRealtimeHandlers() {
+    const { client } = this.telegramClient;
+    client.onNewMessage.add(this.realtimeHandlers.newMessageHandler);
+    client.onEditMessage.add(this.realtimeHandlers.editMessageHandler);
+    client.onDeleteMessage.add(this.realtimeHandlers.deleteMessageHandler);
   }
 
   async processQueue() {
@@ -2093,10 +2159,15 @@ export default class MessageSyncService {
           break;
         }
         const job = this._getNextJob();
-        if (!job) {
-          break;
+        if (job) {
+          await this._processJob(job);
+        } else {
+          const gapChannelId = this._getNextGapChannelId();
+          if (!gapChannelId) {
+            break;
+          }
+          await this._fillChannelGap(gapChannelId);
         }
-        await this._processJob(job);
         await delay(this.interJobDelayMs);
       }
     } finally {
@@ -2106,8 +2177,34 @@ export default class MessageSyncService {
 
   resumePendingJobs() {
     this._resetErroredJobs();
+    this.failedGapChannelIds.clear();
     void this.processQueue();
     void this.refetchQueuedSentMessages();
+  }
+
+  async _fillChannelGap(channelId) {
+    try {
+      await this._syncNewerMessages(channelId);
+    } catch (error) {
+      if (this.stopRequested) {
+        return;
+      }
+      const waitSeconds = parseFloodWaitSeconds(error);
+      if (waitSeconds !== null) {
+        console.log(`[sync] Channel ${channelId}: rate limited, waiting ${waitSeconds}s before fetching the rest of the gap.`);
+        await this._delayUnlessStopped(waitSeconds * 1000);
+        return;
+      }
+      console.error(`[sync] Channel ${channelId}: failed to fill gap, will retry on next start: ${error?.message ?? error}`);
+      this.failedGapChannelIds.add(channelId);
+    }
+  }
+
+  async _delayUnlessStopped(ms) {
+    const until = Date.now() + ms;
+    while (!this.stopRequested && Date.now() < until) {
+      await delay(Math.min(1000, until - Date.now()));
+    }
   }
 
   // Worker-only teardown. Stops the queue loop, requeues *only* the job this
@@ -2143,6 +2240,10 @@ export default class MessageSyncService {
       this.telegramClient.client.onEditMessage.remove(this.realtimeHandlers.editMessageHandler);
       this.telegramClient.client.onDeleteMessage.remove(this.realtimeHandlers.deleteMessageHandler);
       this.realtimeHandlers = null;
+      if (this.unsubscribeClientReplaced) {
+        this.unsubscribeClientReplaced();
+        this.unsubscribeClientReplaced = null;
+      }
       if (this.unsubscribeChannelTooLong) {
         this.unsubscribeChannelTooLong();
         this.unsubscribeChannelTooLong = null;
@@ -2786,15 +2887,14 @@ export default class MessageSyncService {
         this._updateJobStatus(job.id, JOB_STATUS.PENDING);
         return;
       }
-      const waitMatch = /wait of (\d+) seconds is required/i.exec(error.message || '');
-      if (waitMatch) {
-        const waitSeconds = Number(waitMatch[1]);
+      const waitSeconds = parseFloodWaitSeconds(error);
+      if (waitSeconds !== null) {
         this.db.prepare(`
           UPDATE jobs
           SET status = ?, error = ?, updated_at = CURRENT_TIMESTAMP
           WHERE id = ?
         `).run(JOB_STATUS.PENDING, `Rate limited, waiting ${waitSeconds}s`, job.id);
-        await delay(waitSeconds * 1000);
+        await this._delayUnlessStopped(waitSeconds * 1000);
       } else {
         this._markJobError(job.id, error);
       }
@@ -3112,7 +3212,8 @@ export default class MessageSyncService {
   _getChannel(channelId) {
     return this.db.prepare(`
       SELECT channel_id, peer_title, peer_type, username, sync_enabled,
-             last_message_id, last_message_date, oldest_message_id, oldest_message_date
+             last_message_id, last_message_date, oldest_message_id, oldest_message_date,
+             gap_after_message_id
       FROM channels
       WHERE channel_id = ?
     `).get(channelId);
@@ -3214,7 +3315,9 @@ export default class MessageSyncService {
 
   _handleIncomingMessage(message, { isEdit }) {
     const record = this._writeMessage(message, { isEdit });
-    if (!record) {
+    // An edit can touch a message of any age, so it says nothing about what is
+    // archived around it. Moving a cursor here would hide history from later syncs.
+    if (!record || isEdit) {
       return;
     }
 
@@ -3437,6 +3540,10 @@ export default class MessageSyncService {
 
     this.insertMessagesTx(records);
 
+    // The diff holds only the newest messages. mtcute has already moved past the rest
+    // and will not report them again, so the gap has to be on disk before anything else.
+    const hasGap = this._markChannelGap(batchChannelId);
+
     this._updateChannelCursors(batchChannelId, {
       lastMessageId: latestMessageId,
       lastMessageDate: latestMessageDate,
@@ -3444,7 +3551,10 @@ export default class MessageSyncService {
       oldestMessageDate: oldestMessageDate,
     });
 
-    void this._syncNewerMessages(batchChannelId);
+    if (hasGap) {
+      console.log(`[sync] Channel ${batchChannelId}: update diff too long, queued a history fetch for what it skipped.`);
+      void this.processQueue();
+    }
   }
 
   async _syncNewerMessages(channelId) {
@@ -3454,7 +3564,9 @@ export default class MessageSyncService {
       return { hasMoreNewer: false, stoppedEarly: false };
     }
 
-    let minId = channel.last_message_id || 0;
+    // A recorded gap starts below the cursor. Any sync of the channel fills it.
+    const fillingGap = channel.gap_after_message_id !== null;
+    let minId = fillingGap ? channel.gap_after_message_id : (channel.last_message_id || 0);
     let lastMessageId = channel.last_message_id || 0;
     let lastMessageDate = channel.last_message_date || null;
     let oldestMessageId = channel.oldest_message_id || null;
@@ -3472,7 +3584,7 @@ export default class MessageSyncService {
       const { peerTitle: title, peerType: type, messages } = await this.telegramClient.getMessagesByChannelId(
         normalizedId,
         this.batchSize,
-        { minId },
+        { afterId: minId },
       );
 
       if (this.stopRequested) {
@@ -3519,6 +3631,11 @@ export default class MessageSyncService {
 
       minId = newest.id;
       hasMoreNewer = newMessages.length >= this.batchSize;
+      // The start moves up with each page, so an interrupted fill loses nothing.
+      if (fillingGap) {
+        this._setChannelGapStart(normalizedId, newest.id);
+        console.log(`[sync] Channel ${normalizedId}: gap filled up to message ${newest.id}.`);
+      }
 
       if (!hasMoreNewer || this.stopRequested) {
         if (this.stopRequested) {
@@ -3547,6 +3664,11 @@ export default class MessageSyncService {
       oldestMessageId,
       oldestMessageDate,
     });
+
+    if (fillingGap && !stoppedEarly) {
+      this._setChannelGapStart(normalizedId, null);
+      console.log(`[sync] Channel ${normalizedId}: gap closed.`);
+    }
 
     return {
       hasMoreNewer,
