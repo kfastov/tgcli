@@ -38,6 +38,10 @@ function range(from, to) {
   return Array.from({ length: to - from + 1 }, (_, index) => from + index);
 }
 
+function sortedIds(messages) {
+  return messages.map((message) => message.id).sort((a, b) => a - b);
+}
+
 // messages.getHistory as core.telegram.org/api/offsets documents it: a newest-first
 // list is sliced by offset_id + add_offset and limit, and only that slice is then
 // filtered by min_id and max_id.
@@ -132,6 +136,18 @@ describe('catching up on messages newer than the cursor', () => {
 
   const addJob = () => service.addJob(CHANNEL_ID, { depth: 1 });
 
+  const stopOnPage = (stopPage) => {
+    onRequest = (page) => {
+      if (page === stopPage) service.stopRequested = true;
+    };
+  };
+
+  const failOnPage = (failPage) => {
+    onRequest = (page) => {
+      if (page === failPage) throw new Error('network down');
+    };
+  };
+
   const resume = () => {
     service.stopRequested = false;
     onRequest = null;
@@ -195,9 +211,7 @@ describe('catching up on messages newer than the cursor', () => {
   it('keeps the cursor on what is archived when stopped, and the next run finishes', async () => {
     seedChat();
     historyIds = range(1, 15);
-    onRequest = (page) => {
-      if (page === 2) service.stopRequested = true;
-    };
+    stopOnPage(2);
 
     const stopped = await service._syncNewerMessages(CHANNEL_ID);
 
@@ -215,9 +229,7 @@ describe('catching up on messages newer than the cursor', () => {
   it('keeps earlier pages when a request fails, and the next run continues from them', async () => {
     seedChat();
     historyIds = range(1, 15);
-    onRequest = (page) => {
-      if (page === 2) throw new Error('network down');
-    };
+    failOnPage(2);
 
     await expect(service._syncNewerMessages(CHANNEL_ID)).rejects.toThrow('network down');
 
@@ -234,22 +246,8 @@ describe('catching up on messages newer than the cursor', () => {
 
   describe('updates arriving around an unfinished job', () => {
     const interruptions = {
-      stop: {
-        arrange: () => {
-          onRequest = (page) => {
-            if (page === 2) service.stopRequested = true;
-          };
-        },
-        status: 'pending',
-      },
-      failure: {
-        arrange: () => {
-          onRequest = (page) => {
-            if (page === 2) throw new Error('network down');
-          };
-        },
-        status: 'error',
-      },
+      stop: { arrange: () => stopOnPage(2), status: 'pending' },
+      failure: { arrange: () => failOnPage(2), status: 'error' },
     };
 
     it.each(Object.keys(interruptions))(
@@ -284,9 +282,7 @@ describe('catching up on messages newer than the cursor', () => {
       seedChat();
       historyIds = range(1, 15);
       const job = addJob();
-      onRequest = (page) => {
-        if (page === 2) service.stopRequested = true;
-      };
+      stopOnPage(2);
 
       await service._processJob(job);
       expect(cursor()).toBe(12);
@@ -333,7 +329,7 @@ describe('catching up on messages newer than the cursor', () => {
 
       const { messages } = await telegramClient.getMessagesByChannelId(CHANNEL_ID, 3, { afterId: 300 });
 
-      expect(messages.map((message) => message.id).sort((a, b) => a - b)).toEqual([301, 302, 303]);
+      expect(sortedIds(messages)).toEqual([301, 302, 303]);
     });
 
     it('stops at beforeId', async () => {
@@ -344,7 +340,7 @@ describe('catching up on messages newer than the cursor', () => {
         beforeId: 303,
       });
 
-      expect(messages.map((message) => message.id).sort((a, b) => a - b)).toEqual([301, 302]);
+      expect(sortedIds(messages)).toEqual([301, 302]);
     });
 
     it('returns what is left when fewer than limit messages are above afterId', async () => {
@@ -352,7 +348,7 @@ describe('catching up on messages newer than the cursor', () => {
 
       const { messages } = await telegramClient.getMessagesByChannelId(CHANNEL_ID, 5, { afterId: 498 });
 
-      expect(messages.map((message) => message.id).sort((a, b) => a - b)).toEqual([499, 500]);
+      expect(sortedIds(messages)).toEqual([499, 500]);
     });
 
     it('returns nothing above the newest message', async () => {

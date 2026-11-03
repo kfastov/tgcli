@@ -3374,7 +3374,6 @@ export default class MessageSyncService {
     }
 
     let lastMessageId = channel.last_message_id || 0;
-    let oldestMessageId = channel.oldest_message_id || null;
     let hasMoreNewer = false;
     let stoppedEarly = false;
     let peerTitle = channel.peer_title;
@@ -3429,9 +3428,6 @@ export default class MessageSyncService {
       const oldest = newMessages[0];
 
       lastMessageId = newest.id;
-      if (!oldestMessageId || oldest.id < oldestMessageId) {
-        oldestMessageId = oldest.id;
-      }
 
       this._updateChannelCursors(normalizedId, {
         lastMessageId: newest.id,
@@ -3449,6 +3445,7 @@ export default class MessageSyncService {
         break;
       }
 
+      console.log(`[sync] Channel ${normalizedId}: archived up to message ${newest.id}, fetching newer.`);
       await delay(this.interBatchDelayMs);
     }
 
@@ -3466,7 +3463,6 @@ export default class MessageSyncService {
     return {
       hasMoreNewer,
       lastMessageId,
-      oldestMessageId,
       stoppedEarly,
     };
   }
