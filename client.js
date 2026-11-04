@@ -23,7 +23,7 @@ async function main() {
   }
 
   const { peerTitle, messages } = await client.getMessagesByChannelId(firstChat.id, 10);
-  console.log(`\nLatest messages from "${peerTitle}":`);
+  console.log(`\nLatest messages from "${peerTitle ?? firstChat.title}":`);
   messages.forEach(msg => {
     const date = msg.date ? new Date(msg.date * 1000).toISOString() : 'unknown-date';
     console.log(`[${date}] ${msg.text || msg.message || ''}`);

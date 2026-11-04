@@ -1030,7 +1030,10 @@ class TelegramClient {
       }
     }
 
+    // resolvePeer gives an input peer, which has no title or type of its own.
+    let chat = null;
     for await (const message of this.client.iterHistory(peer, iterOptions)) {
+      chat ??= message.chat;
       messages.push(this._serializeMessage(message, peer));
       if (messages.length >= effectiveLimit) {
         break;
@@ -1042,9 +1045,9 @@ class TelegramClient {
     }
 
     return {
-      peerTitle: peer?.displayName || 'Unknown',
+      peerTitle: chat?.displayName ?? null,
       peerId: peer?.id?.toString?.() ?? String(channelId),
-      peerType: normalizePeerType(peer),
+      peerType: chat ? normalizePeerType(chat) : null,
       messages: filterSerializedMessagesById(messages, {
         beforeId: effectiveBeforeId,
         afterId: effectiveAfterId,

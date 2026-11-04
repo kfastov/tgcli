@@ -3750,21 +3750,24 @@ export default class MessageSyncService {
       DELETE FROM messages
       WHERE message_id IN (${placeholders})
         AND channel_id IN (
-          SELECT channel_id FROM channels WHERE peer_type IN ('chat', 'user')
+          SELECT channel_id FROM channels
+          WHERE peer_type IN ('chat', 'user') AND channel_id NOT LIKE '-100%'
         )
     `).run(...ids);
     this.db.prepare(`
       DELETE FROM message_links
       WHERE message_id IN (${placeholders})
         AND channel_id IN (
-          SELECT channel_id FROM channels WHERE peer_type IN ('chat', 'user')
+          SELECT channel_id FROM channels
+          WHERE peer_type IN ('chat', 'user') AND channel_id NOT LIKE '-100%'
         )
     `).run(...ids);
     this.db.prepare(`
       DELETE FROM message_media
       WHERE message_id IN (${placeholders})
         AND channel_id IN (
-          SELECT channel_id FROM channels WHERE peer_type IN ('chat', 'user')
+          SELECT channel_id FROM channels
+          WHERE peer_type IN ('chat', 'user') AND channel_id NOT LIKE '-100%'
         )
     `).run(...ids);
   }

@@ -661,6 +661,54 @@ describe('catching up on messages newer than the cursor', () => {
     });
   });
 
+  describe('what a history fetch says about the chat', () => {
+    const channelRow = () => service._getChannel(CHANNEL_ID);
+
+    it('gives its real title and type', async () => {
+      seedChat();
+      service._markChannelGap(CHANNEL_ID);
+      service.db.prepare(`UPDATE channels SET peer_title = 'Unknown', peer_type = 'chat' WHERE channel_id = ?`).run(CHANNEL_ID);
+      historyIds = range(1, 12);
+
+      await service._fillChannelGap(CHANNEL_ID);
+
+      expect(channelRow().peer_title).toBe('Group');
+      expect(channelRow().peer_type).toBe('channel');
+    });
+
+    it('changes nothing when the page is empty', async () => {
+      seedChat();
+      service._markChannelGap(CHANNEL_ID);
+      service.db.prepare(`UPDATE channels SET peer_type = 'channel' WHERE channel_id = ?`).run(CHANNEL_ID);
+      historyIds = range(1, 10);
+
+      await service._fillChannelGap(CHANNEL_ID);
+
+      expect(channelRow().peer_title).toBe('Group');
+      expect(channelRow().peer_type).toBe('channel');
+    });
+  });
+
+  describe('a delete that names no channel', () => {
+    function seedPrivateRow(id) {
+      service.db.prepare(`INSERT INTO channels (channel_id, peer_type, sync_enabled) VALUES ('2', 'user', 1)`).run();
+      service.db.prepare(`INSERT INTO messages (channel_id, message_id, date, text) VALUES ('2', ?, 1, 'hi')`).run(id);
+    }
+    const privateRows = () => service.db.prepare(`SELECT message_id FROM messages WHERE channel_id = '2'`).all();
+
+    it('removes the row of a private chat, and never one of a channel, whatever its label', () => {
+      seedChat();
+      service._handleIncomingMessage(parsed(11), { isEdit: false });
+      service.db.prepare(`UPDATE channels SET peer_type = 'chat' WHERE channel_id = ?`).run(CHANNEL_ID);
+      seedPrivateRow(11);
+
+      service._handleDeleteMessage({ messageIds: [11] });
+
+      expect(privateRows()).toEqual([]);
+      expect(archivedIds()).toEqual([11]);
+    });
+  });
+
   describe('the hourly comparison with the dialog list', () => {
     it('runs when due, then waits another hour, and fills what it finds', async () => {
       const compare = vi.spyOn(service, 'reconcileWithDialogs').mockResolvedValue(1);
