@@ -841,6 +841,19 @@ describe('cold start catch-up', () => {
       expect((await peers.getById(Number(CHANNEL_ID))).accessHash.eq(ACCESS_HASH)).toBe(true);
     });
 
+    it('overwrites the cached min entry, since deleting one damages the LRU map', async () => {
+      const { telegramClient } = startServer();
+      await telegramClient.client.prepare();
+      const { peers } = telegramClient.client.storage;
+      await peers.updatePeersFrom({ users: [], chats: [MIN_CHANNEL] });
+      await peers.getCompleteById(Number(CHANNEL_ID), true);
+
+      await peers.updatePeersFrom({ users: [], chats: [CHANNEL] });
+
+      expect(peers._cache.has(Number(CHANNEL_ID))).toBe(true);
+      expect(peers._cache.get(Number(CHANNEL_ID)).peer.accessHash.eq(ACCESS_HASH)).toBe(true);
+    });
+
     it('drops the message reference of a chat whose complete row it keeps', async () => {
       const { telegramClient } = await startKnowingTheChannel();
       const { peers, refMsgs } = telegramClient.client.storage;

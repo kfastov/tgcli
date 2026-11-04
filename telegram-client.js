@@ -221,9 +221,10 @@ function keepCompletePeersOverMinCopies(client) {
     }
     await store(peer);
     // store() caches a channel under its bare id while lookups go by the marked one, so
-    // a lookup that cached the min row would go on answering with its hash.
-    if (isChannel && !peer.min) {
-      peers._cache.delete(id);
+    // a lookup that cached the min row would go on answering with its hash. Overwritten,
+    // not deleted, since LruMap.delete unlinks everything older than the entry.
+    if (isChannel && !peer.min && peers._cache.get(id)) {
+      peers._cache.set(id, peers._cache.get(peer.id));
     }
   };
 }

@@ -25,6 +25,8 @@ const PERIODIC_RECONCILE_MS = 60 * 60 * 1000;
 const CONNECTION_CHECK_TIMEOUT_MS = 20 * 1000;
 const RETRY_BASE_MS = 60 * 1000;
 const RETRY_MAX_MS = 60 * 60 * 1000;
+// Marked channel ids are below this. A text prefix would also match some basic groups.
+const MAX_MARKED_CHANNEL_ID = -1000000000000;
 const URL_PATTERN = /https?:\/\/[^\s<>"')]+/giu;
 const FILE_NAME_PATTERN = /\b[\w.\-]+\.[a-z0-9]{2,7}\b/iu;
 const MAX_FILENAME_SCAN_DEPTH = 5;
@@ -3752,7 +3754,7 @@ export default class MessageSyncService {
       WHERE message_id IN (${placeholders})
         AND channel_id IN (
           SELECT channel_id FROM channels
-          WHERE peer_type IN ('chat', 'user') AND channel_id NOT LIKE '-100%'
+          WHERE peer_type IN ('chat', 'user') AND CAST(channel_id AS INTEGER) > ${MAX_MARKED_CHANNEL_ID}
         )
     `).run(...ids);
     this.db.prepare(`
@@ -3760,7 +3762,7 @@ export default class MessageSyncService {
       WHERE message_id IN (${placeholders})
         AND channel_id IN (
           SELECT channel_id FROM channels
-          WHERE peer_type IN ('chat', 'user') AND channel_id NOT LIKE '-100%'
+          WHERE peer_type IN ('chat', 'user') AND CAST(channel_id AS INTEGER) > ${MAX_MARKED_CHANNEL_ID}
         )
     `).run(...ids);
     this.db.prepare(`
@@ -3768,7 +3770,7 @@ export default class MessageSyncService {
       WHERE message_id IN (${placeholders})
         AND channel_id IN (
           SELECT channel_id FROM channels
-          WHERE peer_type IN ('chat', 'user') AND channel_id NOT LIKE '-100%'
+          WHERE peer_type IN ('chat', 'user') AND CAST(channel_id AS INTEGER) > ${MAX_MARKED_CHANNEL_ID}
         )
     `).run(...ids);
   }

@@ -707,6 +707,15 @@ describe('catching up on messages newer than the cursor', () => {
       expect(privateRows()).toEqual([]);
       expect(archivedIds()).toEqual([11]);
     });
+
+    it('still reaches a basic group whose marked id looks like a channel prefix', () => {
+      service.db.prepare(`INSERT INTO channels (channel_id, peer_type, sync_enabled) VALUES ('-1001234567', 'chat', 1)`).run();
+      service.db.prepare(`INSERT INTO messages (channel_id, message_id, date, text) VALUES ('-1001234567', 11, 1, 'hi')`).run();
+
+      service._handleDeleteMessage({ messageIds: [11] });
+
+      expect(service.db.prepare(`SELECT message_id FROM messages WHERE channel_id = '-1001234567'`).all()).toEqual([]);
+    });
   });
 
   describe('the hourly comparison with the dialog list', () => {
