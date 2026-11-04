@@ -661,6 +661,35 @@ describe('catching up on messages newer than the cursor', () => {
     });
   });
 
+  describe('the hourly comparison with the dialog list', () => {
+    it('runs when due, then waits another hour, and fills what it finds', async () => {
+      const compare = vi.spyOn(service, 'reconcileWithDialogs').mockResolvedValue(1);
+      const processQueue = vi.spyOn(service, 'processQueue').mockResolvedValue();
+
+      service._reconcileWhenDue();
+      expect(compare).not.toHaveBeenCalled();
+
+      service.lastReconcileAt = Date.now() - 60 * 60 * 1000;
+      service._reconcileWhenDue();
+      service._reconcileWhenDue();
+
+      expect(compare).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => expect(processQueue).toHaveBeenCalledTimes(1));
+    });
+
+    it('does not start the queue when it was stopped', async () => {
+      vi.spyOn(service, 'reconcileWithDialogs').mockResolvedValue(null);
+      const processQueue = vi.spyOn(service, 'processQueue').mockResolvedValue();
+      service.lastReconcileAt = 0;
+
+      service._reconcileWhenDue();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(processQueue).not.toHaveBeenCalled();
+    });
+  });
+
   describe('queueResyncJob', () => {
     beforeEach(() => {
       vi.spyOn(service, 'processQueue').mockResolvedValue();

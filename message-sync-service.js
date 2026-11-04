@@ -21,6 +21,7 @@ const JOB_STATUS = {
 // Out of reach for this long, Telegram's catch-up is no longer trusted to be complete.
 const LONG_OUTAGE_MS = 5 * 60 * 1000;
 const PERIODIC_CHECK_INTERVAL_MS = 30 * 1000;
+const PERIODIC_RECONCILE_MS = 60 * 60 * 1000;
 const CONNECTION_CHECK_TIMEOUT_MS = 20 * 1000;
 const RETRY_BASE_MS = 60 * 1000;
 const RETRY_MAX_MS = 60 * 60 * 1000;
@@ -574,6 +575,7 @@ export default class MessageSyncService {
     this.confirmingConnection = false;
     this.lastCheckAt = Date.now();
     this.lastErroredJobsRetryAt = Date.now();
+    this.lastReconcileAt = Date.now();
     this.periodicCheckTimer = null;
     // Id of the job this instance set to `in_progress` while running the queue.
     // Only the queue worker owns its in-flight job; `shutdown()` requeues just
@@ -2325,6 +2327,7 @@ export default class MessageSyncService {
       this._checkForSleep();
       void this._confirmConnection();
       this._retryErroredJobsWhenDue();
+      this._reconcileWhenDue();
     }, PERIODIC_CHECK_INTERVAL_MS);
     this.periodicCheckTimer.unref?.();
   }
@@ -2360,6 +2363,21 @@ export default class MessageSyncService {
     this.lastErroredJobsRetryAt = now;
     this._resetErroredJobs();
     void this.processQueue();
+  }
+
+  // Updates leave no trace of what they never delivered, such as the last messages of
+  // a chat gone quiet, and a server with watched chats may not restart for weeks.
+  _reconcileWhenDue() {
+    const now = Date.now();
+    if (now - this.lastReconcileAt < PERIODIC_RECONCILE_MS) {
+      return;
+    }
+    this.lastReconcileAt = now;
+    void this.reconcileWithDialogs().then((dialogCount) => {
+      if (dialogCount !== null) {
+        void this.processQueue();
+      }
+    });
   }
 
   async processQueue() {
