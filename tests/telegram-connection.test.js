@@ -810,6 +810,47 @@ describe('cold start catch-up', () => {
       expect(peer?.accessHash.eq(ACCESS_HASH)).toBe(true);
     });
 
+    it('is not undone by a delayed write of an earlier min copy', async () => {
+      const { telegramClient } = startServer();
+      await telegramClient.client.prepare();
+      const { peers } = telegramClient.client.storage;
+
+      await peers.updatePeersFrom({ users: [], chats: [MIN_CHANNEL] });
+      await peers.updatePeersFrom({ users: [], chats: [MIN_CHANNEL] });
+      await peers.updatePeersFrom({ users: [], chats: [CHANNEL] });
+      await stopServer();
+
+      const restarted = startServer();
+      await restarted.telegramClient.client.prepare();
+      const peer = await restarted.telegramClient.client.storage.peers.getById(Number(CHANNEL_ID));
+      expect(peer?.accessHash.eq(ACCESS_HASH)).toBe(true);
+    });
+
+    it('stops answering with the hash of a min row once it has the real one', async () => {
+      const { telegramClient } = startServer();
+      await telegramClient.client.prepare();
+      const { peers } = telegramClient.client.storage;
+      await peers.updatePeersFrom({ users: [], chats: [MIN_CHANNEL] });
+      // resolvePeer does this on its way to asking Telegram, and the result stays cached.
+      await peers.getCompleteById(Number(CHANNEL_ID), true);
+
+      await peers.updatePeersFrom({ users: [], chats: [CHANNEL] });
+      expect((await peers.getById(Number(CHANNEL_ID))).accessHash.eq(ACCESS_HASH)).toBe(true);
+
+      await peers.updatePeersFrom({ users: [], chats: [MIN_CHANNEL] });
+      expect((await peers.getById(Number(CHANNEL_ID))).accessHash.eq(ACCESS_HASH)).toBe(true);
+    });
+
+    it('drops the message reference of a chat whose complete row it keeps', async () => {
+      const { telegramClient } = await startKnowingTheChannel();
+      const { peers, refMsgs } = telegramClient.client.storage;
+      await refMsgs.store(Number(CHANNEL_ID), Number(CHANNEL_ID), 1);
+
+      await peers.updatePeersFrom({ users: [], chats: [MIN_CHANNEL] });
+
+      await expect(refMsgs.getForPeer(Number(CHANNEL_ID))).resolves.toBeNull();
+    });
+
     it('still stores a min copy of a chat it knows nothing else about', async () => {
       const { telegramClient } = await startKnowingTheChannel();
 

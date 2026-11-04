@@ -207,17 +207,24 @@ function resolveUploadPath(filePath) {
 // cannot be looked up, and an update that hits a pts gap is lost: getChannelDifference
 // finds no peer, or is refused with CHANNEL_INVALID. A min copy adds nothing worth that.
 function keepCompletePeersOverMinCopies(client) {
-  const { peers } = client.storage;
+  const { peers, refMsgs } = client.storage;
   const store = peers.store.bind(peers);
   peers.store = async (peer) => {
+    const isChannel = peer._ === 'channel' || peer._ === 'channelForbidden';
+    const id = isChannel ? toggleChannelIdMark(peer.id) : peer.id;
     if (peer.min) {
-      const id = peer._ === 'channel' ? toggleChannelIdMark(peer.id) : peer.id;
       const existing = await peers.getCompleteById(id);
       if (existing && !existing.min) {
+        await refMsgs.deleteByPeer(id);
         return;
       }
     }
     await store(peer);
+    // store() caches a channel under its bare id while lookups go by the marked one, so
+    // a lookup that cached the min row would go on answering with its hash.
+    if (isChannel && !peer.min) {
+      peers._cache.delete(id);
+    }
   };
 }
 
@@ -582,6 +589,8 @@ class TelegramClient {
       apiId: this.apiId,
       apiHash: this.apiHash,
       storage: this.sessionPath,
+      // A delayed write of a min copy can land after the complete row that replaced it.
+      storageOptions: { peers: { updatesWriteInterval: 0 } },
       platform: createPlatform(),
     };
     if (this.options.disableUpdates) {
