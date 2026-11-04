@@ -2376,6 +2376,7 @@ export default class MessageSyncService {
       return;
     }
     this.lastReconcileAt = now;
+    console.log('[sync] Hourly comparison of the archive with the dialog list.');
     void this.reconcileWithDialogs().then((dialogCount) => {
       if (dialogCount !== null) {
         void this.processQueue();
