@@ -710,6 +710,25 @@ describe('catching up on messages newer than the cursor', () => {
   });
 
   describe('the hourly comparison with the dialog list', () => {
+    it('stays out of the way of a comparison that is already due', () => {
+      const compare = vi.spyOn(service, 'reconcileWithDialogs').mockResolvedValue(1);
+      service.lastReconcileAt = 0;
+      service.reconcileNeeded = true;
+
+      service._reconcileWhenDue();
+
+      expect(compare).not.toHaveBeenCalled();
+    });
+
+    it('counts any finished comparison, so an outage is not followed by another', async () => {
+      vi.spyOn(service, 'refreshChannelsFromDialogs').mockResolvedValue(1);
+      service.lastReconcileAt = 0;
+
+      await service.reconcileWithDialogs();
+
+      expect(service.lastReconcileAt).toBeGreaterThan(Date.now() - 1000);
+    });
+
     it('runs when due, then waits another hour, and fills what it finds', async () => {
       const compare = vi.spyOn(service, 'reconcileWithDialogs').mockResolvedValue(1);
       const processQueue = vi.spyOn(service, 'processQueue').mockResolvedValue();

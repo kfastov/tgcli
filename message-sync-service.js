@@ -1339,6 +1339,7 @@ export default class MessageSyncService {
         }
       } while (this.reconcileAgain && !this.stopRequested);
       this.reconcileNeeded = false;
+      this.lastReconcileAt = Date.now();
       return this.stopRequested ? null : dialogCount;
     } finally {
       // In the same tick as the last look at reconcileAgain, so no request falls between.
@@ -2369,7 +2370,7 @@ export default class MessageSyncService {
   // a chat gone quiet, and a server with watched chats may not restart for weeks.
   _reconcileWhenDue() {
     const now = Date.now();
-    if (now - this.lastReconcileAt < PERIODIC_RECONCILE_MS) {
+    if (this.reconcileNeeded || now - this.lastReconcileAt < PERIODIC_RECONCILE_MS) {
       return;
     }
     this.lastReconcileAt = now;
