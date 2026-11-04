@@ -840,6 +840,66 @@ describe('cold start catch-up', () => {
     });
   });
 
+  describe('when a channel id jumps over the cursor while running', () => {
+    async function startAtCursor10() {
+      telegram.dialogs = [];
+      const server = startServer();
+      const resumed = vi.spyOn(server.messageSyncService, 'resumePendingJobs');
+      seedCursor(server.messageSyncService, CHANNEL_ID, 10);
+      await server.ensureConnected();
+      await vi.waitFor(() => expect(resumed).toHaveBeenCalled());
+      await vi.waitFor(async () => expect(await storedPts()).toBe(telegram.pts));
+      return server;
+    }
+
+    function history(from, to) {
+      const messages = [];
+      for (let id = from; id <= to; id += 1) {
+        messages.push(channelMessage(id));
+      }
+      return messages;
+    }
+
+    function arriveInChannel(id, pts) {
+      deliverLive({ _: 'updateNewChannelMessage', message: channelMessage(id), pts, ptsCount: 1 });
+    }
+
+    it('fetches what mtcute never handed over', async () => {
+      telegram.history.set(BARE_CHANNEL_ID, history(1, 16));
+      await startAtCursor10();
+
+      arriveInChannel(16, 500);
+
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 13, 14, 15, 16]));
+      await vi.waitFor(() => expect(recordedGap(CHANNEL_ID)).toBeNull());
+      expect(cursor(CHANNEL_ID)).toBe(16);
+    });
+
+    it('asks Telegram nothing while ids run in sequence', async () => {
+      telegram.history.set(BARE_CHANNEL_ID, history(1, 12));
+      await startAtCursor10();
+
+      arriveInChannel(11, 500);
+      arriveInChannel(12, 501);
+
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([11, 12]));
+      expect(telegram.historyPages).toBe(0);
+      expect(cursor(CHANNEL_ID)).toBe(12);
+    });
+
+    it('leaves private chats alone, where ids are shared across the account', async () => {
+      const { messageSyncService } = await startAtCursor10();
+      seedCursor(messageSyncService, FRIEND_CHAT_ID, 10);
+
+      arriveLive(friendMessage(50));
+
+      await vi.waitFor(() => expect(archivedIds(FRIEND_CHAT_ID)).toEqual([50]));
+      expect(recordedGap(FRIEND_CHAT_ID)).toBeNull();
+      expect(cursor(FRIEND_CHAT_ID)).toBe(50);
+      expect(telegram.historyPages).toBe(0);
+    });
+  });
+
   describe('when catch-up reports nothing about what a chat missed', () => {
     function friendHistory(from, to) {
       const messages = [];

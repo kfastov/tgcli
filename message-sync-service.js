@@ -3558,6 +3558,7 @@ export default class MessageSyncService {
       return;
     }
 
+    const idsJumped = this._markGapIfIdsJumped(record.channel_id, message);
     const messageDate = toIsoString(record.date);
     this._updateChannelCursorsFromUpdate(record.channel_id, {
       lastMessageId: record.message_id,
@@ -3565,6 +3566,32 @@ export default class MessageSyncService {
       oldestMessageId: record.message_id,
       oldestMessageDate: messageDate,
     });
+    if (idsJumped) {
+      void this.processQueue();
+    }
+  }
+
+  // In a channel or supergroup ids run in sequence, so one that jumps over the cursor
+  // means updates were lost, whatever the reason, or messages were deleted, which costs
+  // one history page. Private chats and basic groups share ids across the account, but
+  // they have no channel difference to fail. A held cursor stays below the message, so
+  // whatever holds it will find the same messages.
+  _markGapIfIdsJumped(channelId, message) {
+    if (message.raw?.peerId?._ !== 'peerChannel') {
+      return false;
+    }
+    const channel = this._getChannel(channelId);
+    if (
+      !(channel?.last_message_id > 0)
+      || message.id <= channel.last_message_id + 1
+      || channel.gap_after_message_id !== null
+      || channel.newer_sync_pending
+      || this._cursorsHeld()
+    ) {
+      return false;
+    }
+    console.log(`[sync] Channel ${channelId}: message ${message.id} came after ${channel.last_message_id}, fetching what lies between.`);
+    return this._markChannelGap(channelId);
   }
 
   // Returns the written record, or null if the message does not belong in the archive.
@@ -3810,6 +3837,7 @@ export default class MessageSyncService {
     // A recorded gap starts below the cursor. Any sync of the channel fills it.
     const fillingGap = channel.gap_after_message_id !== null;
     let lastMessageId = fillingGap ? channel.gap_after_message_id : (channel.last_message_id || 0);
+    let cursorBeforeLastPage = channel.last_message_id;
     let hasMoreNewer = false;
     let stoppedEarly = false;
     let peerTitle = channel.peer_title;
@@ -3823,6 +3851,7 @@ export default class MessageSyncService {
       // Pages go oldest first and the cursor moves after each one, so it only ever
       // passes archived messages and an interrupted run resumes without a hole. With no
       // cursor yet this returns the newest batch: older history is _backfillHistory's.
+      cursorBeforeLastPage = this._getChannel(normalizedId).last_message_id;
       const { peerTitle: title, peerType: type, messages } = await this.telegramClient.getMessagesByChannelId(
         normalizedId,
         this.batchSize,
@@ -3846,7 +3875,7 @@ export default class MessageSyncService {
         break;
       }
 
-      this.archiveHistoryMessages(normalizedId, newMessages);
+      const addedCount = this.archiveHistoryMessages(normalizedId, newMessages);
 
       const newest = newMessages[newMessages.length - 1];
       const oldest = newMessages[0];
@@ -3864,7 +3893,7 @@ export default class MessageSyncService {
       // The start moves up with each page, so an interrupted fill loses nothing.
       if (fillingGap) {
         this._setChannelGapStart(normalizedId, newest.id);
-        console.log(`[sync] Channel ${normalizedId}: gap filled up to message ${newest.id}.`);
+        console.log(`[sync] Channel ${normalizedId}: gap filled up to message ${newest.id}, ${addedCount} new.`);
       }
 
       if (!hasMoreNewer || this.stopRequested) {
@@ -3894,8 +3923,14 @@ export default class MessageSyncService {
     }
 
     if (fillingGap && !stoppedEarly) {
-      this._closeChannelGap(normalizedId);
-      console.log(`[sync] Channel ${normalizedId}: gap closed.`);
+      // An update that moved the cursor while the last page was on its way may have passed
+      // messages that page could not show, so the fill has not caught up with the cursor.
+      if (this._getChannel(normalizedId).last_message_id > Math.max(cursorBeforeLastPage, lastMessageId)) {
+        this._setChannelGapStart(normalizedId, lastMessageId);
+      } else {
+        this._closeChannelGap(normalizedId);
+        console.log(`[sync] Channel ${normalizedId}: gap closed.`);
+      }
     }
 
     return {

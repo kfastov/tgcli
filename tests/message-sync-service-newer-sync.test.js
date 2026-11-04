@@ -527,6 +527,140 @@ describe('catching up on messages newer than the cursor', () => {
     expect(archivedIds()).toEqual(range(1, 20));
   });
 
+  describe('an id that jumps over the cursor', () => {
+    const recordedGap = () => service._getChannel(CHANNEL_ID).gap_after_message_id;
+
+    beforeEach(() => {
+      vi.spyOn(service, 'processQueue').mockResolvedValue();
+    });
+
+    it('records a gap from the cursor and wakes the queue', () => {
+      seedChat();
+
+      service._handleIncomingMessage(parsed(16), { isEdit: false });
+
+      expect(recordedGap()).toBe(10);
+      expect(cursor()).toBe(16);
+      expect(service.processQueue).toHaveBeenCalledTimes(1);
+    });
+
+    it('is not what the next id in sequence does', () => {
+      seedChat();
+
+      service._handleIncomingMessage(parsed(11), { isEdit: false });
+
+      expect(recordedGap()).toBeNull();
+      expect(cursor()).toBe(11);
+      expect(service.processQueue).not.toHaveBeenCalled();
+    });
+
+    it('is not what a message below the cursor does', () => {
+      seedChat();
+
+      service._handleIncomingMessage(parsed(5), { isEdit: false });
+
+      expect(recordedGap()).toBeNull();
+      expect(cursor()).toBe(10);
+    });
+
+    it('is not what an edit does', () => {
+      seedChat();
+
+      service._handleIncomingMessage(parsed(16), { isEdit: true });
+
+      expect(recordedGap()).toBeNull();
+      expect(cursor()).toBe(10);
+    });
+
+    it('means nothing in a chat with no cursor', () => {
+      seedChat({ lastMessageId: 0 });
+
+      service._handleIncomingMessage(parsed(16), { isEdit: false });
+
+      expect(recordedGap()).toBeNull();
+      expect(cursor()).toBe(16);
+    });
+
+    it('is left to the comparison with the dialog list while cursors are held', () => {
+      seedChat();
+      service.reconcileNeeded = true;
+
+      service._handleIncomingMessage(parsed(16), { isEdit: false });
+
+      expect(recordedGap()).toBeNull();
+      expect(cursor()).toBe(10);
+    });
+
+    it('is left to the job while a newer sync is pending', () => {
+      seedChat();
+      addJob();
+
+      service._handleIncomingMessage(parsed(16), { isEdit: false });
+
+      expect(recordedGap()).toBeNull();
+      expect(cursor()).toBe(10);
+    });
+
+    it('keeps the start of a gap already recorded', () => {
+      seedChat();
+      service._setChannelGapStart(CHANNEL_ID, 5);
+
+      service._handleIncomingMessage(parsed(16), { isEdit: false });
+
+      expect(recordedGap()).toBe(5);
+      expect(cursor()).toBe(16);
+      expect(service.processQueue).not.toHaveBeenCalled();
+    });
+
+    it('closes a gap under a cursor that history no longer reaches', async () => {
+      seedChat({ lastMessageId: 20 });
+      service._setChannelGapStart(CHANNEL_ID, 10);
+      historyIds = range(1, 19);
+
+      await service._fillChannelGap(CHANNEL_ID);
+
+      expect(archivedIds()).toEqual(range(11, 19));
+      expect(recordedGap()).toBeNull();
+      expect(cursor()).toBe(20);
+    });
+
+    it('costs one page when the skipped ids were deleted, and closes the gap', async () => {
+      seedChat();
+      historyIds = [...range(1, 10), 16];
+      service._handleIncomingMessage(parsed(16), { isEdit: false });
+
+      await service._fillChannelGap(CHANNEL_ID);
+
+      expect(archivedIds()).toEqual([16]);
+      expect(recordedGap()).toBeNull();
+      expect(cursor()).toBe(16);
+    });
+
+    it('keeps a gap open when an update passes what its last page could see', async () => {
+      seedChat();
+      service._markChannelGap(CHANNEL_ID);
+      historyIds = range(1, 11);
+      const fetchPage = telegramClient.getMessagesByChannelId.bind(telegramClient);
+      vi.spyOn(telegramClient, 'getMessagesByChannelId').mockImplementationOnce(async (...args) => {
+        const page = await fetchPage(...args);
+        // The chat moves on between Telegram's answer and its arrival here.
+        historyIds = range(1, 16);
+        service._handleIncomingMessage(parsed(16), { isEdit: false });
+        return page;
+      });
+
+      await service._fillChannelGap(CHANNEL_ID);
+
+      expect(recordedGap()).toBe(11);
+      expect(cursor()).toBe(16);
+
+      await service._fillChannelGap(CHANNEL_ID);
+
+      expect(archivedIds()).toEqual(range(11, 16));
+      expect(recordedGap()).toBeNull();
+    });
+  });
+
   describe('queueResyncJob', () => {
     beforeEach(() => {
       vi.spyOn(service, 'processQueue').mockResolvedValue();
