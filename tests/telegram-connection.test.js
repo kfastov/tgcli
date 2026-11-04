@@ -123,6 +123,9 @@ class FakeTelegram {
       case 'updates.getDifference':
         return this._difference(request);
       case 'updates.getChannelDifference':
+        if (request.channel._ !== 'inputChannel' || !request.channel.accessHash.eq(ACCESS_HASH)) {
+          throw tl.RpcError.fromTl({ _: 'rpc_error', errorCode: 400, errorMessage: 'CHANNEL_INVALID' });
+        }
         return this.channelDifference ?? {
           _: 'updates.channelDifferenceEmpty', final: true, pts: request.pts,
         };
@@ -743,6 +746,97 @@ describe('cold start catch-up', () => {
 
       expect(archivedIds(CHANNEL_ID)).toEqual([19, 20]);
       expect(cursor(CHANNEL_ID)).toBe(20);
+    });
+  });
+
+  describe('when an update carries a min copy of a chat', () => {
+    const MIN_HASH = Long.fromNumber(999);
+    const MIN_CHANNEL = { ...CHANNEL, min: true, accessHash: MIN_HASH };
+    const OTHER_MIN_CHANNEL = { ...MIN_CHANNEL, id: 600 };
+
+    function emit(update, chats) {
+      running.telegramClient.client._client.onServerUpdate.emit({
+        _: 'updates',
+        updates: [update],
+        users: [SELF, FRIEND],
+        chats,
+        date: 1700000000,
+        seq: 0,
+      });
+    }
+
+    // The way a forward from that chat comes in: the chat among the peers of an update elsewhere.
+    function deliverCopies(chats) {
+      telegram.pts += 1;
+      emit({ _: 'updateNewMessage', message: friendMessage(11), pts: telegram.pts, ptsCount: 1 }, chats);
+    }
+
+    async function startKnowingTheChannel() {
+      telegram.dialogs = [dialogWith(CHANNEL_PEER, 10)];
+      const server = startServer();
+      const resumed = vi.spyOn(server.messageSyncService, 'resumePendingJobs');
+      seedCursor(server.messageSyncService, CHANNEL_ID, 10);
+      await server.ensureConnected();
+      await vi.waitFor(() => expect(resumed).toHaveBeenCalled());
+      await vi.waitFor(async () => expect(await storedPts()).toBe(telegram.pts));
+      return server;
+    }
+
+    it('keeps the access hash it has, in memory and on disk', async () => {
+      const { telegramClient } = await startKnowingTheChannel();
+
+      deliverCopies([MIN_CHANNEL]);
+      await vi.waitFor(() => expect(archivedIds(FRIEND_CHAT_ID)).toEqual([11]));
+      const inMemory = await telegramClient.client.storage.peers.getById(Number(CHANNEL_ID));
+      expect(inMemory.accessHash.eq(ACCESS_HASH)).toBe(true);
+
+      await stopServer();
+      const restarted = startServer();
+      await restarted.telegramClient.client.prepare();
+      const onDisk = await restarted.telegramClient.client.storage.peers.getById(Number(CHANNEL_ID));
+      expect(onDisk?.accessHash.eq(ACCESS_HASH)).toBe(true);
+    });
+
+    it('keeps it after a restart too, before the chat has been seen again', async () => {
+      await startKnowingTheChannel();
+      await stopServer();
+
+      const restarted = startServer();
+      await restarted.telegramClient.client.prepare();
+      const { peers } = restarted.telegramClient.client.storage;
+      await peers.updatePeersFrom({ users: [], chats: [MIN_CHANNEL] });
+
+      const peer = await peers.getById(Number(CHANNEL_ID));
+      expect(peer?.accessHash.eq(ACCESS_HASH)).toBe(true);
+    });
+
+    it('still stores a min copy of a chat it knows nothing else about', async () => {
+      const { telegramClient } = await startKnowingTheChannel();
+
+      deliverCopies([OTHER_MIN_CHANNEL]);
+      await vi.waitFor(() => expect(archivedIds(FRIEND_CHAT_ID)).toEqual([11]));
+
+      const hash = await telegramClient.client.storage.peers.getMinAccessHash(-1000000000600);
+      expect(hash.eq(MIN_HASH)).toBe(true);
+    });
+
+    it('can still fetch what that chat has missed', async () => {
+      await startKnowingTheChannel();
+      deliverCopies([MIN_CHANNEL]);
+      await vi.waitFor(() => expect(archivedIds(FRIEND_CHAT_ID)).toEqual([11]));
+
+      telegram.channelDifference = {
+        _: 'updates.channelDifference',
+        final: true,
+        pts: 505,
+        newMessages: [channelMessage(13), channelMessage(14)],
+        otherUpdates: [],
+        ...PEERS,
+      };
+      // Names the chat without carrying a copy of it, so mtcute has to look it up.
+      emit({ _: 'updateChannelTooLong', channelId: BARE_CHANNEL_ID, pts: 500 }, []);
+
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([13, 14]));
     });
   });
 

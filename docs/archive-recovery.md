@@ -2,12 +2,15 @@
 
 Versions before the sent-message fix did not archive messages sent through tgcli
 (`send text`, `send file`, `send photo`), and the next incoming message moved the
-sync cursor past them for good. `scripts/recover-archive-gaps.js` writes back
-whatever a chat's history has and the archive does not.
+sync cursor past them for good. Versions before the realtime fix also lost single
+messages in channels and supergroups while the server ran, with no sign in the
+archive, because a min copy of a chat overwrote its access hash in the session.
+`scripts/recover-archive-gaps.js` writes back whatever a chat's history has and the
+archive does not.
 
 ## Steps
 
-1. Install a version with the fix, or new sends keep leaving gaps.
+1. Install a version with the fixes, or new gaps keep appearing.
 2. Back up the archive. It is `messages.db` in the store directory (`TGCLI_STORE`, or
    the OS app-data directory):
 
@@ -15,9 +18,9 @@ whatever a chat's history has and the archive does not.
    sqlite3 <store>/messages.db ".backup <store>/messages.backup.db"
    ```
 
-3. List the chats you sent to through tgcli. The archive does not record which sends
-   came from tgcli, so this list comes from you. The script refuses chats with sync
-   disabled.
+3. List the chats to repair: those you sent to through tgcli, whose sends the archive
+   does not mark, and active channels and supergroups. The script refuses chats with
+   sync disabled.
 4. For each chat, pick `afterMessageId`: the last message before the first possible
    gap. `0` walks the whole chat. The walk starts at the newest message and costs one
    page of 100 messages per second.

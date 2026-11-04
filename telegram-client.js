@@ -1,6 +1,6 @@
 import { TelegramClient as MtCuteClient } from '@mtcute/node';
 import { InputMedia, Message, PeersIndex } from '@mtcute/core';
-import { randomLong } from '@mtcute/core/utils.js';
+import { randomLong, toggleChannelIdMark } from '@mtcute/core/utils.js';
 import { html } from '@mtcute/html-parser';
 import { md } from '@mtcute/markdown-parser';
 import QRCode from 'qrcode';
@@ -200,6 +200,25 @@ function resolveUploadPath(filePath) {
     throw new Error(`File not found: ${resolved}`);
   }
   return `file:${resolved}`;
+}
+
+// mtcute writes a min peer over the complete one it already has, access hash included
+// (still so in 0.32.7). A min row counts as having no hash, so from then on the chat
+// cannot be looked up, and an update that hits a pts gap is lost: getChannelDifference
+// finds no peer, or is refused with CHANNEL_INVALID. A min copy adds nothing worth that.
+function keepCompletePeersOverMinCopies(client) {
+  const { peers } = client.storage;
+  const store = peers.store.bind(peers);
+  peers.store = async (peer) => {
+    if (peer.min) {
+      const id = peer._ === 'channel' ? toggleChannelIdMark(peer.id) : peer.id;
+      const existing = await peers.getCompleteById(id);
+      if (existing && !existing.min) {
+        return;
+      }
+    }
+    await store(peer);
+  };
 }
 
 function resolveOptionalCaption(caption) {
@@ -570,7 +589,9 @@ class TelegramClient {
     } else {
       clientOptions.updates = this.updatesConfig;
     }
-    return new MtCuteClient(clientOptions);
+    const client = new MtCuteClient(clientOptions);
+    keepCompletePeersOverMinCopies(client);
+    return client;
   }
 
   _isAuthKeyUnregisteredError(error) {

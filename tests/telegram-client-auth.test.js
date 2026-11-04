@@ -3,6 +3,7 @@ const mtcuteClientCtor = vi.hoisted(() => vi.fn(function () {
     destroy: vi.fn().mockResolvedValue(undefined),
     stopUpdatesLoop: vi.fn().mockResolvedValue(undefined),
     onRawUpdate: { remove: vi.fn() },
+    storage: { peers: { store: vi.fn() } },
   };
 }));
 
@@ -26,6 +27,7 @@ describe('telegram client auth bootstrap options', () => {
         destroy: vi.fn().mockResolvedValue(undefined),
         stopUpdatesLoop: vi.fn().mockResolvedValue(undefined),
         onRawUpdate: { remove: vi.fn() },
+        storage: { peers: { store: vi.fn() } },
       };
     });
   });
