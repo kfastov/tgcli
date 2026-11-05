@@ -972,7 +972,7 @@ describe('cold start catch-up', () => {
   // them from history as well, and mtcute drops the copies it already received. They
   // show up in history about half a minute later, with nothing to announce them.
   describe('when a channel difference names real messages as deleted', () => {
-    const RECHECK_TIMES = [30, 120, 600, 1800, 7200].map((seconds) => seconds * 1000);
+    const RECHECK_TIMES = [60, 600, 3600].map((seconds) => seconds * 1000);
     let queuedAt;
 
     function history(...ids) {
@@ -1031,6 +1031,24 @@ describe('cold start catch-up', () => {
       }
     }
 
+    function namedDeletedByDifference(...messageIds) {
+      running.messageSyncService._handleDeleteMessage({
+        channelId: CHANNEL_ID,
+        messageIds,
+        raw: { ptsCount: 0 },
+      });
+    }
+
+    function pushedDelete(messageIds, pts) {
+      deliverLive({
+        _: 'updateDeleteChannelMessages',
+        channelId: BARE_CHANNEL_ID,
+        messages: messageIds,
+        pts,
+        ptsCount: messageIds.length,
+      });
+    }
+
     function queuedIds() {
       return running.messageSyncService.db
         .prepare('SELECT message_id FROM messages_to_recheck ORDER BY message_id')
@@ -1066,10 +1084,9 @@ describe('cold start catch-up', () => {
     it('reads only when a check is due, then lets go of a message that stays deleted', async () => {
       await lose13And14();
 
-      await recheckAt(RECHECK_TIMES[0] - 1000);
-      expect(telegram.messageReads).toBe(0);
-
       for (const [index, elapsed] of RECHECK_TIMES.entries()) {
+        await recheckAt(elapsed - 1000);
+        expect(telegram.messageReads).toBe(2 * index);
         await recheckAt(elapsed);
         expect(telegram.messageReads).toBe(2 * (index + 1));
         await recheckAt(elapsed + 1000);
@@ -1085,13 +1102,13 @@ describe('cold start catch-up', () => {
     it('reads once for a schedule that passed during downtime, then waits for what is left', async () => {
       await lose13And14();
 
-      await recheckAt(RECHECK_TIMES[2] + 1000);
+      await recheckAt(RECHECK_TIMES[1] + 1000);
       expect(telegram.messageReads).toBe(2);
 
-      await recheckAt(RECHECK_TIMES[2] + 2000);
+      await recheckAt(RECHECK_TIMES[1] + 2000);
       expect(telegram.messageReads).toBe(2);
 
-      await recheckAt(RECHECK_TIMES[3]);
+      await recheckAt(RECHECK_TIMES[2]);
       expect(telegram.messageReads).toBe(4);
     });
 
@@ -1122,8 +1139,8 @@ describe('cold start catch-up', () => {
       arriveInChannel(11, 500);
       await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([11]));
 
-      deliverLive({ _: 'updateDeleteChannelMessages', channelId: BARE_CHANNEL_ID, messages: [11], pts: 501, ptsCount: 1 });
-      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([]));
+      namedDeletedByDifference(11);
+      expect(archivedIds(CHANNEL_ID)).toEqual([]);
       queuedAt = Date.now();
       await recheckAt(RECHECK_TIMES[0]);
 
@@ -1136,8 +1153,7 @@ describe('cold start catch-up', () => {
       arriveInChannel(11, 500);
       await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([11]));
 
-      deliverLive({ _: 'updateDeleteChannelMessages', channelId: BARE_CHANNEL_ID, messages: [11], pts: 501, ptsCount: 1 });
-      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([]));
+      namedDeletedByDifference(11);
       queuedAt = Date.now();
       for (const elapsed of RECHECK_TIMES) {
         await recheckAt(elapsed);
@@ -1147,18 +1163,108 @@ describe('cold start catch-up', () => {
       expect(queuedIds()).toEqual([]);
     });
 
+    it('takes a delete Telegram pushes at its word and reads nothing', async () => {
+      telegram.history.set(BARE_CHANNEL_ID, history(11));
+      await startAtCursor(10);
+      arriveInChannel(11, 500);
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([11]));
+
+      pushedDelete([11], 501);
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([]));
+      queuedAt = Date.now();
+      for (const elapsed of RECHECK_TIMES) {
+        await recheckAt(elapsed);
+      }
+
+      expect(queuedIds()).toEqual([]);
+      expect(telegram.messageReads).toBe(0);
+      expect(archivedIds(CHANNEL_ID)).toEqual([]);
+    });
+
+    it.each([
+      ['one of them', [13], [14]],
+      ['all of them', [13, 14], []],
+    ])('stops checking %s when Telegram then pushes the delete', async (_, deleted, left) => {
+      await lose13And14();
+      telegram.history.set(BARE_CHANNEL_ID, history(11, 12, 13, 14, 15));
+
+      pushedDelete(deleted, 504 + deleted.length);
+      await vi.waitFor(() => expect(queuedIds()).toEqual(left));
+      await recheckAt(RECHECK_TIMES[0]);
+
+      expect(telegram.messageReads).toBe(left.length);
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, ...left, 15]);
+    });
+
+    it('takes back nothing Telegram pushes as deleted during a read', async () => {
+      await lose13And14();
+      telegram.history.set(BARE_CHANNEL_ID, history(11, 12, 13, 14, 15));
+      const { messageSyncService, telegramClient } = running;
+      const read = telegramClient.getMessageById.bind(telegramClient);
+      vi.spyOn(telegramClient, 'getMessageById').mockImplementation(async (channelId, messageId) => {
+        const message = await read(channelId, messageId);
+        if (messageId === 13) {
+          messageSyncService._handleDeleteMessage({
+            channelId: CHANNEL_ID,
+            messageIds: [13],
+            raw: { ptsCount: 1 },
+          });
+        }
+        return message;
+      });
+
+      await recheckAt(RECHECK_TIMES[0]);
+
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 14, 15]);
+      expect(queuedIds()).toEqual([]);
+    });
+
+    it('reads once and lets go of a row left by a longer schedule', async () => {
+      await lose13And14();
+      telegram.history.set(BARE_CHANNEL_ID, history(11, 12, 13, 15));
+      running.messageSyncService.db
+        .prepare('UPDATE messages_to_recheck SET attempts = ?')
+        .run(RECHECK_TIMES.length + 1);
+
+      await recheckAt(RECHECK_TIMES.at(-1) + 1000);
+
+      expect(telegram.messageReads).toBe(2);
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 13, 15]);
+      expect(queuedIds()).toEqual([]);
+    });
+
+    it('reads now a row left by a longer schedule, then waits for the last check', async () => {
+      await lose13And14();
+      running.messageSyncService.db
+        .prepare('UPDATE messages_to_recheck SET attempts = ?')
+        .run(RECHECK_TIMES.length + 1);
+
+      await recheckAt(RECHECK_TIMES[1] + 1000);
+      expect(telegram.messageReads).toBe(2);
+      expect(queuedIds()).toEqual([13, 14]);
+
+      await recheckAt(RECHECK_TIMES[1] + 2000);
+      expect(telegram.messageReads).toBe(2);
+
+      await recheckAt(RECHECK_TIMES[2]);
+      expect(telegram.messageReads).toBe(4);
+      expect(queuedIds()).toEqual([]);
+    });
+
+    it('reads again a delete that does not say how it arrived', async () => {
+      await startAtCursor(10);
+
+      running.messageSyncService._handleDeleteMessage({ channelId: CHANNEL_ID, messageIds: [9] });
+
+      expect(queuedIds()).toEqual([9]);
+    });
+
     it('does not check deletes of messages far below the cursor', async () => {
       await startAtCursor(500);
 
-      deliverLive({
-        _: 'updateDeleteChannelMessages',
-        channelId: BARE_CHANNEL_ID,
-        messages: [50, 400, 401],
-        pts: 500,
-        ptsCount: 1,
-      });
+      namedDeletedByDifference(50, 400, 401);
 
-      await vi.waitFor(() => expect(queuedIds()).toEqual([401]));
+      expect(queuedIds()).toEqual([401]);
     });
 
     it('does not check deletes in a chat with no cursor yet', async () => {
@@ -1167,7 +1273,7 @@ describe('cold start catch-up', () => {
         .prepare('UPDATE channels SET last_message_id = NULL WHERE channel_id = ?')
         .run(CHANNEL_ID);
 
-      messageSyncService._handleDeleteMessage({ channelId: CHANNEL_ID, messageIds: [5] });
+      namedDeletedByDifference(5);
 
       expect(queuedIds()).toEqual([]);
     });
@@ -1185,8 +1291,8 @@ describe('cold start catch-up', () => {
       expect(queuedIds()).toEqual([]);
       expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 15]);
 
-      deliverLive({ _: 'updateDeleteChannelMessages', channelId: BARE_CHANNEL_ID, messages: [12], pts: 505, ptsCount: 1 });
-      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([11, 15]));
+      namedDeletedByDifference(12);
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 15]);
       expect(queuedIds()).toEqual([]);
     });
 
@@ -1212,7 +1318,7 @@ describe('cold start catch-up', () => {
       vi.spyOn(telegramClient, 'getMessageById').mockImplementation(async (channelId, messageId) => {
         const message = await read(channelId, messageId);
         if (messageId === 13) {
-          messageSyncService._handleDeleteMessage({ channelId: CHANNEL_ID, messageIds: [13] });
+          namedDeletedByDifference(13);
         }
         return message;
       });
@@ -1233,7 +1339,7 @@ describe('cold start catch-up', () => {
       vi.spyOn(telegramClient, 'getMessageById').mockImplementation(async (channelId, messageId) => {
         const message = await read(channelId, messageId);
         if (messageId === 13) {
-          messageSyncService._handleDeleteMessage({ channelId: CHANNEL_ID, messageIds: [13] });
+          namedDeletedByDifference(13);
         }
         return message;
       });
@@ -1248,7 +1354,7 @@ describe('cold start catch-up', () => {
       await lose13And14();
       await recheckAt(RECHECK_TIMES[0]);
       await recheckAt(RECHECK_TIMES[1]);
-      running.messageSyncService._handleDeleteMessage({ channelId: CHANNEL_ID, messageIds: [13, 14] });
+      namedDeletedByDifference(13, 14);
       queuedAt = Date.now();
       telegram.messageReads = 0;
 

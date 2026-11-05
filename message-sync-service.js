@@ -22,7 +22,7 @@ const JOB_STATUS = {
 const LONG_OUTAGE_MS = 5 * 60 * 1000;
 const PERIODIC_CHECK_INTERVAL_MS = 30 * 1000;
 // How long after a message was named deleted or skipped to read it again.
-const RECHECK_AFTER_MS = [30 * 1000, 2 * 60 * 1000, 10 * 60 * 1000, 30 * 60 * 1000, 2 * 60 * 60 * 1000];
+const RECHECK_AFTER_MS = [60 * 1000, 10 * 60 * 1000, 60 * 60 * 1000];
 // A message Telegram hides is a fresh one, so ids further than this from the cursor or
 // from the next message, and those next to older messages, are not checked.
 const RECHECK_MAX_ID_DISTANCE = 100;
@@ -3780,7 +3780,16 @@ export default class MessageSyncService {
         DELETE FROM message_media
         WHERE channel_id = ? AND message_id IN (${placeholders})
       `).run(channelId, ...ids);
-      this._queueRecheckOfDeleted(channelId, ids);
+      // Telegram pushes a delete with a real ptsCount, and no message named that way has stayed.
+      // Only differences, always with ptsCount 0, have named messages that turned out real.
+      if (update.raw?.ptsCount > 0) {
+        this.db.prepare(`
+          DELETE FROM messages_to_recheck
+          WHERE channel_id = ? AND message_id IN (${placeholders})
+        `).run(channelId, ...ids);
+      } else {
+        this._queueRecheckOfDeleted(channelId, ids);
+      }
       return;
     }
 
@@ -3889,7 +3898,7 @@ export default class MessageSyncService {
   // In a burst of updates mtcute asks for a channel difference. Telegram can name fresh,
   // real messages as deleted in it and hide them from history for a while, and mtcute
   // then drops the copies it already received. Nothing announces them when they show up,
-  // so whatever Telegram calls deleted, or a page of history skips, is read again later.
+  // so whatever a difference calls deleted, or a page of history skips, is read again later.
   _queueRecheck(channelId, messageIds) {
     if (this._getChannel(channelId)?.sync_enabled !== 1) {
       return;
@@ -3968,7 +3977,7 @@ export default class MessageSyncService {
       const now = Date.now();
       const due = this.db.prepare(`
         SELECT channel_id, message_id, queued_at, attempts FROM messages_to_recheck
-      `).all().filter((row) => now - row.queued_at >= RECHECK_AFTER_MS[row.attempts]);
+      `).all().filter((row) => now - row.queued_at >= (RECHECK_AFTER_MS[row.attempts] ?? 0));
       for (const row of due) {
         if (!await this._recheckMessage(row)) {
           return;
