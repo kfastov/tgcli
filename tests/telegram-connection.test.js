@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { Long, tl } from '@mtcute/core';
+import { Long, MtPeerNotFoundError, tl } from '@mtcute/core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createTelegramConnector } from '../core/telegram-connection.js';
@@ -102,6 +102,7 @@ class FakeTelegram {
     this.dialogsGate = null;
     this.failNext = new Map();
     this.archivedDialogs = [];
+    this.messageReads = 0;
   }
 
   arriveWhileOffline(message) {
@@ -140,6 +141,18 @@ class FakeTelegram {
       case 'messages.getHistory':
         await this.historyGate?.promise;
         return this._historySlice(request);
+      case 'channels.getMessages': {
+        this.messageReads += request.id.length;
+        const known = this.history.get(request.channel.channelId) ?? [];
+        return {
+          _: 'messages.channelMessages',
+          messages: request.id.map(({ id }) => (
+            known.find((message) => message.id === id) ?? { _: 'messageEmpty', id }
+          )),
+          count: known.length,
+          ...PEERS,
+        };
+      }
       default:
         throw new Error(`FakeTelegram has no answer for ${request._}`);
     }
@@ -951,6 +964,466 @@ describe('cold start catch-up', () => {
       expect(recordedGap(FRIEND_CHAT_ID)).toBeNull();
       expect(cursor(FRIEND_CHAT_ID)).toBe(50);
       expect(telegram.historyPages).toBe(0);
+    });
+  });
+
+  // As seen on a busy forum: updates arrive out of order, so mtcute asks for a channel
+  // difference. Telegram answers that some of those messages were deleted and hides
+  // them from history as well, and mtcute drops the copies it already received. They
+  // show up in history about half a minute later, with nothing to announce them.
+  describe('when a channel difference names real messages as deleted', () => {
+    const RECHECK_TIMES = [30, 120, 600, 1800, 7200].map((seconds) => seconds * 1000);
+    let queuedAt;
+
+    function history(...ids) {
+      return ids.map(channelMessage);
+    }
+
+    function arriveInChannel(id, pts) {
+      deliverLive({ _: 'updateNewChannelMessage', message: channelMessage(id), pts, ptsCount: 1 });
+    }
+
+    async function startAtCursor(id) {
+      telegram.dialogs = [];
+      const server = startServer();
+      const resumed = vi.spyOn(server.messageSyncService, 'resumePendingJobs');
+      seedCursor(server.messageSyncService, CHANNEL_ID, id);
+      await server.ensureConnected();
+      await vi.waitFor(() => expect(resumed).toHaveBeenCalled());
+      await vi.waitFor(async () => expect(await storedPts()).toBe(telegram.pts));
+      return server;
+    }
+
+    // 13 and 14 reach mtcute, then the difference calls them deleted and history has
+    // not got them, so the fill started by the jump to 15 finds nothing between.
+    async function lose13And14() {
+      telegram.history.set(BARE_CHANNEL_ID, history(11, 12, 15));
+      const server = await startAtCursor(10);
+      arriveInChannel(11, 500);
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([11]));
+
+      telegram.channelDifference = {
+        _: 'updates.channelDifference',
+        final: true,
+        pts: 504,
+        newMessages: history(12, 15),
+        otherUpdates: [
+          { _: 'updateDeleteChannelMessages', channelId: BARE_CHANNEL_ID, messages: [13, 14], pts: 504, ptsCount: 0 },
+        ],
+        ...PEERS,
+      };
+      arriveInChannel(13, 502);
+      arriveInChannel(14, 503);
+      arriveInChannel(15, 504);
+
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 15]));
+      await vi.waitFor(() => expect(recordedGap(CHANNEL_ID)).toBeNull());
+      queuedAt = Date.now();
+      return server;
+    }
+
+    async function recheckAt(elapsedMs) {
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(queuedAt + elapsedMs);
+      try {
+        await running.messageSyncService._recheckDueMessages();
+      } finally {
+        clock.mockRestore();
+      }
+    }
+
+    function queuedIds() {
+      return running.messageSyncService.db
+        .prepare('SELECT message_id FROM messages_to_recheck ORDER BY message_id')
+        .all()
+        .map((row) => row.message_id);
+    }
+
+    it('archives them once Telegram shows them again, leaving the cursor alone', async () => {
+      await lose13And14();
+      expect(queuedIds()).toEqual([13, 14]);
+
+      telegram.history.set(BARE_CHANNEL_ID, history(11, 12, 13, 14, 15));
+      await recheckAt(RECHECK_TIMES[0]);
+
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 13, 14, 15]);
+      expect(queuedIds()).toEqual([]);
+      expect(cursor(CHANNEL_ID)).toBe(15);
+    });
+
+    it('keeps looking while Telegram still hides them', async () => {
+      await lose13And14();
+
+      await recheckAt(RECHECK_TIMES[0]);
+      await recheckAt(RECHECK_TIMES[1]);
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 15]);
+
+      telegram.history.set(BARE_CHANNEL_ID, history(11, 12, 13, 14, 15));
+      await recheckAt(RECHECK_TIMES[2]);
+
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 13, 14, 15]);
+    });
+
+    it('reads only when a check is due, then lets go of a message that stays deleted', async () => {
+      await lose13And14();
+
+      await recheckAt(RECHECK_TIMES[0] - 1000);
+      expect(telegram.messageReads).toBe(0);
+
+      for (const [index, elapsed] of RECHECK_TIMES.entries()) {
+        await recheckAt(elapsed);
+        expect(telegram.messageReads).toBe(2 * (index + 1));
+        await recheckAt(elapsed + 1000);
+        expect(telegram.messageReads).toBe(2 * (index + 1));
+      }
+
+      expect(queuedIds()).toEqual([]);
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 15]);
+      await recheckAt(RECHECK_TIMES.at(-1) * 10);
+      expect(telegram.messageReads).toBe(2 * RECHECK_TIMES.length);
+    });
+
+    it('reads once for a schedule that passed during downtime, then waits for what is left', async () => {
+      await lose13And14();
+
+      await recheckAt(RECHECK_TIMES[2] + 1000);
+      expect(telegram.messageReads).toBe(2);
+
+      await recheckAt(RECHECK_TIMES[2] + 2000);
+      expect(telegram.messageReads).toBe(2);
+
+      await recheckAt(RECHECK_TIMES[3]);
+      expect(telegram.messageReads).toBe(4);
+    });
+
+    it('lets go after one read when the whole schedule passed during downtime', async () => {
+      await lose13And14();
+
+      await recheckAt(RECHECK_TIMES.at(-1) + 1000);
+
+      expect(telegram.messageReads).toBe(2);
+      expect(queuedIds()).toEqual([]);
+    });
+
+    it('survives a restart', async () => {
+      await lose13And14();
+      await stopServer();
+
+      telegram.history.set(BARE_CHANNEL_ID, history(11, 12, 13, 14, 15));
+      startServer();
+      await running.ensureConnected();
+      await recheckAt(RECHECK_TIMES[0]);
+
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 13, 14, 15]);
+    });
+
+    it('restores a row that a false delete removed', async () => {
+      telegram.history.set(BARE_CHANNEL_ID, history(11));
+      await startAtCursor(10);
+      arriveInChannel(11, 500);
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([11]));
+
+      deliverLive({ _: 'updateDeleteChannelMessages', channelId: BARE_CHANNEL_ID, messages: [11], pts: 501, ptsCount: 1 });
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([]));
+      queuedAt = Date.now();
+      await recheckAt(RECHECK_TIMES[0]);
+
+      expect(archivedIds(CHANNEL_ID)).toEqual([11]);
+    });
+
+    it('keeps a really deleted message out of the archive', async () => {
+      telegram.history.set(BARE_CHANNEL_ID, []);
+      await startAtCursor(10);
+      arriveInChannel(11, 500);
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([11]));
+
+      deliverLive({ _: 'updateDeleteChannelMessages', channelId: BARE_CHANNEL_ID, messages: [11], pts: 501, ptsCount: 1 });
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([]));
+      queuedAt = Date.now();
+      for (const elapsed of RECHECK_TIMES) {
+        await recheckAt(elapsed);
+      }
+
+      expect(archivedIds(CHANNEL_ID)).toEqual([]);
+      expect(queuedIds()).toEqual([]);
+    });
+
+    it('does not check deletes of messages far below the cursor', async () => {
+      await startAtCursor(500);
+
+      deliverLive({
+        _: 'updateDeleteChannelMessages',
+        channelId: BARE_CHANNEL_ID,
+        messages: [50, 400, 401],
+        pts: 500,
+        ptsCount: 1,
+      });
+
+      await vi.waitFor(() => expect(queuedIds()).toEqual([401]));
+    });
+
+    it('does not check deletes in a chat with no cursor yet', async () => {
+      const { messageSyncService } = await startAtCursor(10);
+      messageSyncService.db
+        .prepare('UPDATE channels SET last_message_id = NULL WHERE channel_id = ?')
+        .run(CHANNEL_ID);
+
+      messageSyncService._handleDeleteMessage({ channelId: CHANNEL_ID, messageIds: [5] });
+
+      expect(queuedIds()).toEqual([]);
+    });
+
+    it('does not check deletes in a chat with sync off, and forgets one turned off later', async () => {
+      await lose13And14();
+      running.messageSyncService.db
+        .prepare('UPDATE channels SET sync_enabled = 0 WHERE channel_id = ?')
+        .run(CHANNEL_ID);
+
+      telegram.history.set(BARE_CHANNEL_ID, history(11, 12, 13, 14, 15));
+      await recheckAt(RECHECK_TIMES[0]);
+
+      expect(telegram.messageReads).toBe(0);
+      expect(queuedIds()).toEqual([]);
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 15]);
+
+      deliverLive({ _: 'updateDeleteChannelMessages', channelId: BARE_CHANNEL_ID, messages: [12], pts: 505, ptsCount: 1 });
+      await vi.waitFor(() => expect(archivedIds(CHANNEL_ID)).toEqual([11, 15]));
+      expect(queuedIds()).toEqual([]);
+    });
+
+    it('spends no attempt while Telegram is out of reach', async () => {
+      await lose13And14();
+      running.messageSyncService.disconnectedAt = Date.now();
+
+      await recheckAt(RECHECK_TIMES[0]);
+      expect(telegram.messageReads).toBe(0);
+
+      running.messageSyncService.disconnectedAt = null;
+      telegram.history.set(BARE_CHANNEL_ID, history(11, 12, 13, 14, 15));
+      await recheckAt(RECHECK_TIMES[0]);
+
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 13, 14, 15]);
+    });
+
+    it('takes back nothing deleted during a read, and starts the schedule again', async () => {
+      await lose13And14();
+      telegram.history.set(BARE_CHANNEL_ID, history(11, 12, 13, 14, 15));
+      const { messageSyncService, telegramClient } = running;
+      const read = telegramClient.getMessageById.bind(telegramClient);
+      vi.spyOn(telegramClient, 'getMessageById').mockImplementation(async (channelId, messageId) => {
+        const message = await read(channelId, messageId);
+        if (messageId === 13) {
+          messageSyncService._handleDeleteMessage({ channelId: CHANNEL_ID, messageIds: [13] });
+        }
+        return message;
+      });
+
+      await recheckAt(RECHECK_TIMES[0]);
+
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 14, 15]);
+      expect(queuedIds()).toEqual([13]);
+      expect(messageSyncService.db.prepare('SELECT attempts FROM messages_to_recheck').get().attempts).toBe(0);
+    });
+
+    it('takes back nothing deleted during a read after the cursor moved far away', async () => {
+      await lose13And14();
+      telegram.history.set(BARE_CHANNEL_ID, history(11, 12, 13, 14, 15));
+      const { messageSyncService, telegramClient } = running;
+      messageSyncService._updateChannelCursors(CHANNEL_ID, { lastMessageId: 500 });
+      const read = telegramClient.getMessageById.bind(telegramClient);
+      vi.spyOn(telegramClient, 'getMessageById').mockImplementation(async (channelId, messageId) => {
+        const message = await read(channelId, messageId);
+        if (messageId === 13) {
+          messageSyncService._handleDeleteMessage({ channelId: CHANNEL_ID, messageIds: [13] });
+        }
+        return message;
+      });
+
+      await recheckAt(RECHECK_TIMES[0]);
+
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 14, 15]);
+      expect(queuedIds()).toEqual([13]);
+    });
+
+    it('gives a message named again the full schedule', async () => {
+      await lose13And14();
+      await recheckAt(RECHECK_TIMES[0]);
+      await recheckAt(RECHECK_TIMES[1]);
+      running.messageSyncService._handleDeleteMessage({ channelId: CHANNEL_ID, messageIds: [13, 14] });
+      queuedAt = Date.now();
+      telegram.messageReads = 0;
+
+      for (const elapsed of RECHECK_TIMES) {
+        await recheckAt(elapsed);
+      }
+
+      expect(telegram.messageReads).toBe(2 * RECHECK_TIMES.length);
+    });
+
+    it('spends no attempt on a rate limit, and stops reading until the next check', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      await lose13And14();
+      telegram.failNext.set(
+        'channels.getMessages',
+        tl.RpcError.fromTl({ _: 'rpc_error', errorCode: 420, errorMessage: 'FLOOD_WAIT_100' }),
+      );
+
+      await recheckAt(RECHECK_TIMES[0]);
+      expect(telegram.messageReads).toBe(0);
+      expect(queuedIds()).toEqual([13, 14]);
+
+      telegram.history.set(BARE_CHANNEL_ID, history(11, 12, 13, 14, 15));
+      await recheckAt(RECHECK_TIMES[0]);
+
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 13, 14, 15]);
+    });
+
+    it.each([
+      ['an expired session', new Error('Not logged in')],
+      ['a 401', tl.RpcError.fromTl({ _: 'rpc_error', errorCode: 401, errorMessage: 'AUTH_KEY_UNREGISTERED' })],
+      ['a failure on the side of Telegram', tl.RpcError.fromTl({ _: 'rpc_error', errorCode: 500, errorMessage: 'INTERNAL' })],
+    ])('spends no attempt on %s', async (_, failure) => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      await lose13And14();
+      const read = vi.spyOn(running.telegramClient, 'getMessageById').mockRejectedValue(failure);
+
+      for (const elapsed of RECHECK_TIMES) {
+        await recheckAt(elapsed);
+      }
+
+      expect(queuedIds()).toEqual([13, 14]);
+      read.mockRestore();
+      telegram.history.set(BARE_CHANNEL_ID, history(11, 12, 13, 14, 15));
+      await recheckAt(RECHECK_TIMES[0]);
+
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 13, 14, 15]);
+    });
+
+    it('does not let a read that keeps failing hold up the next message', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      await lose13And14();
+      telegram.history.set(BARE_CHANNEL_ID, history(11, 12, 13, 14, 15));
+      const { telegramClient } = running;
+      const read = telegramClient.getMessageById.bind(telegramClient);
+      vi.spyOn(telegramClient, 'getMessageById').mockImplementation(async (channelId, messageId) => {
+        if (messageId === 13) {
+          throw new TypeError('broken');
+        }
+        return read(channelId, messageId);
+      });
+
+      await recheckAt(RECHECK_TIMES[0]);
+
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 14, 15]);
+      expect(queuedIds()).toEqual([13]);
+    });
+
+    it('gives up on a read that keeps failing for a day of running', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      await lose13And14();
+      vi.spyOn(running.telegramClient, 'getMessageById').mockRejectedValue(new Error('broken'));
+      const day = 24 * 60 * 60 * 1000;
+
+      await recheckAt(day - 60 * 1000);
+      expect(queuedIds()).toEqual([13, 14]);
+
+      await recheckAt(day);
+      expect(queuedIds()).toEqual([]);
+    });
+
+    it('counts that day from the start of the server, not from the queueing', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      await lose13And14();
+      const day = 24 * 60 * 60 * 1000;
+      queuedAt -= 10 * day;
+      running.messageSyncService.db.prepare('UPDATE messages_to_recheck SET queued_at = ?').run(queuedAt);
+      vi.spyOn(running.telegramClient, 'getMessageById').mockRejectedValue(new Error('broken'));
+
+      await recheckAt(10 * day);
+
+      expect(queuedIds()).toEqual([13, 14]);
+    });
+
+    it.each([
+      [400, 'CHANNEL_PRIVATE'],
+      [403, 'CHAT_ADMIN_REQUIRED'],
+      [406, 'CHANNEL_PRIVATE'],
+    ])('spends one attempt when Telegram refuses the chat with %i, and goes on to the next message', async (errorCode, errorMessage) => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      await lose13And14();
+      telegram.failNext.set(
+        'channels.getMessages',
+        tl.RpcError.fromTl({ _: 'rpc_error', errorCode, errorMessage }),
+      );
+      telegram.history.set(BARE_CHANNEL_ID, history(11, 12, 13, 14, 15));
+
+      await recheckAt(RECHECK_TIMES[0]);
+
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 14, 15]);
+      expect(queuedIds()).toEqual([13]);
+
+      await recheckAt(RECHECK_TIMES[0]);
+      expect(queuedIds()).toEqual([13]);
+
+      await recheckAt(RECHECK_TIMES[1]);
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 13, 14, 15]);
+    });
+
+    it('lets go of a message in a chat it can no longer resolve', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      await lose13And14();
+      const { telegramClient } = running;
+      vi.spyOn(telegramClient, 'getMessageById').mockRejectedValue(new MtPeerNotFoundError('not cached'));
+
+      for (const elapsed of RECHECK_TIMES) {
+        await recheckAt(elapsed);
+      }
+
+      expect(queuedIds()).toEqual([]);
+    });
+
+    it('writes nothing when the server stops during a read', async () => {
+      await lose13And14();
+      telegram.history.set(BARE_CHANNEL_ID, history(11, 12, 13, 14, 15));
+      const { messageSyncService, telegramClient } = running;
+      const read = telegramClient.getMessageById.bind(telegramClient);
+      vi.spyOn(telegramClient, 'getMessageById').mockImplementation(async (...args) => {
+        const message = await read(...args);
+        messageSyncService.stopRequested = true;
+        return message;
+      });
+
+      await recheckAt(RECHECK_TIMES[0]);
+
+      expect(archivedIds(CHANNEL_ID)).toEqual([11, 12, 15]);
+      expect(queuedIds()).toEqual([13, 14]);
+      messageSyncService.stopRequested = false;
+    });
+
+    it('is part of the periodic checks', async () => {
+      const { messageSyncService } = await startAtCursor(10);
+      const recheck = vi.spyOn(messageSyncService, '_recheckDueMessages').mockResolvedValue();
+      clearInterval(messageSyncService.periodicCheckTimer);
+      vi.useFakeTimers();
+      try {
+        messageSyncService._startPeriodicChecks();
+        await vi.advanceTimersByTimeAsync(30 * 1000);
+        expect(recheck).toHaveBeenCalledTimes(1);
+      } finally {
+        clearInterval(messageSyncService.periodicCheckTimer);
+        vi.useRealTimers();
+      }
+    });
+
+    it('never runs two passes at once', async () => {
+      await lose13And14();
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(queuedAt + RECHECK_TIMES[0]);
+      await Promise.all([
+        running.messageSyncService._recheckDueMessages(),
+        running.messageSyncService._recheckDueMessages(),
+      ]);
+      clock.mockRestore();
+
+      expect(telegram.messageReads).toBe(2);
     });
   });
 

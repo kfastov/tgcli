@@ -766,6 +766,143 @@ describe('catching up on messages newer than the cursor', () => {
     });
   });
 
+  describe('ids a page of history skipped', () => {
+    function queued() {
+      return service.db
+        .prepare('SELECT message_id FROM messages_to_recheck ORDER BY message_id')
+        .all()
+        .map((row) => row.message_id);
+    }
+
+    function seedAt(channelId, id) {
+      service.upsertChannels([{ id: channelId, title: 'Group', type: 'channel' }]);
+      service._updateChannelCursors(channelId, { lastMessageId: id, oldestMessageId: id });
+    }
+
+    function at(messageId, secondsLater = 0) {
+      vi.spyOn(Date, 'now').mockReturnValue((1700000000 + messageId + secondsLater) * 1000);
+    }
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('remembers those next to fresh messages', async () => {
+      seedAt(CHANNEL_ID, 10);
+      historyIds = [11, 14, 15, 18];
+      at(18);
+
+      await service._syncNewerMessages(CHANNEL_ID);
+
+      expect(queued()).toEqual([12, 13, 16, 17]);
+    });
+
+    it('leaves out those next to messages older than ten minutes', async () => {
+      seedAt(CHANNEL_ID, 10);
+      historyIds = [13, 16];
+      at(16, 10 * 60 - 2);
+
+      await service._syncNewerMessages(CHANNEL_ID);
+
+      expect(queued()).toEqual([14, 15]);
+    });
+
+    it('has nothing to remember when ids run in sequence', async () => {
+      seedAt(CHANNEL_ID, 10);
+      historyIds = [11, 12, 13];
+      at(13);
+
+      await service._syncNewerMessages(CHANNEL_ID);
+
+      expect(queued()).toEqual([]);
+    });
+
+    it('leaves out a jump of more than a hundred ids', async () => {
+      seedAt(CHANNEL_ID, 10);
+      historyIds = [110, 212];
+      at(212);
+
+      await service._syncNewerMessages(CHANNEL_ID);
+
+      expect(queued()).toEqual(Array.from({ length: 99 }, (_, index) => 11 + index));
+    });
+
+    it('leaves out everything below the first message of a chat with no cursor', async () => {
+      service.upsertChannels([{ id: CHANNEL_ID, title: 'Group', type: 'channel' }]);
+      historyIds = [50, 53];
+      at(53);
+
+      await service._syncNewerMessages(CHANNEL_ID);
+
+      expect(queued()).toEqual([51, 52]);
+    });
+
+    describe('when a fill ends below the cursor', () => {
+      function openGap(channelId, gapAfter, cursorId) {
+        seedAt(channelId, cursorId);
+        service._setChannelGapStart(channelId, gapAfter);
+      }
+
+      function archive(channelId, id) {
+        service.archiveHistoryMessages(channelId, [{ id, date: 1700000000 + id, text: 'kept' }]);
+      }
+
+      it('remembers what history did not show up to the cursor', async () => {
+        openGap(CHANNEL_ID, 12, 16);
+        archive(CHANNEL_ID, 16);
+        historyIds = [13];
+        at(16);
+
+        await service._syncNewerMessages(CHANNEL_ID);
+
+        expect(queued()).toEqual([14, 15]);
+        expect(service._getChannel(CHANNEL_ID).gap_after_message_id).toBeNull();
+      });
+
+      it('remembers them when history shows nothing at all', async () => {
+        openGap(CHANNEL_ID, 12, 15);
+        archive(CHANNEL_ID, 14);
+        historyIds = [];
+        at(15);
+
+        await service._syncNewerMessages(CHANNEL_ID);
+
+        expect(queued()).toEqual([13]);
+      });
+
+      it('leaves out a cursor more than a hundred ids away', async () => {
+        openGap(CHANNEL_ID, 12, 113);
+        historyIds = [];
+        at(113);
+
+        await service._syncNewerMessages(CHANNEL_ID);
+
+        expect(queued()).toEqual([]);
+      });
+
+      it('leaves out chats that share ids across the account', async () => {
+        openGap('42', 12, 15);
+        historyIds = [];
+        at(15);
+
+        await service._syncNewerMessages('42');
+
+        expect(queued()).toEqual([]);
+      });
+    });
+
+    it('leaves out chats that share ids across the account', async () => {
+      const privateChatId = '42';
+      seedAt(privateChatId, 10);
+      historyIds = [11, 14];
+      at(14);
+
+      await service._syncNewerMessages(privateChatId);
+
+      expect(queued()).toEqual([]);
+    });
+  });
+
   describe('queueResyncJob', () => {
     beforeEach(() => {
       vi.spyOn(service, 'processQueue').mockResolvedValue();

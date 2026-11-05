@@ -5,6 +5,9 @@ Versions before the sent-message fix did not archive messages sent through tgcli
 sync cursor past them for good. Versions before the realtime fix also lost single
 messages in channels and supergroups while the server ran, with no sign in the
 archive, because a min copy of a chat overwrote its access hash in the session.
+Versions before the recheck fix lost fresh messages in busy channels too: Telegram can
+name real messages as deleted in a channel difference and hide them from history for a
+while, and nothing announces them when they show up.
 `scripts/recover-archive-gaps.js` writes back whatever a chat's history has and the
 archive does not.
 

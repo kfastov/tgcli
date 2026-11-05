@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import { setTimeout as delay } from 'timers/promises';
-import { Message, PeersIndex, _messageMediaFromTl } from '@mtcute/core';
+import { Message, MtPeerNotFoundError, PeersIndex, _messageMediaFromTl } from '@mtcute/core';
 import { normalizeChannelId, summarizeMedia } from './telegram-client.js';
 import { resolveStoreDir, resolveStorePaths } from './core/store.js';
 import { parseRequiredWaitSeconds } from './core/send-utils.js';
@@ -21,6 +21,14 @@ const JOB_STATUS = {
 // Out of reach for this long, Telegram's catch-up is no longer trusted to be complete.
 const LONG_OUTAGE_MS = 5 * 60 * 1000;
 const PERIODIC_CHECK_INTERVAL_MS = 30 * 1000;
+// How long after a message was named deleted or skipped to read it again.
+const RECHECK_AFTER_MS = [30 * 1000, 2 * 60 * 1000, 10 * 60 * 1000, 30 * 60 * 1000, 2 * 60 * 60 * 1000];
+// A message Telegram hides is a fresh one, so ids further than this from the cursor or
+// from the next message, and those next to older messages, are not checked.
+const RECHECK_MAX_ID_DISTANCE = 100;
+const RECHECK_RECENT_MS = 10 * 60 * 1000;
+// A read that keeps failing for this long, on a running server, is not going to work.
+const RECHECK_GIVE_UP_MS = 24 * 60 * 60 * 1000;
 const PERIODIC_RECONCILE_MS = 60 * 60 * 1000;
 const CONNECTION_CHECK_TIMEOUT_MS = 20 * 1000;
 const RETRY_BASE_MS = 60 * 1000;
@@ -204,6 +212,18 @@ const TAG_RULES = [
 
 function normalizeChannelKey(channelId) {
   return String(normalizeChannelId(channelId));
+}
+
+// Only in channels and supergroups, private chats and basic groups share them.
+function hasSequentialIds(channelId) {
+  return Number(channelId) <= MAX_MARKED_CHANNEL_ID;
+}
+
+// Telegram refusing this chat will not change soon, unlike a dropped connection, an
+// expired session (401) or a failure of its own (5xx), which say nothing about the message.
+function isRefusedRead(error) {
+  const code = error?.code;
+  return (code >= 400 && code < 500 && code !== 401) || error instanceof MtPeerNotFoundError;
 }
 
 // mtcute builds the message of an updateShortSentMessage from the response alone,
@@ -559,6 +579,7 @@ export default class MessageSyncService {
     this.interBatchDelayMs = options.interBatchDelayMs || 1000;
     this.processing = false;
     this.stopRequested = false;
+    this.recheckingMessages = false;
     this.realtimeActive = false;
     this.realtimeHandlers = null;
     this.unsubscribeChannelTooLong = null;
@@ -766,6 +787,16 @@ export default class MessageSyncService {
       CREATE TABLE IF NOT EXISTS sent_messages_to_refetch (
         channel_id TEXT NOT NULL,
         message_id INTEGER NOT NULL,
+        PRIMARY KEY (channel_id, message_id)
+      );
+    `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS messages_to_recheck (
+        channel_id TEXT NOT NULL,
+        message_id INTEGER NOT NULL,
+        queued_at INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (channel_id, message_id)
       );
     `);
@@ -2326,11 +2357,13 @@ export default class MessageSyncService {
 
   _startPeriodicChecks() {
     this.lastCheckAt = Date.now();
+    this.periodicChecksStartedAt = this.lastCheckAt;
     this.periodicCheckTimer = setInterval(() => {
       this._checkForSleep();
       void this._confirmConnection();
       this._retryErroredJobsWhenDue();
       this._reconcileWhenDue();
+      void this._recheckDueMessages();
     }, PERIODIC_CHECK_INTERVAL_MS);
     this.periodicCheckTimer.unref?.();
   }
@@ -3747,6 +3780,7 @@ export default class MessageSyncService {
         DELETE FROM message_media
         WHERE channel_id = ? AND message_id IN (${placeholders})
       `).run(channelId, ...ids);
+      this._queueRecheckOfDeleted(channelId, ids);
       return;
     }
 
@@ -3852,6 +3886,165 @@ export default class MessageSyncService {
     }
   }
 
+  // In a burst of updates mtcute asks for a channel difference. Telegram can name fresh,
+  // real messages as deleted in it and hide them from history for a while, and mtcute
+  // then drops the copies it already received. Nothing announces them when they show up,
+  // so whatever Telegram calls deleted, or a page of history skips, is read again later.
+  _queueRecheck(channelId, messageIds) {
+    if (this._getChannel(channelId)?.sync_enabled !== 1) {
+      return;
+    }
+    if (!messageIds.length) {
+      return;
+    }
+    // Named again, a message gets the full schedule again.
+    const queue = this.db.prepare(`
+      INSERT INTO messages_to_recheck (channel_id, message_id, queued_at) VALUES (?, ?, ?)
+      ON CONFLICT (channel_id, message_id) DO UPDATE SET queued_at = excluded.queued_at, attempts = 0
+    `);
+    const now = Date.now();
+    for (const messageId of messageIds) {
+      queue.run(channelId, messageId, now);
+    }
+    console.log(`[sync] Channel ${channelId}: will read ${messageIds.join(', ')} again, in case Telegram is hiding them.`);
+  }
+
+  // One already queued goes back too, however far the cursor has moved: a read of it may
+  // be on its way, with an answer older than this delete.
+  _queueRecheckOfDeleted(channelId, messageIds) {
+    const cursor = this._getChannel(channelId)?.last_message_id;
+    const queued = this.db.prepare(`
+      SELECT 1 FROM messages_to_recheck WHERE channel_id = ? AND message_id = ?
+    `);
+    this._queueRecheck(channelId, messageIds.filter((id) => (
+      (cursor > 0 && id > cursor - RECHECK_MAX_ID_DISTANCE) || queued.get(channelId, id)
+    )));
+  }
+
+  // Without a cursor the ids below a chat's first page are not missing.
+  _queueRecheckOfSkipped(channelId, cursor, messages) {
+    if (!hasSequentialIds(channelId)) {
+      return;
+    }
+    const recentSince = Date.now() - RECHECK_RECENT_MS;
+    const skipped = [];
+    let previous = cursor > 0 ? cursor : messages[0].id;
+    for (const message of messages) {
+      if (message.date * 1000 >= recentSince && message.id - previous <= RECHECK_MAX_ID_DISTANCE) {
+        for (let id = previous + 1; id < message.id; id += 1) {
+          skipped.push(id);
+        }
+      }
+      previous = message.id;
+    }
+    this._queueRecheck(channelId, skipped);
+  }
+
+  // A fill can end below the cursor when history hides the newest messages as well.
+  _queueRecheckUpToCursor(channelId, fromId) {
+    const cursor = this._getChannel(channelId)?.last_message_id;
+    if (!hasSequentialIds(channelId) || !(cursor - fromId <= RECHECK_MAX_ID_DISTANCE)) {
+      return;
+    }
+    const archived = new Set(this.db.prepare(`
+      SELECT message_id FROM messages WHERE channel_id = ? AND message_id > ? AND message_id < ?
+    `).all(channelId, fromId, cursor).map((row) => row.message_id));
+    const missing = [];
+    for (let id = fromId + 1; id < cursor; id += 1) {
+      if (!archived.has(id)) {
+        missing.push(id);
+      }
+    }
+    this._queueRecheck(channelId, missing);
+  }
+
+  async _recheckDueMessages() {
+    // An outage would use up the attempts with nothing learned.
+    if (this.recheckingMessages || this.disconnectedAt !== null) {
+      return;
+    }
+    this.recheckingMessages = true;
+    try {
+      const now = Date.now();
+      const due = this.db.prepare(`
+        SELECT channel_id, message_id, queued_at, attempts FROM messages_to_recheck
+      `).all().filter((row) => now - row.queued_at >= RECHECK_AFTER_MS[row.attempts]);
+      for (const row of due) {
+        if (!await this._recheckMessage(row)) {
+          return;
+        }
+      }
+    } catch (error) {
+      if (!this.stopRequested) {
+        console.error(`[sync] Could not read the queue of messages to check again: ${error?.message ?? error}`);
+      }
+    } finally {
+      this.recheckingMessages = false;
+    }
+  }
+
+  // Returns false when the pass should stop for now.
+  async _recheckMessage({ channel_id: channelId, message_id: messageId, queued_at: queuedAt }) {
+    const forget = () => this.db.prepare(`
+      DELETE FROM messages_to_recheck WHERE channel_id = ? AND message_id = ?
+    `).run(channelId, messageId);
+
+    if (this._getChannel(channelId)?.sync_enabled !== 1) {
+      forget();
+      return true;
+    }
+
+    try {
+      const message = await this.telegramClient.getMessageById(channelId, messageId);
+      if (this.stopRequested) {
+        return false;
+      }
+      const row = this.db.prepare(`
+        SELECT queued_at FROM messages_to_recheck WHERE channel_id = ? AND message_id = ?
+      `).get(channelId, messageId);
+      // Named deleted during the read: this answer may be older than the delete.
+      if (row?.queued_at !== queuedAt) {
+        return true;
+      }
+      if (message) {
+        if (this.archiveHistoryMessages(channelId, [message])) {
+          console.log(`[sync] Channel ${channelId}: message ${messageId} turned out not to be deleted, archived.`);
+        }
+        forget();
+        return true;
+      }
+    } catch (error) {
+      if (this.stopRequested) {
+        return false;
+      }
+      if (parseRequiredWaitSeconds(error) !== null) {
+        console.error(`[sync] Channel ${channelId}: rate limited checking message ${messageId}, will try again.`);
+        return false;
+      }
+      if (!isRefusedRead(error)) {
+        console.error(`[sync] Channel ${channelId}: could not check message ${messageId}: ${error?.message ?? error}`);
+        if (Date.now() - Math.max(queuedAt, this.periodicChecksStartedAt) >= RECHECK_GIVE_UP_MS) {
+          console.error(`[sync] Channel ${channelId}: no longer checking message ${messageId}.`);
+          forget();
+        }
+        return true;
+      }
+      console.error(`[sync] Channel ${channelId}: Telegram refused to show message ${messageId}: ${error.message}`);
+    }
+
+    // Downtime can leave several checks overdue, and one read answers for all of them.
+    const nextAttempt = RECHECK_AFTER_MS.findIndex((afterMs) => Date.now() - queuedAt < afterMs);
+    if (nextAttempt === -1) {
+      console.log(`[sync] Channel ${channelId}: message ${messageId} still not there, no longer checking.`);
+      forget();
+    } else {
+      this.db.prepare(`
+        UPDATE messages_to_recheck SET attempts = ? WHERE channel_id = ? AND message_id = ?
+      `).run(nextAttempt, channelId, messageId);
+    }
+    return true;
+  }
+
   async _syncNewerMessages(channelId) {
     const normalizedId = normalizeChannelKey(channelId);
     const channel = this._getChannel(normalizedId);
@@ -3901,6 +4094,7 @@ export default class MessageSyncService {
       }
 
       const addedCount = this.archiveHistoryMessages(normalizedId, newMessages);
+      this._queueRecheckOfSkipped(normalizedId, lastMessageId, newMessages);
 
       const newest = newMessages[newMessages.length - 1];
       const oldest = newMessages[0];
@@ -3953,6 +4147,7 @@ export default class MessageSyncService {
       if (this._getChannel(normalizedId).last_message_id > Math.max(cursorBeforeLastPage, lastMessageId)) {
         this._setChannelGapStart(normalizedId, lastMessageId);
       } else {
+        this._queueRecheckUpToCursor(normalizedId, lastMessageId);
         this._closeChannelGap(normalizedId);
         console.log(`[sync] Channel ${normalizedId}: gap closed.`);
       }
