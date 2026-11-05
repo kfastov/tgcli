@@ -32,8 +32,8 @@ archive does not.
    while one answers, printing its pid. Any other tgcli command starts a new server,
    so run none until you are done.
 6. Run the script from a repository checkout, with the Node version `better-sqlite3`
-   is built for. So far it has only run against a stubbed Telegram, so start with one
-   chat where you know a message is missing, and check it as in step 7 before going on:
+   is built for. Start with one chat where you know a message is missing, and check it
+   as in step 7 before going on:
 
    ```bash
    node scripts/recover-archive-gaps.js <chatId> <afterMessageId>
