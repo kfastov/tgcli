@@ -2599,10 +2599,13 @@ async function runSyncStatus(globalFlags) {
       const counts = REPAIR_STATUS_ORDER.map((status) => `${status}=${repairTotals.byStatus[status] ?? 0}`).join(' ');
       const missing = repairs.some((repair) => repair.dry_run) ? ` missing=${repairTotals.missing}` : '';
       console.log(`REPAIRS: ${repairTotals.chats} chat(s) ${counts} checked=${repairTotals.checked} added=${repairTotals.added}${missing}`);
-      const named = repairs.filter((repair) => repair.status === 'in_progress' || repair.status === 'error');
+      const named = [
+        ...repairs.filter((repair) => repair.status === 'in_progress'),
+        ...repairs.filter((repair) => repair.status === 'error'),
+      ];
       for (const repair of named.slice(0, REPAIR_STATUS_LINES)) {
         const error = repair.error ? ` error=${repair.error}` : '';
-        console.log(`  repair ${repairLabel(repair)} [${repair.status}] checked=${repair.checked_count} added=${repair.added_count}${error}`);
+        console.log(`  repair ${repairLabel(repair)} [${repair.status}] checked=${repair.checked_count} ${addedWord(repair)}=${repair.added_count}${error}`);
       }
       if (named.length > REPAIR_STATUS_LINES) {
         console.log(`  … and ${named.length - REPAIR_STATUS_LINES} more; \`tgcli --json backfill status\` lists them all.`);

@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { Long, tl } from '@mtcute/core';
+import { Long, MtPeerNotFoundError, tl } from '@mtcute/core';
 import { iterHistory } from '@mtcute/core/methods.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -208,6 +208,49 @@ describe('backfill repair', () => {
     expect(repairRow(service)).toMatchObject({ dry_run: 0, added_count: 2 });
   });
 
+  // A dry run takes the chat's row: over a repair under way it would drop the rest of it.
+  it('refuses a dry run over a repair still under way, and takes one after it', async () => {
+    const service = setUp(range(10, 259), [10]);
+    service.addRepairs({ chats: [CHANNEL_ID] });
+    await service._repairNextPage(service._getNextRepair());
+
+    expect(() => service.addRepairs({ chats: [CHANNEL_ID], dryRun: true })).toThrow(/repair is under way in 1 of these chat/);
+    expect(() => service.addRepairs({ all: true, dryRun: true })).toThrow(/under way/);
+    expect(repairRow(service)).toMatchObject({ status: 'in_progress', dry_run: 0, cursor_message_id: 160 });
+
+    await service.processQueue();
+    expect(service.addRepairs({ chats: [CHANNEL_ID], dryRun: true })).toEqual([CHANNEL_ID]);
+  });
+
+  it('counts in a dry run only this chat\'s rows as present', async () => {
+    const service = setUp(range(10, 20), [10]);
+    service.db.prepare('INSERT INTO channels (channel_id, sync_enabled) VALUES (?, 1)').run(OTHER_ID);
+    service.insertMessagesTx(range(11, 20).map((id) => service._buildMessageRecord(OTHER_ID, { id, date: BASE_DATE + id })));
+
+    service.addRepairs({ chats: [CHANNEL_ID], dryRun: true });
+    await service.processQueue();
+
+    expect(repairRow(service)).toMatchObject({ dry_run: 1, added_count: 10 });
+  });
+
+  it('adds what it needs to an archive made before dry runs and dialog membership', async () => {
+    const first = setUp([10, 11], [10]);
+    const dbPath = first.db.name;
+    first.db.exec('ALTER TABLE archive_repairs DROP COLUMN dry_run');
+    first.db.exec('ALTER TABLE channels DROP COLUMN in_dialogs');
+    first.close();
+
+    const service = makeService();
+    const columns = (table) => service.db.prepare(`PRAGMA table_info(${table})`).all().map((col) => col.name);
+    expect(service.db.name).toBe(dbPath);
+    expect(columns('archive_repairs')).toContain('dry_run');
+    expect(columns('channels')).toContain('in_dialogs');
+
+    service.addRepairs({ chats: [CHANNEL_ID], dryRun: true });
+    await service.processQueue();
+    expect(repairRow(service)).toMatchObject({ status: 'idle', dry_run: 1, added_count: 1 });
+  });
+
   it('stops at the date bound', async () => {
     const service = setUp(range(100, 200), [100, 101, 200]);
 
@@ -372,6 +415,37 @@ describe('backfill repair', () => {
     await service.processQueue();
     expect(historyRequests).toHaveLength(0);
     expect(repairRow(service).status).toBe('skipped');
+  });
+
+  it.each([
+    ['CHANNEL_INVALID', () => tl.RpcError.fromTl({ _: 'rpc_error', errorCode: 400, errorMessage: 'CHANNEL_INVALID' })],
+    ['a peer missing from the cache', () => new MtPeerNotFoundError('Peer -1000000000500 is not found in local cache')],
+  ])('skips a chat on %s', async (_, makeError) => {
+    const service = setUp(range(10, 30), [10]);
+    answer = () => {
+      throw makeError();
+    };
+
+    service.addRepairs({ chats: [CHANNEL_ID] });
+    await service.processQueue();
+
+    expect(repairRow(service).status).toBe('skipped');
+  });
+
+  // These break every request, not this chat: skipping would give up on each chat in turn.
+  it.each([
+    [406, 'AUTH_KEY_DUPLICATED'],
+    [420, 'FROZEN_METHOD_INVALID'],
+  ])('keeps %i %s a failure that is retried', async (errorCode, errorMessage) => {
+    const service = setUp(range(10, 30), [10]);
+    answer = () => {
+      throw tl.RpcError.fromTl({ _: 'rpc_error', errorCode, errorMessage });
+    };
+
+    service.addRepairs({ chats: [CHANNEL_ID] });
+    await service.processQueue();
+
+    expect(repairRow(service).status).toBe('error');
   });
 
   it('stops for a chat whose sync was turned off, and stays stopped while it is off', async () => {
