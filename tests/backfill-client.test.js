@@ -362,19 +362,53 @@ describe('backfill repair', () => {
     expect(JSON.parse(stdoutText())).toEqual({ ok: true, channelIds: ['-100'] });
   });
 
-  it('status lists repairs that have not finished', async () => {
+  it('status sums up the repairs and names the one under way', async () => {
     services.current = makeFakeServices({
       listRepairs: vi.fn(() => [
         repair({ checked_count: 300, added_count: 4 }),
-        repair({ channel_id: '-200', peer_title: 'Done', status: 'idle' }),
+        repair({ channel_id: '-200', peer_title: 'Done', status: 'idle', checked_count: 10, added_count: 1 }),
+        repair({ channel_id: '-300', peer_title: 'Next', status: 'pending' }),
+        repair({ channel_id: '-400', peer_title: 'Left', status: 'skipped', error: 'gone' }),
       ]),
     });
 
     await runProgram(['backfill', 'status']);
 
     const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('REPAIRS: 4 chat(s) idle=1 in_progress=1 pending=1 skipped=1 error=0 checked=310 added=5');
     expect(out).toContain('repair Chan [in_progress] checked=300 added=4');
-    expect(out).not.toContain('repair Done');
+    expect(out).not.toMatch(/repair (Done|Next|Left)/);
+  });
+
+  // `--all` queues every synced chat: a line each would bury the queue.
+  it('status names at most ten failed repairs', async () => {
+    const failed = Array.from({ length: 12 }, (_, index) => repair({
+      channel_id: `-${500 + index}`,
+      peer_title: `Failed ${index}`,
+      status: 'error',
+      error: 'boom',
+    }));
+    const pending = Array.from({ length: 1500 }, (_, index) => repair({ channel_id: `-${9000 + index}`, status: 'pending' }));
+    services.current = makeFakeServices({ listRepairs: vi.fn(() => [...failed, ...pending]) });
+
+    await runProgram(['backfill', 'status']);
+
+    const lines = logSpy.mock.calls.flat().join('\n').split('\n');
+    expect(lines.filter((line) => line.includes('[error]'))).toHaveLength(10);
+    expect(lines.filter((line) => line.includes('[pending]'))).toHaveLength(0);
+    expect(lines).toContain('  … and 2 more; `tgcli --json backfill status` lists them all.');
+  });
+
+  it('status --json adds totals to the full list', async () => {
+    services.current = makeFakeServices({
+      listRepairs: vi.fn(() => [repair({ status: 'idle', checked_count: 7, added_count: 2 })]),
+    });
+
+    await runProgram(['--json', 'backfill', 'status']);
+
+    const out = JSON.parse(stdoutText());
+    expect(out.repairTotals).toEqual({ chats: 1, byStatus: { idle: 1 }, checked: 7, added: 2 });
+    expect(out.repairs).toHaveLength(1);
   });
 });
 

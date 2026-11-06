@@ -1855,6 +1855,21 @@ function repairLabel(repair) {
   return repair.peer_title || repair.channel_id;
 }
 
+const REPAIR_STATUS_ORDER = ['idle', 'in_progress', 'pending', 'skipped', 'error'];
+const REPAIR_STATUS_LINES = 10;
+
+function summarizeRepairs(repairs) {
+  const byStatus = {};
+  let checked = 0;
+  let added = 0;
+  for (const repair of repairs) {
+    byStatus[repair.status] = (byStatus[repair.status] ?? 0) + 1;
+    checked += repair.checked_count ?? 0;
+    added += repair.added_count ?? 0;
+  }
+  return { chats: repairs.length, byStatus, checked, added };
+}
+
 function repairSummary(repair) {
   return {
     channelId: repair.channel_id,
@@ -2520,7 +2535,7 @@ async function runSyncStatus(globalFlags) {
       jobs: service.listJobs({ limit: 100 }),
       repairs: service.listRepairs(),
     }));
-    const openRepairs = repairs.filter((repair) => repair.status !== 'idle');
+    const repairTotals = summarizeRepairs(repairs);
     // in_progress first, then pending — the chats actively/imminently backfilling.
     const active = jobs.filter((job) => job.status === 'in_progress' || job.status === 'pending');
     const ping = await pingServer(storeDir);
@@ -2539,6 +2554,7 @@ async function runSyncStatus(globalFlags) {
           cursorDate: job.cursor_message_date ?? null,
           updatedAt: job.updated_at ?? null,
         })),
+        repairTotals,
         repairs: repairs.map(repairSummary),
       });
       return;
@@ -2559,9 +2575,18 @@ async function runSyncStatus(globalFlags) {
         console.log(`  ${label} [${job.status}] ${done}/${target} (${pct}%)${cursor}${updated}`);
       }
     }
-    for (const repair of openRepairs) {
-      const error = repair.error ? ` error=${repair.error}` : '';
-      console.log(`  repair ${repairLabel(repair)} [${repair.status}] checked=${repair.checked_count} added=${repair.added_count}${error}`);
+    if (repairs.length) {
+      // `--all` queues every synced chat, so name only the one under way and the failures.
+      const counts = REPAIR_STATUS_ORDER.map((status) => `${status}=${repairTotals.byStatus[status] ?? 0}`).join(' ');
+      console.log(`REPAIRS: ${repairTotals.chats} chat(s) ${counts} checked=${repairTotals.checked} added=${repairTotals.added}`);
+      const named = repairs.filter((repair) => repair.status === 'in_progress' || repair.status === 'error');
+      for (const repair of named.slice(0, REPAIR_STATUS_LINES)) {
+        const error = repair.error ? ` error=${repair.error}` : '';
+        console.log(`  repair ${repairLabel(repair)} [${repair.status}] checked=${repair.checked_count} added=${repair.added_count}${error}`);
+      }
+      if (named.length > REPAIR_STATUS_LINES) {
+        console.log(`  … and ${named.length - REPAIR_STATUS_LINES} more; \`tgcli --json backfill status\` lists them all.`);
+      }
     }
   }, timeoutMs);
 }
