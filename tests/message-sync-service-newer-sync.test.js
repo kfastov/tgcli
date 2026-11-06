@@ -110,9 +110,7 @@ describe('catching up on messages newer than the cursor', () => {
   });
 
   afterEach(() => {
-    if (service?.db?.open) {
-      service.db.close();
-    }
+    service?.close();
     fs.rmSync(storeDir, { recursive: true, force: true });
   });
 

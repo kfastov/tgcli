@@ -55,9 +55,7 @@ describe('per-batch backfill progress persistence', () => {
   });
 
   afterEach(async () => {
-    if (service?.db?.open) {
-      service.db.close();
-    }
+    service?.close();
     fs.rmSync(storeDir, { recursive: true, force: true });
   });
 
@@ -145,9 +143,7 @@ describe('job-count and watched-channel helpers', () => {
   });
 
   afterEach(() => {
-    if (service?.db?.open) {
-      service.db.close();
-    }
+    service?.close();
     fs.rmSync(storeDir, { recursive: true, force: true });
   });
 

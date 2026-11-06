@@ -2543,6 +2543,8 @@ export default class MessageSyncService {
   // the `jobs` table — so a read-only command run against a live server's store
   // cannot corrupt the server's in-progress job (#42).
   close() {
+    // A queue loop waiting out its delay would otherwise wake up to a closed archive.
+    this.stopRequested = true;
     clearInterval(this.periodicCheckTimer);
     clearTimeout(this.gapRetryTimer);
     if (this.realtimeActive && this.realtimeHandlers) {
