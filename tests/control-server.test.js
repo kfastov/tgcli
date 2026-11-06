@@ -30,6 +30,8 @@ async function resolveChatKey(chat) {
 
 function makeService(overrides = {}) {
   return {
+    // Nothing local knows a username unless a test says so.
+    findChatKeyLocally: vi.fn(async () => null),
     resolveChatKey: vi.fn(resolveChatKey),
     getJobCounts: vi.fn(() => ({ pending: 1, inProgress: 2 })),
     addJob: vi.fn((chatId, opts) => ({
@@ -203,6 +205,15 @@ describe('control API request handler', () => {
     expect(service.cancelJobs).toHaveBeenCalledWith({ channelId: '9001', jobId: undefined });
     await request(port, 'POST', '/control/retry', { token: TOKEN, body: { channelId: '@chan' } });
     expect(service.retryJobs).toHaveBeenCalledWith({ jobId: undefined, channelId: '9001', allErrors: false });
+  });
+
+  it('POST /control/cancel finds a username the archive knows without asking Telegram', async () => {
+    service.findChatKeyLocally.mockResolvedValueOnce('9002');
+
+    await request(port, 'POST', '/control/cancel', { token: TOKEN, body: { chatId: '@known' } });
+
+    expect(service.cancelJobs).toHaveBeenCalledWith({ channelId: '9002', jobId: undefined });
+    expect(service.resolveChatKey).not.toHaveBeenCalled();
   });
 
   // What is left under a username Telegram no longer has can still be canceled.
