@@ -15,20 +15,25 @@ vi.mock('child_process', () => ({ spawn: spawnMock, spawnSync: spawnSyncMock }))
 
 import {
   cancelBackfill,
+  DEV_LEASE_MS,
   enqueueBackfill,
   enqueueRepair,
   ensureServer,
   invoke,
   pingServer,
   readControlFile,
+  restartServer,
   retryBackfill,
   ServerUnavailableError,
+  syncServerVersion,
+  versionTakeover,
 } from '../core/control-client.js';
-import { CONTROL_TOKEN_HEADER } from '../core/control-server.js';
+import { CONTROL_CLIENT_VERSION_HEADER, CONTROL_TOKEN_HEADER } from '../core/control-server.js';
 import { SendCommandError } from '../core/send-utils.js';
+import { parseVersion, readVersion } from '../core/version.js';
 
 const realFetch = global.fetch;
-const CLI_VERSION = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+const CLI_VERSION = readVersion();
 
 let storeDir;
 
@@ -89,6 +94,7 @@ describe('pingServer', () => {
     const [url, init] = global.fetch.mock.calls[0];
     expect(url).toBe('http://127.0.0.1:8765/control/ping');
     expect(init.headers[CONTROL_TOKEN_HEADER]).toBe('secret');
+    expect(init.headers[CONTROL_CLIENT_VERSION_HEADER]).toBe(CLI_VERSION);
   });
 
   it('returns null when the server is unreachable', async () => {
@@ -350,14 +356,14 @@ describe('server older or newer than this CLI', () => {
     const serverPid = runningServer({ tty: '??', owner: { autoStarted: false } });
     await expect(invoke(storeDir, { op: 'listChannels', args: {} })).resolves.toBe('done');
     expect(killSpy).not.toHaveBeenCalledWith(serverPid, 'SIGTERM');
-    expect(stderr()).toContain('Restart it to use this version.');
+    expect(stderr()).toContain('Restart it to use this version');
   });
 
   it('leaves an older server alone when it has a terminal, whatever its window', async () => {
     const serverPid = runningServer({ tty: 'ttys003' });
     await expect(invoke(storeDir, { op: 'listChannels', args: {} })).resolves.toBe('done');
     expect(killSpy).not.toHaveBeenCalledWith(serverPid, 'SIGTERM');
-    expect(stderr()).toContain('Restart it to use this version.');
+    expect(stderr()).toContain('Restart it to use this version');
   });
 
   it('invoke stops an idle auto-started older server and reports it as unavailable', async () => {
@@ -422,7 +428,7 @@ describe('server older or newer than this CLI', () => {
   });
 
   it('compares versions numerically', async () => {
-    const [major, minor, patch] = CLI_VERSION.split('.').map(Number);
+    const { major, minor, patch } = parseVersion(CLI_VERSION);
     const serverPid = runningServer({ version: `${major}.${minor}.${patch + 10}` });
     await expect(invoke(storeDir, { op: 'listChannels', args: {} })).resolves.toBe('done');
     expect(killSpy).not.toHaveBeenCalledWith(serverPid, 'SIGTERM');
@@ -529,5 +535,195 @@ describe('invoke over a real socket', () => {
     writeControl({ pid: 9, port, token: 'secret', startedAt: 's' });
     const error = await invoke(storeDir, { op: 'sendText', args: {} }).catch((e) => e);
     expect(error).toBeInstanceOf(ServerUnavailableError);
+  });
+});
+
+describe('versionTakeover', () => {
+  const recent = DEV_LEASE_MS - 1;
+  const stale = DEV_LEASE_MS;
+
+  it.each([
+    ['the same version', '2.2.5', '2.2.5', undefined, 'same'],
+    ['an older release', '2.2.4', '2.2.5', undefined, 'take-over'],
+    ['a newer release', '2.2.6', '2.2.5', undefined, 'newer'],
+    ['the release a dev build grew from', '2.2.5', '2.2.6-dev+abc1234', undefined, 'take-over'],
+    ['a release newer than a dev build', '2.3.0', '2.2.6-dev+abc1234', undefined, 'newer'],
+    ['a dev build used recently, from a release', '2.2.6-dev+abc1234', '2.2.5', recent, 'dev-in-use'],
+    ['a dev build used recently, from another dev build', '2.2.6-dev+abc1234', '2.2.6-dev+def5678', recent, 'dev-in-use'],
+    ['a dev build used recently, from a newer release', '2.2.6-dev+abc1234', '2.3.0', recent, 'dev-in-use'],
+    ['a dev build left alone, from an older release', '2.2.6-dev+abc1234', '2.2.5', stale, 'take-over'],
+    ['a dev build that cannot say', '2.2.6-dev+abc1234', '2.2.5', undefined, 'take-over'],
+  ])('%s', (_label, serverVersion, cliVersion, ownClientIdleMs, expected) => {
+    expect(versionTakeover({ serverVersion, cliVersion, ownClientIdleMs })).toBe(expected);
+  });
+
+  it('never lets two CLIs in use take the server from each other in turn', () => {
+    const versions = ['2.2.4', '2.2.5', '2.2.6-dev+abc1234', '2.2.6-dev+def5678', '2.3.0'];
+    for (const a of versions) {
+      for (const b of versions) {
+        // Both run all the time, so whichever server is up was just used by its CLI.
+        const aTakesFromB = versionTakeover({ serverVersion: b, cliVersion: a, ownClientIdleMs: 0 }) === 'take-over';
+        const bTakesFromA = versionTakeover({ serverVersion: a, cliVersion: b, ownClientIdleMs: 0 }) === 'take-over';
+        expect(aTakesFromB && bTakesFromA, `${a} and ${b}`).toBe(false);
+      }
+    }
+  });
+});
+
+describe('syncServerVersion', () => {
+  let killSpy;
+
+  beforeEach(() => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    killSpy = vi.spyOn(process, 'kill').mockImplementation(() => {
+      throw Object.assign(new Error('kill ESRCH'), { code: 'ESRCH' });
+    });
+  });
+
+  it('starts this version in place of the server it replaced', async () => {
+    writeControl({ pid: 50, port: 8765, token: 'secret', startedAt: 's', version: '0.0.1', autoStarted: true });
+    global.fetch.mockImplementation((url) => {
+      if (url.endsWith('/control/shutdown')) {
+        fs.rmSync(path.join(storeDir, 'control.json'), { force: true });
+        return Promise.resolve(jsonResponse(202, { ok: true, pid: 50 }));
+      }
+      if (!fs.existsSync(path.join(storeDir, 'control.json'))) {
+        return Promise.reject(new TypeError('fetch failed'));
+      }
+      const { pid, version } = readControlFile(storeDir);
+      return Promise.resolve(jsonResponse(200, { ok: true, pid, version, jobs: {} }));
+    });
+    killSpy.mockImplementation((pid) => {
+      if (pid === 50) {
+        throw Object.assign(new Error('kill ESRCH'), { code: 'ESRCH' });
+      }
+      return true;
+    });
+    spawnMock.mockImplementation(() => {
+      writeControl({ pid: 51, port: 8765, token: 'secret', startedAt: 's', version: CLI_VERSION });
+      return { unref: vi.fn() };
+    });
+
+    await expect(syncServerVersion(storeDir)).resolves.toBe('replaced');
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(readControlFile(storeDir)).toMatchObject({ pid: 51, version: CLI_VERSION });
+  });
+
+  it('does nothing without a server', async () => {
+    await expect(syncServerVersion(storeDir)).resolves.toBe('none');
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it('renews the lease of a dev server on this version with a ping', async () => {
+    writeControl({ pid: 60, port: 8765, token: 'secret', startedAt: 's', version: CLI_VERSION });
+    global.fetch.mockResolvedValue(jsonResponse(200, { ok: true, pid: 60, version: CLI_VERSION }));
+    await expect(syncServerVersion(storeDir)).resolves.toBe('current');
+    const [url, init] = global.fetch.mock.calls[0];
+    expect(url).toBe('http://127.0.0.1:8765/control/ping');
+    expect(init.headers[CONTROL_CLIENT_VERSION_HEADER]).toBe(CLI_VERSION);
+  });
+
+  it('warns once per server when a command checks twice', async () => {
+    writeControl({ pid: 70, port: 8765, token: 'secret', startedAt: 's', version: '999.0.0', autoStarted: true });
+    global.fetch.mockImplementation((url) => Promise.resolve(url.endsWith('/control/ping')
+      ? jsonResponse(200, { ok: true, pid: 70, version: '999.0.0', jobs: {} })
+      : jsonResponse(200, { result: 'done' })));
+    await syncServerVersion(storeDir);
+    await expect(invoke(storeDir, { op: 'listChannels', args: {} })).resolves.toBe('done');
+    expect(console.error).toHaveBeenCalledTimes(1);
+    expect(global.fetch.mock.calls.filter(([url]) => url.endsWith('/control/ping'))).toHaveLength(1);
+  });
+});
+
+describe('restartServer', () => {
+  let alive;
+
+  beforeEach(() => {
+    alive = new Set();
+    vi.spyOn(process, 'kill').mockImplementation((pid) => {
+      if (!alive.has(pid)) {
+        throw Object.assign(new Error('kill ESRCH'), { code: 'ESRCH' });
+      }
+      return true;
+    });
+  });
+
+  function serveFromControlFile({ onShutdown } = {}) {
+    global.fetch.mockImplementation((url) => {
+      const control = readControlFile(storeDir);
+      if (!control) {
+        return Promise.reject(new TypeError('fetch failed'));
+      }
+      if (url.endsWith('/control/shutdown')) {
+        onShutdown?.(control.pid);
+        return Promise.resolve(jsonResponse(202, { ok: true, pid: control.pid }));
+      }
+      return Promise.resolve(jsonResponse(200, { ok: true, pid: control.pid, version: control.version, startedAt: 'now', jobs: {} }));
+    });
+  }
+
+  function stopsCleanly(pid) {
+    fs.rmSync(path.join(storeDir, 'control.json'), { force: true });
+    alive.delete(pid);
+  }
+
+  it('stops the old server, then starts this version in its place', async () => {
+    alive.add(80);
+    writeControl({ pid: 80, port: 8765, token: 'secret', startedAt: 's', version: '2.2.5', autoStarted: true });
+    serveFromControlFile({ onShutdown: stopsCleanly });
+    spawnMock.mockImplementation(() => {
+      expect(alive.has(80)).toBe(false);
+      writeControl({ pid: 81, port: 8765, token: 'secret', startedAt: 's', version: CLI_VERSION });
+      return { unref: vi.fn() };
+    });
+
+    const { previous, current } = await restartServer(storeDir);
+    expect(previous).toMatchObject({ running: true, stopped: true, pid: 80, version: '2.2.5', method: 'control' });
+    expect(current).toMatchObject({ pid: 81, version: CLI_VERSION });
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('starts a server when none runs', async () => {
+    serveFromControlFile();
+    spawnMock.mockImplementation(() => {
+      writeControl({ pid: 90, port: 8765, token: 'secret', startedAt: 's', version: CLI_VERSION });
+      return { unref: vi.fn() };
+    });
+    const { previous, current } = await restartServer(storeDir);
+    expect(previous.running).toBe(false);
+    expect(current).toMatchObject({ pid: 90 });
+  });
+
+  it('lets a service manager bring its server back instead of starting a second one', async () => {
+    alive.add(100);
+    writeControl({ pid: 100, port: 8765, token: 'secret', startedAt: 's', version: '2.2.5', autoStarted: false, manager: 'launchd' });
+    serveFromControlFile({
+      onShutdown: (pid) => {
+        stopsCleanly(pid);
+        setTimeout(() => writeControl({ pid: 101, port: 8765, token: 'secret', startedAt: 's', version: '2.2.5', autoStarted: false, manager: 'launchd' }), 300);
+      },
+    });
+    const { previous, current } = await restartServer(storeDir);
+    expect(previous).toMatchObject({ pid: 100, manager: 'launchd' });
+    expect(current).toMatchObject({ pid: 101 });
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it('starts nothing when the old server does not stop', async () => {
+    vi.useFakeTimers();
+    try {
+      alive.add(110);
+      writeControl({ pid: 110, port: 8765, token: 'secret', startedAt: 's', version: '2.2.5', autoStarted: true });
+      serveFromControlFile();
+      const done = restartServer(storeDir, { timeoutMs: 1000 });
+      await vi.advanceTimersByTimeAsync(5000);
+      const { previous, current } = await done;
+      expect(previous).toMatchObject({ running: true, stopped: false, pid: 110 });
+      expect(current).toBeNull();
+      expect(spawnMock).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

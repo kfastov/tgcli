@@ -15,6 +15,9 @@ down once the queue drains and nothing is watched.
 Commands that stay local (no server): `config`, `service`, `doctor`, and `auth`
 (interactive login bootstraps the session the server then uses).
 
+Before any command runs, the CLI checks the version of a running server and
+replaces an outdated one it started itself (see `server` below).
+
 ## Global flags
 - --json
 - --timeout DURATION
@@ -91,8 +94,33 @@ one-shot client.
 - `sync` remains a silent alias of `backfill` (and every subcommand), so existing `sync …` invocations keep working unchanged.
 
 ## server
-- server
+- server [--idle-exit DURATION]
   - Start the background sync service (MCP HTTP server runs only when enabled in config).
+  - Every server writes `server.log` in the store, also when it runs in the background;
+    at 5 MB the file moves to `server.log.1` and a new one starts.
+- server stop [--force]
+  - Ask the running server to shut down (over the control API; SIGTERM for an older
+    server) and wait until its process has exited. The job it was backfilling goes back
+    to the queue. `--force` kills a server that has not exited after a minute. Prints
+    `No tgcli server is running.` and exits 0 when there is none.
+  - `--json`: `{ running, stopped, server: { pid, version, autoStarted, manager, method } }`.
+- server restart [--force]
+  - Stop the running server, if any, and start this CLI's version in its place. A
+    server run by `tgcli service` comes back through its service manager instead.
+  - `--json`: `{ previous: { pid, version, ... } | null, current: { pid, version, startedAt } }`.
+- server logs [-n N] [--follow]
+  - Print the last N lines of the server log (default 100). `--follow` keeps printing
+    new lines, across rotations, until Ctrl-C or `--timeout`.
+  - `--json`: `{ path, exists, lines }`; with `--follow`, one `{ "line": ... }` object
+    per line.
+
+Every command checks the running server's version before it runs. A server that an
+older CLI started on its own is replaced by this version right away, unless it has
+backfill jobs queued; a newer server is left alone. A dev build run from a clone
+(`2.2.6-dev+<commit>`) counts as newer than the release it grew from, and while a CLI
+of that build has used its server in the last 10 minutes no other version replaces
+it. `server restart` switches to the caller's version in any direction. See
+`docs/development.md`.
 
 ## service
 - service install

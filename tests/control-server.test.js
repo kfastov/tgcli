@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   createControlRequestHandler,
+  CONTROL_CLIENT_VERSION_HEADER,
   CONTROL_TOKEN_HEADER,
 } from '../core/control-server.js';
 import { OPERATIONS } from '../core/operations.js';
@@ -352,5 +353,73 @@ describe('POST /control/invoke', () => {
     });
     expect(status).toBe(401);
     expect(warmServices.telegramClient.listDialogs).not.toHaveBeenCalled();
+  });
+});
+
+describe('control API shutdown and client versions', () => {
+  let server;
+  let port;
+  let clock;
+  let onShutdown;
+
+  async function start(overrides = {}) {
+    clock = 1_000_000;
+    onShutdown = 'onShutdown' in overrides ? overrides.onShutdown : vi.fn();
+    const handler = createControlRequestHandler({
+      service: makeService(),
+      token: TOKEN,
+      pid: 12345,
+      version: '2.2.6-dev+abc1234',
+      startedAt: 's',
+      now: () => clock,
+      ...overrides,
+      onShutdown,
+    });
+    ({ server, port } = await startServer(handler));
+  }
+
+  afterEach(() => {
+    server.close();
+  });
+
+  function ping(clientVersion) {
+    return fetch(`http://127.0.0.1:${port}/control/ping`, {
+      headers: {
+        [CONTROL_TOKEN_HEADER]: TOKEN,
+        ...(clientVersion ? { [CONTROL_CLIENT_VERSION_HEADER]: clientVersion } : {}),
+      },
+    }).then((res) => res.json());
+  }
+
+  it('POST /control/shutdown replies before it starts the shutdown', async () => {
+    // Like the real one, the shutdown drops every open connection.
+    await start({ onShutdown: vi.fn(() => server.closeAllConnections()) });
+    const { status, json } = await request(port, 'POST', '/control/shutdown', { token: TOKEN });
+    expect(status).toBe(202);
+    expect(json).toEqual({ ok: true, pid: 12345 });
+    await vi.waitFor(() => expect(onShutdown).toHaveBeenCalledTimes(1));
+  });
+
+  it('POST /control/shutdown needs the token', async () => {
+    await start();
+    const { status } = await request(port, 'POST', '/control/shutdown');
+    expect(status).toBe(401);
+    expect(onShutdown).not.toHaveBeenCalled();
+  });
+
+  it('answers 501 when the server has no shutdown hook', async () => {
+    await start({ onShutdown: undefined });
+    const { status } = await request(port, 'POST', '/control/shutdown', { token: TOKEN });
+    expect(status).toBe(501);
+  });
+
+  it('times how long no CLI of its own version has called, from the start', async () => {
+    await start();
+    clock += 5000;
+    expect((await ping('2.2.5')).ownClientIdleMs).toBe(5000);
+    expect((await ping()).ownClientIdleMs).toBe(5000);
+    expect((await ping('2.2.6-dev+abc1234')).ownClientIdleMs).toBe(0);
+    clock += 700;
+    expect((await ping('2.2.5')).ownClientIdleMs).toBe(700);
   });
 });

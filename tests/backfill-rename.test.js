@@ -38,6 +38,7 @@ vi.mock('../core/control-client.js', () => ({
   ensureServer: (...args) => control.ensureServer(...args),
   invoke: (...args) => control.invoke(...args),
   pingServer: vi.fn(),
+  syncServerVersion: vi.fn(async () => 'current'),
   enqueueBackfill: (...args) => control.enqueueBackfill(...args),
   cancelBackfill: vi.fn(),
   retryBackfill: vi.fn(),

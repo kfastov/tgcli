@@ -19,6 +19,7 @@ import {
   isIdle,
 } from "./core/control-server.js";
 import { readVersion } from "./core/version.js";
+import { captureServerOutput } from "./core/server-log.js";
 import { readJsonBody } from "./core/http-util.js";
 import { parseDuration } from "./core/duration.js";
 import { OPERATIONS } from "./core/operations.js";
@@ -26,6 +27,8 @@ import { OPERATIONS } from "./core/operations.js";
 const SERVICE_STATE_FILE = "service-state.json";
 
 const storeDir = resolveStoreDir();
+// First, so even a startup failure lands in <store>/server.log.
+captureServerOutput(storeDir);
 const { config, path: configPath } = loadConfig(storeDir);
 const missingConfig = validateConfig(config ?? {});
 if (missingConfig.length > 0) {
@@ -55,6 +58,7 @@ const IDLE_EXIT_MS = resolveIdleExitMs(readIdleExitArg());
 // Any other server belongs to the user.
 const AUTO_STARTED = process.argv.includes("--auto-started");
 const IDLE_CHECK_INTERVAL_MS = 5000;
+console.log(`[startup] tgcli server ${readVersion()} (pid ${process.pid}, ${AUTO_STARTED ? "auto-started" : "started by hand"}${IDLE_EXIT_MS > 0 ? `, idle exit after ${IDLE_EXIT_MS}ms` : ""})`);
 
 const { telegramClient, messageSyncService } = createServices({ storeDir, config });
 
@@ -1744,6 +1748,10 @@ if (controlEnabled) {
     // Await the shared connect before any op touches MTProto; the connect is
     // kicked off in the background once the listeners are up.
     ensureLogin: () => ensureTelegramConnected(),
+    // `tgcli server stop` / `restart`.
+    onShutdown: () => {
+      void shutdown("stop requested over the control API").finally(() => process.exit(0));
+    },
   });
 
   controlServer = http.createServer((req, res) => {
@@ -1775,6 +1783,7 @@ if (controlEnabled) {
         startedAt,
         version: serviceState.version,
         autoStarted: AUTO_STARTED,
+        manager: serviceState.manager,
       });
       controlFileWritten = true;
     } catch (error) {
@@ -1812,8 +1821,7 @@ if (IDLE_EXIT_MS > 0) {
       idleExitMs: IDLE_EXIT_MS,
     });
     if (idle) {
-      console.log("[shutdown] idle window elapsed with no work; exiting.");
-      void shutdown().finally(() => process.exit(0));
+      void shutdown("idle window elapsed with no work").finally(() => process.exit(0));
     }
   }, IDLE_CHECK_INTERVAL_MS);
   if (typeof idleTimer.unref === "function") {
@@ -1821,12 +1829,17 @@ if (IDLE_EXIT_MS > 0) {
   }
 }
 
-async function shutdown() {
-  if (shuttingDown) {
-    return;
-  }
+// Every caller gets the one shutdown in flight, so a second request (a signal
+// after a control API stop, say) waits for it instead of exiting halfway.
+let shutdownPromise = null;
+function shutdown(reason) {
+  shutdownPromise ??= runShutdown(reason);
+  return shutdownPromise;
+}
+
+async function runShutdown(reason) {
   shuttingDown = true;
-  console.log("[shutdown] received termination signal, closing resources...");
+  console.log(`[shutdown] ${reason}; closing resources...`);
   const closeTasks = [];
   for (const record of sessions.values()) {
     const task = closeSessionRecord(record, "shutdown");
@@ -1882,10 +1895,11 @@ async function shutdown() {
     stoppedAt: new Date().toISOString(),
     pid: null,
   });
+  console.log("[shutdown] done");
 }
 
-const handleShutdownSignal = () => {
-  void shutdown().finally(() => process.exit(0));
+const handleShutdownSignal = (signal) => {
+  void shutdown(`received ${signal}`).finally(() => process.exit(0));
 };
 
 process.prependListener("SIGINT", handleShutdownSignal);
