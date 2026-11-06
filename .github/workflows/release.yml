@@ -77,7 +77,10 @@ jobs:
             echo "::error::Tag $TAG does not match package.json $VERSION"
             exit 1
           fi
-          FILE="$(npm pack --json | node -e "process.stdout.write(JSON.parse(require('fs').readFileSync(0, 'utf8'))[0].filename)")"
+          # The prepare script prints to stdout, so take the tarball from its own directory.
+          mkdir "$RUNNER_TEMP/pack"
+          npm pack --pack-destination "$RUNNER_TEMP/pack" >/dev/null
+          FILE="$(ls "$RUNNER_TEMP/pack"/*.tgz)"
           {
             echo "version=$VERSION"
             echo "file=$FILE"
