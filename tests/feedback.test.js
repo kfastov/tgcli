@@ -16,6 +16,7 @@ vi.mock('../store-lock.js', () => ({
 
 import { createServices } from '../core/services.js';
 import { saveConfig } from '../core/config.js';
+import { readVersion } from '../core/version.js';
 import {
   formatFeedbackMessage,
   getFeedbackCooldownRemainingSeconds,
@@ -23,7 +24,7 @@ import {
   writeFeedbackLastSentAt,
 } from '../cli.js';
 
-const PACKAGE_VERSION = JSON.parse(fs.readFileSync(path.resolve('package.json'), 'utf8')).version;
+const PACKAGE_VERSION = readVersion();
 
 function createTempStore() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'tgcli-feedback-test-'));

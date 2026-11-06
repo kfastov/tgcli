@@ -36,9 +36,14 @@ import {
   enqueueBackfill,
   enqueueRepair,
   ensureServer,
+  isManagedServer,
   pingServer,
+  restartServer,
   retryBackfill,
+  stopServer,
+  syncServerVersion,
 } from './core/control-client.js';
+import { appendServerLog, followServerLog, readServerLogTail } from './core/server-log.js';
 
 const CLI_PATH = fileURLToPath(import.meta.url);
 const SERVICE_STATE_FILE = 'service-state.json';
@@ -71,6 +76,7 @@ const DEFAULT_SEND_TIMEOUT_MS = 30000;
 const FEEDBACK_LAST_FILE = 'feedback-last.json';
 const FEEDBACK_COOLDOWN_MS = 60 * 1000;
 const FEEDBACK_DEFAULT_CHAT_ID = '@kfastov';
+const DEFAULT_SERVER_LOG_LINES = 100;
 
 const CLI_PROGRAM = buildProgram();
 
@@ -225,12 +231,28 @@ function buildProgram() {
     .option('--channel <id|username>', 'Cancel by channel')
     .action(withGlobalOptions((globalFlags, options) => runSyncJobsCancel(globalFlags, options)));
 
-  program
+  const server = program
     .command('server')
     .description('Run background sync service (MCP optional)')
     .option('--idle-exit <duration>', 'Exit after this idle period with no jobs or watched channels')
     .addOption(new Option('--auto-started').hideHelp())
     .action(withGlobalOptions((globalFlags, options) => runServer(globalFlags, options)));
+  server
+    .command('stop')
+    .description('Stop the running server and wait until it has exited')
+    .option('--force', 'Kill the server if it has not exited after a minute')
+    .action(withGlobalOptions((globalFlags, options) => runServerStop(globalFlags, options)));
+  server
+    .command('restart')
+    .description("Restart the server on this CLI's version")
+    .option('--force', 'Kill the old server if it has not exited after a minute')
+    .action(withGlobalOptions((globalFlags, options) => runServerRestart(globalFlags, options)));
+  server
+    .command('logs')
+    .description('Show the end of the server log')
+    .option('-n, --lines <n>', `Number of lines to show (default ${DEFAULT_SERVER_LOG_LINES})`)
+    .option('--follow', 'Keep printing lines as the server writes them')
+    .action(withGlobalOptions((globalFlags, options) => runServerLogs(globalFlags, options)));
 
   const service = program.command('service').description('Manage background service');
   service
@@ -672,7 +694,34 @@ function buildProgram() {
   program.action(() => {
     program.help();
   });
+  program.hook('preAction', (_program, actionCommand) => keepServerOnThisVersion(actionCommand));
   return program;
+}
+
+// `server` and `service` commands start, stop and replace servers themselves.
+function managesServerItself(command) {
+  for (let current = command; current?.parent; current = current.parent) {
+    if (current.name() === 'server' || current.name() === 'service') {
+      return true;
+    }
+  }
+  return !command?.parent;
+}
+
+// Before any command runs, a server on another version is replaced by this one
+// (see syncServerVersion). A failed check never blocks the command itself.
+async function keepServerOnThisVersion(actionCommand) {
+  if (managesServerItself(actionCommand)) {
+    return;
+  }
+  const quiet = Boolean(actionCommand.optsWithGlobals().quiet);
+  try {
+    await syncServerVersion(resolveStoreDir(), { quiet });
+  } catch (error) {
+    if (!quiet) {
+      process.stderr.write(`Warning: could not bring tgcli server to this version: ${error?.message ?? error}\n`);
+    }
+  }
 }
 
 function collectOption(value, previous) {
@@ -1955,13 +2004,21 @@ async function runServer(globalFlags, options = {}) {
         resolve();
         return;
       }
-      reject(new Error(`Server exited with code ${code ?? 'null'}${signal ? ` (${signal})` : ''}`));
+      const message = `Server exited with code ${code ?? 'null'}${signal ? ` (${signal})` : ''}`;
+      // A server that dies of a signal writes nothing itself.
+      appendServerLog(storeDir, `[server] ${message}`);
+      reject(new Error(message));
     });
   });
 
-  const { missing } = getStoreConfig(resolveStoreDir());
+  const storeDir = resolveStoreDir();
+  const { missing } = getStoreConfig(storeDir);
   if (missing.length > 0) {
-    throw new Error('Not authenticated. Run "tgcli auth" to configure credentials.');
+    const message = 'Not authenticated. Run "tgcli auth" to configure credentials.';
+    if (options.autoStarted) {
+      appendServerLog(storeDir, `[startup] ${message}`);
+    }
+    throw new Error(message);
   }
 
   return runWithTimeout(runChild, timeoutMs, () => {
@@ -1969,6 +2026,122 @@ async function runServer(globalFlags, options = {}) {
       child.kill('SIGTERM');
     }
   });
+}
+
+function serverLabel(server) {
+  return `tgcli server ${server.version ?? '(unknown version)'} (pid ${server.pid})`;
+}
+
+function reportStopping(globalFlags) {
+  return (server) => writeProgress(globalFlags, `Stopping ${serverLabel(server)}...`);
+}
+
+function notStoppedError(server, force) {
+  return new Error(force
+    ? `${serverLabel(server)} could not be killed.`
+    : `${serverLabel(server)} has not exited a minute after it was asked to stop; \`tgcli server stop --force\` kills it.`);
+}
+
+function stoppedServerPayload(server) {
+  return {
+    pid: server.pid,
+    version: server.version,
+    autoStarted: server.autoStarted,
+    manager: server.manager,
+    method: server.method,
+  };
+}
+
+async function runServerStop(globalFlags, options = {}) {
+  return runWithTimeout(async () => {
+    const force = Boolean(options.force);
+    const result = await stopServer(resolveStoreDir(), { force, onStopping: reportStopping(globalFlags) });
+    if (result.running && !result.stopped) {
+      throw notStoppedError(result, force);
+    }
+    if (globalFlags.json) {
+      writeJson({ running: result.running, stopped: result.stopped, server: result.running ? stoppedServerPayload(result) : null });
+      return;
+    }
+    if (!result.running) {
+      console.log('No tgcli server is running.');
+      return;
+    }
+    console.log(`Stopped ${serverLabel(result)}.`);
+    if (isManagedServer(result)) {
+      console.log(`${result.manager} runs it as a service and may start it again; \`tgcli service stop\` keeps it stopped.`);
+    }
+  }, globalFlags.timeoutMs);
+}
+
+async function runServerRestart(globalFlags, options = {}) {
+  return runWithTimeout(async () => {
+    const storeDir = resolveStoreDir();
+    if (getStoreConfig(storeDir).missing.length > 0) {
+      throw new Error('Not authenticated. Run "tgcli auth" to configure credentials.');
+    }
+    const force = Boolean(options.force);
+    const { previous, current } = await restartServer(storeDir, {
+      force,
+      quiet: globalFlags.quiet,
+      onStopping: reportStopping(globalFlags),
+    });
+    if (previous.running && !previous.stopped) {
+      throw notStoppedError(previous, force);
+    }
+    const currentPayload = { pid: current.pid, version: current.version ?? null, startedAt: current.startedAt ?? null };
+    if (globalFlags.json) {
+      writeJson({ previous: previous.running ? stoppedServerPayload(previous) : null, current: currentPayload });
+      return;
+    }
+    console.log(previous.running
+      ? `Restarted tgcli server: ${previous.version ?? '(unknown version)'} (pid ${previous.pid}) -> ${current.version} (pid ${current.pid}).`
+      : `Started ${serverLabel(current)}.`);
+    if (current.version !== readVersion()) {
+      console.log(`It runs ${current.version}, not this CLI's ${readVersion()}: ${isManagedServer(previous) ? `${previous.manager} started it` : 'another CLI started it first'}.`);
+    }
+  }, globalFlags.timeoutMs);
+}
+
+async function runServerLogs(globalFlags, options = {}) {
+  const count = parsePositiveInt(options.lines, '--lines') ?? DEFAULT_SERVER_LOG_LINES;
+  const storeDir = resolveStoreDir();
+  const tail = readServerLogTail(storeDir, count);
+  if (globalFlags.json && !options.follow) {
+    writeJson({ path: tail.path, exists: tail.exists, lines: tail.lines });
+    return;
+  }
+  // With --follow, --json prints one JSON object per line as it arrives.
+  const emit = globalFlags.json
+    ? (line) => process.stdout.write(`${JSON.stringify({ line })}\n`)
+    : (line) => process.stdout.write(`${line}\n`);
+  if (!tail.exists) {
+    if (!options.follow) {
+      console.log(`No server log yet (${tail.path}).`);
+      return;
+    }
+    writeProgress(globalFlags, `Waiting for ${tail.path}...`);
+  }
+  tail.lines.forEach(emit);
+  if (!options.follow) {
+    return;
+  }
+
+  const controller = new AbortController();
+  const stop = () => controller.abort();
+  process.once('SIGINT', stop);
+  const timer = globalFlags.timeoutMs ? setTimeout(stop, globalFlags.timeoutMs) : null;
+  try {
+    await followServerLog(storeDir, (lines) => lines.forEach(emit), {
+      signal: controller.signal,
+      from: tail.position ?? undefined,
+    });
+  } finally {
+    process.off('SIGINT', stop);
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 async function runServiceInstall(globalFlags) {

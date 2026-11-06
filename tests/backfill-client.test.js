@@ -14,6 +14,7 @@ const control = vi.hoisted(() => ({
   cancelBackfill: vi.fn(() => Promise.resolve({ canceled: 1, jobIds: [11] })),
   retryBackfill: vi.fn(() => Promise.resolve({ updated: 2, jobIds: [11, 12] })),
   enqueueRepair: vi.fn(() => Promise.resolve({ channelIds: ['-100'] })),
+  syncServerVersion: vi.fn(() => Promise.resolve('current')),
 }));
 
 vi.mock('../core/services.js', () => ({
@@ -206,6 +207,52 @@ describe('backfill status', () => {
     expect(out).toContain('QUEUE:');
     expect(out).toContain('SERVER: up (pid 7)');
     expect(out).toContain('Chan [in_progress] 40/100 (40%)');
+  });
+
+  it('brings a server on another version to this one before reporting it', async () => {
+    services.current = makeFakeServices();
+    const order = [];
+    control.syncServerVersion.mockImplementation(async () => {
+      order.push('sync');
+      return 'replaced';
+    });
+    control.pingServer.mockImplementation(async () => {
+      order.push('ping');
+      return { ok: true, pid: 8, version: '3' };
+    });
+
+    await runProgram(['backfill', 'status']);
+    expect(control.syncServerVersion).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: false });
+    expect(order).toEqual(['sync', 'ping']);
+    expect(logSpy.mock.calls.flat().join('\n')).toContain('SERVER: up (pid 8)');
+  });
+});
+
+describe('server version check before every command', () => {
+  afterEach(() => {
+    process.exitCode = 0;
+  });
+
+  it('runs before doctor, which never talks to the server', async () => {
+    services.current = makeFakeServices();
+    await runProgram(['--quiet', 'doctor']).catch(() => {});
+    expect(control.syncServerVersion).toHaveBeenCalledWith('/tmp/tgcli-test-store', { quiet: true });
+  });
+
+  it.each([
+    ['server stop', ['server', 'stop']],
+    ['server logs', ['server', 'logs']],
+  ])('leaves %s to manage the server itself', async (_label, argv) => {
+    await runProgram(argv).catch(() => {});
+    expect(control.syncServerVersion).not.toHaveBeenCalled();
+  });
+
+  it('does not block the command when the check fails', async () => {
+    services.current = makeFakeServices();
+    control.syncServerVersion.mockRejectedValueOnce(new Error('ps exploded'));
+    await runProgram(['backfill', 'status']);
+    expect(stderrText()).toContain('could not bring tgcli server to this version: ps exploded');
+    expect(logSpy.mock.calls.flat().join('\n')).toContain('QUEUE:');
   });
 });
 

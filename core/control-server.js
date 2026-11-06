@@ -8,6 +8,9 @@ import { SendCommandError } from './send-utils.js';
 
 export const CONTROL_FILE = 'control.json';
 export const CONTROL_TOKEN_HEADER = 'x-tgcli-control-token';
+// Each CLI request names its version, so a server knows when a CLI of its own
+// version last used it (see ownClientIdleMs in /control/ping).
+export const CONTROL_CLIENT_VERSION_HEADER = 'x-tgcli-client-version';
 
 // Generate a fresh control secret. Loopback binding plus this token are the two
 // layers guarding the always-on control API.
@@ -74,6 +77,9 @@ export function isIdle({ jobCounts, watchedCount, lastActivityAt, now, idleExitM
  * @param {string} deps.startedAt     ISO timestamp the server started.
  * @param {Function} [deps.onActivity] Called on every authed request (idle reset).
  * @param {Function} [deps.ensureLogin] Optional async hook run before enqueue.
+ * @param {Function} [deps.onShutdown] Runs the server's graceful shutdown; called
+ *                                     once the /control/shutdown reply is sent.
+ * @param {Function} [deps.now]        Clock in ms, for tests.
  */
 export function createControlRequestHandler({
   service,
@@ -84,7 +90,12 @@ export function createControlRequestHandler({
   startedAt,
   onActivity,
   ensureLogin,
+  onShutdown,
+  now = Date.now,
 }) {
+  // The CLI that started this server ran its version, so the clock starts now.
+  let ownClientAt = now();
+
   return async function handleControlRequest(req, res) {
     let url;
     try {
@@ -108,6 +119,9 @@ export function createControlRequestHandler({
     if (typeof onActivity === 'function') {
       onActivity();
     }
+    if (req.headers[CONTROL_CLIENT_VERSION_HEADER] === version) {
+      ownClientAt = now();
+    }
 
     try {
       if (req.method === 'GET' && url.pathname === '/control/ping') {
@@ -117,7 +131,19 @@ export function createControlRequestHandler({
           version,
           startedAt,
           jobs: service.getJobCounts(),
+          ownClientIdleMs: Math.max(0, now() - ownClientAt),
         });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/control/shutdown') {
+        if (typeof onShutdown !== 'function') {
+          sendJson(res, 501, { error: 'Shutdown is not available on this server' });
+          return;
+        }
+        // Reply first: the shutdown closes every control connection.
+        res.once('finish', () => onShutdown());
+        sendJson(res, 202, { ok: true, pid });
         return;
       }
 

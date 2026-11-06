@@ -32,6 +32,7 @@ vi.mock('../core/control-client.js', () => ({
   ensureServer: (...args) => control.ensureServer(...args),
   invoke: (...args) => control.invoke(...args),
   pingServer: vi.fn(),
+  syncServerVersion: vi.fn(async () => 'current'),
   enqueueBackfill: vi.fn(),
   cancelBackfill: vi.fn(),
   ServerUnavailableError,
