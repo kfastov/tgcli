@@ -66,6 +66,7 @@ tgcli backfill status                          # active backfills + server statu
 tgcli backfill count                           # number of in-progress backfills
 tgcli backfill wait                            # block until the queue drains
 tgcli backfill cancel --chat @channel          # stop a chat's backfills
+tgcli backfill repair --all                    # fill holes older versions left (last 30 days of every synced chat)
 tgcli channels watch --chat @channel           # subscribe a chat for archiving (queues a backfill)
 tgcli channels unwatch --chat @channel         # stop archiving a chat
 tgcli backfill --follow                         # track the server's queue to completion (`sync` is a silent alias)

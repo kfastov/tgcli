@@ -5,51 +5,53 @@ Versions before the sent-message fix did not archive messages sent through tgcli
 sync cursor past them for good. Versions before the realtime fix also lost single
 messages in channels and supergroups while the server ran, with no sign in the
 archive, because a min copy of a chat overwrote its access hash in the session.
-Versions before the recheck fix lost fresh messages in busy channels too: Telegram can
-name real messages as deleted in a channel difference and hide them from history for a
-while, and nothing announces them when they show up.
-`scripts/recover-archive-gaps.js` writes back whatever a chat's history has and the
-archive does not.
+Versions before the recheck fix (2.2.5) lost fresh messages in busy channels too:
+Telegram can name real messages as deleted in a channel difference and hide them from
+history for a while, and nothing announces them when they show up.
+
+`tgcli backfill repair` writes back whatever a chat's history has and the archive does
+not. The always-on server runs it between its other work, so nothing has to be stopped.
+`tgcli doctor` reminds you of it until `--all` has run; an archive started by 2.2.5 or later
+needs no repair and gets no reminder.
 
 ## Steps
 
-1. Install a version with the fixes, or new gaps keep appearing.
-2. Back up the archive. It is `messages.db` in the store directory (`TGCLI_STORE`, or
-   the OS app-data directory):
-
+1. Install 2.2.5 or later, or new gaps keep appearing.
+2. Optionally back up the archive. A repair only adds rows, but the archive is
+   `messages.db` in the store directory (`TGCLI_STORE`, or the OS app-data directory):
    ```bash
    sqlite3 <store>/messages.db ".backup <store>/messages.backup.db"
    ```
-
-3. List the chats to repair: those you sent to through tgcli, whose sends the archive
-   does not mark, and active channels and supergroups. The script refuses chats with
-   sync disabled.
-4. For each chat, pick `afterMessageId`: the last message before the first possible
-   gap. `0` walks the whole chat. The walk starts at the newest message and costs one
-   page of 100 messages per second.
-5. Stop the server: `tgcli service stop` if it runs as a service, otherwise kill it. It
-   does not exit by itself while any chat is synced, and the script refuses to run
-   while one answers, printing its pid. Any other tgcli command starts a new server,
-   so run none until you are done.
-6. Run the script from a repository checkout, with the Node version `better-sqlite3`
-   is built for. Start with one chat where you know a message is missing, and check it
-   as in step 7 before going on:
-
+3. Repair every chat with sync on, over the last 30 days:
    ```bash
-   node scripts/recover-archive-gaps.js <chatId> <afterMessageId>
+   tgcli backfill repair --all
    ```
-
-7. Check a message you know was missing. Ask SQLite rather than `tgcli messages show`,
+   Or one chat, with a date or a message id as the lower bound:
+   ```bash
+   tgcli backfill repair --chat @channel --since 2026-01-01
+   tgcli backfill repair --chat @channel --after-id 123456
+   ```
+   `--since` also takes a duration with a unit, such as `7d`. `--after-id` alone sets no
+   date bound, and `--after-id 0` walks everything the archive covers. The command follows progress
+   on stderr and prints what it added; Ctrl-C detaches and the server carries on.
+   `--background` returns at once, and `tgcli backfill status` shows repairs under way.
+4. Check a message you know was missing. Ask SQLite rather than `tgcli messages show`,
    which falls back to Telegram when the archive has no such row:
-
    ```bash
    sqlite3 <store>/messages.db "SELECT message_id, text FROM messages WHERE channel_id = '<chatId>' AND message_id = <messageId>;"
    ```
 
 ## What it does
 
-- Walks the history from new to old and writes through `INSERT OR IGNORE`: existing
-  rows do not change and nothing is duplicated, so an interrupted run can be repeated.
-- Leaves the sync cursors alone.
+- Walks the history from new to old, one page of 100 messages per step with a second
+  between pages, and writes through `INSERT OR IGNORE`: existing rows do not change and
+  nothing is duplicated.
+- Leaves the sync cursors alone, and goes no lower than what the archive covers: the
+  older of the chat's oldest archived message and its backfill cursor. Older history is
+  what `backfill --depth` and `--min-date` are for, and a chat with nothing archived is
+  skipped.
 - Adds everything missing in the range, not only your own sends.
-- Runs with updates disabled, so it does not take the catch-up from the server.
+- Lets backfills and gap fills go first, a page at a time. A restarted server carries on
+  where it stopped, a rate limit pauses it, and a failed repair is retried with failed
+  backfills, hourly, unless the chat's sync is off.
+- Asking again for a chat starts its repair over with the new bounds.

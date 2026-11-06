@@ -13,6 +13,7 @@ const control = vi.hoisted(() => ({
   enqueueBackfill: vi.fn(() => Promise.resolve({ jobId: 11, channelId: '-100', status: 'pending' })),
   cancelBackfill: vi.fn(() => Promise.resolve({ canceled: 1, jobIds: [11] })),
   retryBackfill: vi.fn(() => Promise.resolve({ updated: 2, jobIds: [11, 12] })),
+  enqueueRepair: vi.fn(() => Promise.resolve({ channelIds: ['-100'] })),
 }));
 
 vi.mock('../core/services.js', () => ({
@@ -43,6 +44,7 @@ function makeFakeServices(overrides = {}) {
     getQueueStats: vi.fn(() => ({ pending: 0, in_progress: 0, idle: 0, error: 0, processing: false })),
     getJobCounts: vi.fn(() => ({ pending: 0, inProgress: 0 })),
     listJobs: vi.fn(() => []),
+    listRepairs: vi.fn(() => []),
     cancelJobs: vi.fn(() => ({ canceled: 1, jobIds: [11] })),
     shutdown: vi.fn().mockResolvedValue(undefined),
     ...overrides,
@@ -81,6 +83,7 @@ afterEach(() => {
   control.enqueueBackfill.mockResolvedValue({ jobId: 11, channelId: '-100', status: 'pending' });
   control.cancelBackfill.mockResolvedValue({ canceled: 1, jobIds: [11] });
   control.retryBackfill.mockResolvedValue({ updated: 2, jobIds: [11, 12] });
+  control.enqueueRepair.mockResolvedValue({ channelIds: ['-100'] });
   vi.clearAllMocks();
 });
 
@@ -203,6 +206,112 @@ describe('backfill status', () => {
     expect(out).toContain('QUEUE:');
     expect(out).toContain('SERVER: up (pid 7)');
     expect(out).toContain('Chan [in_progress] 40/100 (40%)');
+  });
+});
+
+describe('backfill repair', () => {
+  const repair = (fields) => ({
+    channel_id: '-100',
+    peer_title: 'Chan',
+    status: 'in_progress',
+    checked_count: 0,
+    added_count: 0,
+    cursor_message_id: null,
+    error: null,
+    ...fields,
+  });
+
+  afterEach(() => {
+    process.exitCode = 0;
+  });
+
+  it('queues one chat for the last 30 days on the server and follows it to the end', async () => {
+    const listRepairs = vi
+      .fn()
+      .mockReturnValueOnce([repair({ checked_count: 100, added_count: 1 })])
+      .mockReturnValue([repair({ status: 'idle', checked_count: 250, added_count: 2 })]);
+    services.current = makeFakeServices({ listRepairs });
+    const before = Math.floor(Date.now() / 1000);
+
+    await runProgram(['backfill', 'repair', '--chat', '@chan']);
+
+    expect(control.ensureServer).toHaveBeenCalled();
+    const [storeDir, request] = control.enqueueRepair.mock.calls[0];
+    expect(storeDir).toBe('/tmp/tgcli-test-store');
+    expect(request).toMatchObject({ chats: ['@chan'], all: false, afterId: 0 });
+    expect(before - request.sinceDate).toBeGreaterThanOrEqual(30 * 86400 - 1);
+    expect(before - request.sinceDate).toBeLessThanOrEqual(30 * 86400 + 1);
+    expect(listRepairs).toHaveBeenCalledWith({ channelIds: ['-100'] });
+    expect(stderrText()).toContain('Repairing Chan: checked 100, added 1');
+    expect(logSpy.mock.calls.flat().join(' ')).toContain('Chan: checked 250, added 2.');
+    expect(process.exitCode).not.toBe(1);
+  });
+
+  it('takes an ISO date for --since, and no date bound with --after-id alone', async () => {
+    services.current = makeFakeServices({ listRepairs: vi.fn(() => [repair({ status: 'idle' })]) });
+
+    await runProgram(['backfill', 'repair', '--all', '--since', '2026-10-01']);
+    expect(control.enqueueRepair.mock.calls[0][1]).toEqual({
+      chats: [],
+      all: true,
+      afterId: 0,
+      sinceDate: Date.parse('2026-10-01') / 1000,
+    });
+
+    await runProgram(['sync', 'repair', '--chat', '-100', '--after-id', '500']);
+    expect(control.enqueueRepair.mock.calls[1][1]).toEqual({ chats: ['-100'], all: false, afterId: 500, sinceDate: null });
+  });
+
+  it.each([
+    [['backfill', 'repair'], /either --chat/],
+    [['backfill', 'repair', '--chat', '-100', '--all'], /either --chat/],
+    [['backfill', 'repair', '--all', '--after-id', '5'], /--after-id works with --chat only/],
+    [['backfill', 'repair', '--chat', '-100', '--since', 'soon'], /--since must be/],
+    [['backfill', 'repair', '--chat', '-100', '--since', '30'], /--since must be/],
+  ])('refuses %j before touching the server', async (argv, message) => {
+    services.current = makeFakeServices();
+
+    await runProgram(argv);
+
+    expect(process.exitCode).toBe(1);
+    expect(stderrText()).toMatch(message);
+    expect(control.ensureServer).not.toHaveBeenCalled();
+    expect(control.enqueueRepair).not.toHaveBeenCalled();
+  });
+
+  it('exits non-zero and says why when a repair fails', async () => {
+    services.current = makeFakeServices({
+      listRepairs: vi.fn(() => [repair({ status: 'error', error: 'CHANNEL_PRIVATE' })]),
+    });
+
+    await runProgram(['backfill', 'repair', '--chat', '-100']);
+
+    expect(process.exitCode).toBe(1);
+    expect(errSpy.mock.calls.flat().join(' ')).toContain('Repair of Chan failed: CHANNEL_PRIVATE');
+  });
+
+  it('--background --json returns the queued chats without following them', async () => {
+    services.current = makeFakeServices();
+
+    await runProgram(['--json', 'backfill', 'repair', '--all', '--background']);
+
+    expect(services.current.messageSyncService.listRepairs).not.toHaveBeenCalled();
+    expect(JSON.parse(stdoutText())).toEqual({ ok: true, channelIds: ['-100'] });
+  });
+
+  it('status lists repairs that have not finished', async () => {
+    services.current = makeFakeServices({
+      listRepairs: vi.fn(() => [
+        repair({ checked_count: 300, added_count: 4 }),
+        repair({ channel_id: '-200', peer_title: 'Done', status: 'idle' }),
+      ]),
+    });
+
+    await runProgram(['backfill', 'status']);
+
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('repair Chan [in_progress] checked=300 added=4');
+    expect(out).not.toContain('repair Done');
   });
 });
 

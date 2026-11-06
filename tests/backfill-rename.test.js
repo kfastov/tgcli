@@ -70,6 +70,7 @@ function makeFakeServices(overrides = {}) {
       processing: false,
     })),
     listJobs: vi.fn(() => []),
+    listRepairs: vi.fn(() => []),
     addJob: vi.fn((chat) => ({ id: 1, channel_id: chat, status: 'pending' })),
     setChannelSync: vi.fn((chat, enabled) => ({
       channel_id: chat,

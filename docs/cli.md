@@ -67,6 +67,15 @@ one-shot client.
 - backfill cancel --chat <id|username>
   - Cancel a chat's backfills via the server when one is up; falls back to a
     direct cancel (same as `backfill jobs cancel --channel`) when none is.
+- backfill repair --chat <id|username>|--all [--since ISO|7d] [--after-id N] [--background]
+  - Fill holes that older versions left in the archive: walk the chat's history from
+    the newest message down to the bound and write back what the archive lacks.
+    Cursors stay put, and nothing below what the archive covers is added (the older
+    of the oldest archived message and the backfill cursor). Without a bound it reads
+    the last 30 days; `--since` takes an ISO date or a duration with a unit (`7d`), and
+    `--after-id` alone sets no date bound. Runs on the server between its other jobs, one page a second; follows
+    progress like `backfill --chat`, and Ctrl-C detaches. Exits non-zero if a repair
+    fails. See [archive-recovery.md](archive-recovery.md).
 - backfill (no --chat): track the server's queue (alias: `sync`)
   - `--follow`: auto-start the server if needed, track the queue with live
     progress, and exit once it drains. The server keeps running on its own
@@ -94,7 +103,8 @@ one-shot client.
 
 ## doctor
 - doctor [--connect]
-  - Checks auth, lock, FTS, last sync, queue state.
+  - Checks auth, lock, FTS, last sync, queue state. For an archive started before 2.2.5,
+    suggests `backfill repair --all` until it has run.
 
 ## channels
 - channels list [--limit] [--query]
@@ -212,5 +222,5 @@ Legacy `--offset-id` is accepted as a hidden alias for `--before-id`.
 `<folder>` can be a numeric folder ID or folder title.
 
 ## Recovering archive gaps
-`scripts/recover-archive-gaps.js` fills gaps that older versions left in the archive.
+`tgcli backfill repair` fills gaps that older versions left in the archive.
 See [archive-recovery.md](archive-recovery.md).

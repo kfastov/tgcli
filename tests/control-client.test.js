@@ -16,6 +16,7 @@ vi.mock('child_process', () => ({ spawn: spawnMock, spawnSync: spawnSyncMock }))
 import {
   cancelBackfill,
   enqueueBackfill,
+  enqueueRepair,
   ensureServer,
   invoke,
   pingServer,
@@ -121,6 +122,21 @@ describe('enqueueBackfill / cancelBackfill', () => {
   it('throws the server error message on a non-200 backfill response', async () => {
     global.fetch.mockResolvedValue(jsonResponse(400, { error: 'chatId is required' }));
     await expect(enqueueBackfill(storeDir, {})).rejects.toThrow('chatId is required');
+  });
+
+  it('POSTs to /control/repair and returns the queued chats', async () => {
+    global.fetch.mockResolvedValue(jsonResponse(200, { channelIds: ['-100'] }));
+    const result = await enqueueRepair(storeDir, { chats: ['@c'], all: false, afterId: 0, sinceDate: 1700000000 });
+    expect(result).toEqual({ channelIds: ['-100'] });
+    const [url, init] = global.fetch.mock.calls[0];
+    expect(url).toBe('http://127.0.0.1:8765/control/repair');
+    expect(JSON.parse(init.body)).toEqual({ chats: ['@c'], all: false, afterId: 0, sinceDate: 1700000000 });
+  });
+
+  it('says to restart a server too old to know /control/repair', async () => {
+    writeControl({ pid: 9, port: 8765, token: 'secret', startedAt: 's', version: '2.2.4' });
+    global.fetch.mockResolvedValue(jsonResponse(404, { error: 'Not found' }));
+    await expect(enqueueRepair(storeDir, { all: true })).rejects.toThrow(/server \(2\.2\.4, pid 9\) predates `backfill repair`; restart it/);
   });
 
   it('POSTs to /control/cancel', async () => {

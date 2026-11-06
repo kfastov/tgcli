@@ -143,6 +143,38 @@ export function createControlRequestHandler({
         return;
       }
 
+      if (req.method === 'POST' && url.pathname === '/control/repair') {
+        const body = await readJsonBody(req);
+        const chats = Array.isArray(body?.chats) ? body.chats.filter((chat) => String(chat ?? '').trim() !== '') : [];
+        if (!body?.all && !chats.length) {
+          sendJson(res, 400, { error: 'Provide chats or all' });
+          return;
+        }
+        const isBound = (value) => value === undefined || value === null || (Number.isInteger(value) && value >= 0);
+        if (!isBound(body?.afterId) || !isBound(body?.sinceDate)) {
+          sendJson(res, 400, { error: 'afterId and sinceDate must be non-negative integers' });
+          return;
+        }
+        let channelIds;
+        try {
+          channelIds = service.addRepairs({
+            chats,
+            all: Boolean(body?.all),
+            afterId: body?.afterId,
+            sinceDate: body?.sinceDate,
+          });
+        } catch (error) {
+          sendJson(res, 400, { error: error?.message ?? 'Repair request failed' });
+          return;
+        }
+        if (typeof ensureLogin === 'function') {
+          await ensureLogin();
+        }
+        void service.processQueue();
+        sendJson(res, 200, { channelIds });
+        return;
+      }
+
       if (req.method === 'POST' && url.pathname === '/control/invoke') {
         const body = await readJsonBody(req);
         const op = body?.op;

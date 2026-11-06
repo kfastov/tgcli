@@ -26,6 +26,7 @@ import { parseDuration } from './core/duration.js';
 import {
   cancelBackfill,
   enqueueBackfill,
+  enqueueRepair,
   ensureServer,
   pingServer,
   retryBackfill,
@@ -35,6 +36,9 @@ const CLI_PATH = fileURLToPath(import.meta.url);
 const SERVICE_STATE_FILE = 'service-state.json';
 const LAUNCHD_LABEL = 'com.kfastov.tgcli';
 const SYSTEMD_SERVICE_NAME = 'tgcli';
+// How far back `backfill repair` reads when given no bound.
+const DEFAULT_REPAIR_SINCE = '30d';
+const REPAIR_PROGRESS_INTERVAL_MS = 5000;
 const AUTH_SYNC_HINT = 'Run `tgcli backfill --once` or `tgcli backfill --follow` when you need archive data.';
 const CONFIG_SPECS = [
   { key: 'apiId', path: ['apiId'], type: 'number' },
@@ -164,6 +168,19 @@ function buildProgram() {
     // presence inside the handler rather than with requiredOption).
     .action(withGlobalOptions((globalFlags, options, command) =>
       runBackfillCancel(globalFlags, command.optsWithGlobals()),
+    ));
+  sync
+    .command('repair')
+    .description('Fill holes in the archive from Telegram history (cursors stay put)')
+    // --chat and --background are also declared on the parent `backfill`; read them
+    // through optsWithGlobals, as `backfill cancel` does.
+    .option('--chat <id|username>', 'Chat to repair')
+    .option('--all', 'Repair every chat with sync enabled')
+    .option('--since <date|duration>', `Lower bound: ISO date or duration such as 7d (default ${DEFAULT_REPAIR_SINCE})`)
+    .option('--after-id <id>', 'Lower bound: only messages above this id (with --chat; no default date bound)')
+    .option('--background', 'Enqueue and return immediately')
+    .action(withGlobalOptions((globalFlags, options, command) =>
+      runBackfillRepair(globalFlags, command.optsWithGlobals()),
     ));
   const syncJobs = sync.command('jobs').description('Manage sync jobs');
   syncJobs
@@ -1739,6 +1756,135 @@ async function runBackfillCancel(globalFlags, options = {}) {
   }, globalFlags.timeoutMs);
 }
 
+// An ISO date, or a duration back from now. Returns unix seconds.
+function parseRepairSince(value, now = Date.now()) {
+  const raw = String(value).trim();
+  if (/^\d{4}-\d{2}-\d{2}/.test(raw)) {
+    const ms = Date.parse(raw);
+    if (!Number.isFinite(ms)) {
+      throw new Error(`--since: invalid date ${raw}`);
+    }
+    return Math.floor(ms / 1000);
+  }
+  let ms;
+  try {
+    // A bare number would read as seconds; nobody means that here.
+    ms = /^\d+$/.test(raw) ? null : parseDuration(raw);
+  } catch {
+    ms = null;
+  }
+  if (ms === null) {
+    throw new Error(`--since must be an ISO date or a duration such as 7d, got ${raw}`);
+  }
+  return Math.floor((now - ms) / 1000);
+}
+
+function repairLabel(repair) {
+  return repair.peer_title || repair.channel_id;
+}
+
+function repairSummary(repair) {
+  return {
+    channelId: repair.channel_id,
+    title: repair.peer_title ?? null,
+    status: repair.status,
+    checked: repair.checked_count ?? 0,
+    added: repair.added_count ?? 0,
+    cursorMessageId: repair.cursor_message_id ?? null,
+    error: repair.error ?? null,
+  };
+}
+
+// Queue a repair on the always-on server (auto-starting it) and follow it, or return
+// at once with --background. Like `backfill --chat`, Ctrl-C detaches and the server
+// carries on.
+async function runBackfillRepair(globalFlags, options = {}) {
+  return runWithTimeout(async () => {
+    if (Boolean(options.chat) === Boolean(options.all)) {
+      throw new Error('Pass either --chat <id|username> or --all');
+    }
+    if (options.afterId !== undefined && !options.chat) {
+      throw new Error('--after-id works with --chat only');
+    }
+    const afterId = options.afterId !== undefined ? Number(options.afterId) : 0;
+    if (!Number.isInteger(afterId) || afterId < 0) {
+      throw new Error('--after-id must be a message id (0 or more)');
+    }
+    const since = options.since ?? (options.afterId !== undefined ? null : DEFAULT_REPAIR_SINCE);
+    const sinceDate = since ? parseRepairSince(since) : null;
+
+    const storeDir = resolveStoreDir();
+    await ensureAutoStartedServer(globalFlags, storeDir);
+    const { channelIds } = await enqueueRepair(storeDir, {
+      chats: options.chat ? [options.chat] : [],
+      all: Boolean(options.all),
+      afterId,
+      sinceDate,
+    });
+
+    if (options.background) {
+      if (globalFlags.json) {
+        writeJson({ ok: true, channelIds });
+      } else {
+        console.log(`Queued a repair of ${channelIds.length} chat(s). Follow it with \`tgcli backfill status\`.`);
+      }
+      return;
+    }
+
+    let detached = false;
+    const onSigint = () => {
+      detached = true;
+      writeProgress(globalFlags, 'Still running in the background — check `tgcli backfill status`');
+      process.exit(0);
+    };
+    process.on('SIGINT', onSigint);
+
+    try {
+      let repairs = [];
+      let lastLine = null;
+      let lastPrintedAt = 0;
+      while (!detached) {
+        repairs = withReadSnapshot(storeDir, (service) => service.listRepairs({ channelIds }));
+        const active = repairs.find((repair) => !TERMINAL_JOB_STATUSES.has(repair.status));
+        if (!active) {
+          break;
+        }
+        const finished = repairs.length - repairs.filter((repair) => !TERMINAL_JOB_STATUSES.has(repair.status)).length;
+        const line = `Repairing ${repairLabel(active)}: checked ${active.checked_count}, added ${active.added_count}`
+          + (repairs.length > 1 ? ` (${finished}/${repairs.length} chats done)` : '');
+        if (line !== lastLine && Date.now() - lastPrintedAt >= REPAIR_PROGRESS_INTERVAL_MS) {
+          writeProgress(globalFlags, line);
+          lastLine = line;
+          lastPrintedAt = Date.now();
+        }
+        await delay(1000);
+      }
+
+      const failed = repairs.filter((repair) => repair.status === 'error');
+      if (failed.length) {
+        process.exitCode = 1;
+      }
+      if (globalFlags.json) {
+        writeJson({ ok: failed.length === 0, repairs: repairs.map(repairSummary) });
+        return;
+      }
+      for (const repair of repairs) {
+        if (repair.status === 'error') {
+          console.error(`Repair of ${repairLabel(repair)} failed: ${repair.error ?? 'unknown error'}`);
+        } else if (repair.added_count > 0 || repairs.length === 1) {
+          console.log(`${repairLabel(repair)}: checked ${repair.checked_count}, added ${repair.added_count}.`);
+        }
+      }
+      const added = repairs.reduce((sum, repair) => sum + (repair.added_count ?? 0), 0);
+      if (repairs.length > 1) {
+        console.log(`Repaired ${repairs.length - failed.length}/${repairs.length} chat(s), added ${added} message(s).`);
+      }
+    } finally {
+      process.off('SIGINT', onSigint);
+    }
+  }, globalFlags.timeoutMs);
+}
+
 // Bare `backfill`/`sync` (no --chat). Archiving runs in the always-on server; this
 // only tracks its queue. `--follow` and `--once` both drain the queue and exit —
 // they never run a worker or hold the store write lock. With no flag, there is
@@ -2150,10 +2296,12 @@ async function runSyncStatus(globalFlags) {
     const storeDir = resolveStoreDir();
     // Snapshot the queue + active backfills under a brief read lock so a running
     // server keeps its write lock free.
-    const { queue, jobs } = withReadSnapshot(storeDir, (service) => ({
+    const { queue, jobs, repairs } = withReadSnapshot(storeDir, (service) => ({
       queue: service.getQueueStats(),
       jobs: service.listJobs({ limit: 100 }),
+      repairs: service.listRepairs(),
     }));
+    const openRepairs = repairs.filter((repair) => repair.status !== 'idle');
     // in_progress first, then pending — the chats actively/imminently backfilling.
     const active = jobs.filter((job) => job.status === 'in_progress' || job.status === 'pending');
     const ping = await pingServer(storeDir);
@@ -2172,6 +2320,7 @@ async function runSyncStatus(globalFlags) {
           cursorDate: job.cursor_message_date ?? null,
           updatedAt: job.updated_at ?? null,
         })),
+        repairs: repairs.map(repairSummary),
       });
       return;
     }
@@ -2190,6 +2339,10 @@ async function runSyncStatus(globalFlags) {
         const updated = job.updated_at ? ` updated=${job.updated_at}` : '';
         console.log(`  ${label} [${job.status}] ${done}/${target} (${pct}%)${cursor}${updated}`);
       }
+    }
+    for (const repair of openRepairs) {
+      const error = repair.error ? ` error=${repair.error}` : '';
+      console.log(`  repair ${repairLabel(repair)} [${repair.status}] checked=${repair.checked_count} added=${repair.added_count}${error}`);
     }
   }, timeoutMs);
 }
@@ -2305,6 +2458,7 @@ async function runDoctor(globalFlags, options = {}) {
 
     const search = messageSyncService.getSearchStatus();
     const queue = messageSyncService.getQueueStats();
+    const repairSuggested = messageSyncService.isRepairSuggested();
 
     const payload = {
       storeDir,
@@ -2315,6 +2469,7 @@ async function runDoctor(globalFlags, options = {}) {
       ftsEnabled: search.enabled,
       ftsVersion: search.version,
       queue,
+      repairSuggested,
     };
 
     if (globalFlags.json) {
@@ -2328,6 +2483,9 @@ async function runDoctor(globalFlags, options = {}) {
     console.log(`CONNECTED: ${payload.connected}`);
     console.log(`FTS: ${payload.ftsEnabled}${payload.ftsVersion ? ` (v${payload.ftsVersion})` : ''}`);
     console.log(`QUEUE: pending=${queue.pending} in_progress=${queue.in_progress} idle=${queue.idle} error=${queue.error} gaps=${queue.gaps}`);
+    if (repairSuggested) {
+      console.log(`REPAIR: versions before 2.2.5 could lose messages; fill the holes with \`tgcli backfill repair --all\` (the last ${DEFAULT_REPAIR_SINCE} of every synced chat).`);
+    }
   });
 }
 

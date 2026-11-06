@@ -21,6 +21,7 @@ describe('parseDuration', () => {
     expect(parseDuration('5s')).toBe(5_000);
     expect(parseDuration('2m')).toBe(120_000);
     expect(parseDuration('1h')).toBe(3_600_000);
+    expect(parseDuration('30d')).toBe(30 * 86_400_000);
   });
 
   it('is case-insensitive and trims whitespace', () => {

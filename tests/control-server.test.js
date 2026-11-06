@@ -21,6 +21,7 @@ function makeService(overrides = {}) {
     processQueue: vi.fn(() => Promise.resolve()),
     cancelJobs: vi.fn(() => ({ canceled: 1, jobIds: [42] })),
     retryJobs: vi.fn(() => ({ updated: 1, jobIds: [42] })),
+    addRepairs: vi.fn(({ chats, all }) => (all ? ['-100', '-200'] : chats)),
     ...overrides,
   };
 }
@@ -115,6 +116,53 @@ describe('control API request handler', () => {
     });
     expect(status).toBe(400);
     expect(service.addJob).not.toHaveBeenCalled();
+  });
+
+  it('POST /control/repair queues repairs and kicks the queue', async () => {
+    const { status, json } = await request(port, 'POST', '/control/repair', {
+      token: TOKEN,
+      body: { chats: ['-100'], afterId: 0, sinceDate: 1700000000 },
+    });
+    expect(status).toBe(200);
+    expect(service.addRepairs).toHaveBeenCalledWith({ chats: ['-100'], all: false, afterId: 0, sinceDate: 1700000000 });
+    expect(service.processQueue).toHaveBeenCalledTimes(1);
+    expect(json).toEqual({ channelIds: ['-100'] });
+  });
+
+  it('POST /control/repair takes all chats with sync on', async () => {
+    const { status, json } = await request(port, 'POST', '/control/repair', {
+      token: TOKEN,
+      body: { all: true, sinceDate: 1700000000 },
+    });
+    expect(status).toBe(200);
+    expect(service.addRepairs).toHaveBeenCalledWith({ chats: [], all: true, afterId: undefined, sinceDate: 1700000000 });
+    expect(json).toEqual({ channelIds: ['-100', '-200'] });
+  });
+
+  it('POST /control/repair requires chats or all', async () => {
+    const { status } = await request(port, 'POST', '/control/repair', { token: TOKEN, body: { chats: [' '] } });
+    expect(status).toBe(400);
+    expect(service.addRepairs).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ chats: ['-100'], sinceDate: '2026-01-01' }],
+    [{ chats: ['-100'], afterId: -1 }],
+    [{ all: true, sinceDate: 1.5 }],
+  ])('POST /control/repair refuses bounds that are not whole numbers: %j', async (body) => {
+    const { status } = await request(port, 'POST', '/control/repair', { token: TOKEN, body });
+    expect(status).toBe(400);
+    expect(service.addRepairs).not.toHaveBeenCalled();
+  });
+
+  it('POST /control/repair answers 400 with the reason a chat cannot be repaired', async () => {
+    service.addRepairs.mockImplementation(() => {
+      throw new Error('Chat -999 is not in the archive.');
+    });
+    const { status, json } = await request(port, 'POST', '/control/repair', { token: TOKEN, body: { chats: ['-999'] } });
+    expect(status).toBe(400);
+    expect(json).toEqual({ error: 'Chat -999 is not in the archive.' });
+    expect(service.processQueue).not.toHaveBeenCalled();
   });
 
   it('POST /control/cancel cancels via cancelJobs', async () => {

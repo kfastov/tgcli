@@ -32,6 +32,10 @@ const RECHECK_GIVE_UP_MS = 24 * 60 * 60 * 1000;
 const PERIODIC_RECONCILE_MS = 60 * 60 * 1000;
 const CONNECTION_CHECK_TIMEOUT_MS = 20 * 1000;
 const RETRY_BASE_MS = 60 * 1000;
+// A repair walks history one page per queue step, so jobs and gap fills never wait
+// behind it for long.
+const REPAIR_PAGE_SIZE = 100;
+const REPAIR_PAGE_DELAY_MS = 1000;
 const RETRY_MAX_MS = 60 * 60 * 1000;
 // Marked channel ids are below this. A text prefix would also match some basic groups.
 const MAX_MARKED_CHANNEL_ID = -1000000000000;
@@ -577,6 +581,7 @@ export default class MessageSyncService {
     this.batchSize = options.batchSize || 100;
     this.interJobDelayMs = options.interJobDelayMs || 3000;
     this.interBatchDelayMs = options.interBatchDelayMs || 1000;
+    this.repairPageDelayMs = options.repairPageDelayMs ?? REPAIR_PAGE_DELAY_MS;
     this.processing = false;
     this.stopRequested = false;
     this.recheckingMessages = false;
@@ -616,6 +621,9 @@ export default class MessageSyncService {
 
     this.db = new Database(this.dbPath);
     this.db.pragma('journal_mode = WAL');
+    const newArchive = !this.db.prepare(`
+      SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'
+    `).get();
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS channels (
@@ -801,6 +809,25 @@ export default class MessageSyncService {
       );
     `);
 
+    // One repair per chat: a walk of its history from the newest message down to a
+    // bound, writing back what the archive lacks. cursor_message_id is where the
+    // next page starts, so a restarted server carries on.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS archive_repairs (
+        channel_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        after_message_id INTEGER NOT NULL DEFAULT 0,
+        since_date INTEGER,
+        cursor_message_id INTEGER,
+        checked_count INTEGER NOT NULL DEFAULT 0,
+        added_count INTEGER NOT NULL DEFAULT 0,
+        error TEXT,
+        generation INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS message_links (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -880,6 +907,9 @@ export default class MessageSyncService {
         value TEXT
       );
     `);
+    if (newArchive) {
+      this._setRepairNotNeeded('archive started with the fixes');
+    }
 
     const searchSchema = this.db.prepare(`
       SELECT sql FROM sqlite_master
@@ -2431,17 +2461,19 @@ export default class MessageSyncService {
           break;
         }
         const job = this._getNextJob();
+        const gapChannelId = job ? null : this._getNextGapChannelId();
+        const repair = job || gapChannelId ? null : this._getNextRepair();
         if (job) {
           await this._processJob(job);
-        } else {
-          const gapChannelId = this._getNextGapChannelId();
-          if (!gapChannelId) {
-            this._scheduleNextGapRetry();
-            break;
-          }
+        } else if (gapChannelId) {
           await this._fillChannelGap(gapChannelId);
+        } else if (repair) {
+          await this._repairNextPage(repair);
+        } else {
+          this._scheduleNextGapRetry();
+          break;
         }
-        await delay(this.interJobDelayMs);
+        await delay(repair ? this.repairPageDelayMs : this.interJobDelayMs);
       }
     } finally {
       this.processing = false;
@@ -2543,12 +2575,189 @@ export default class MessageSyncService {
 
   // A chat the user has turned off keeps its failed job until it is turned on again.
   _resetErroredJobs() {
+    for (const table of ['jobs', 'archive_repairs']) {
+      this.db.prepare(`
+        UPDATE ${table}
+        SET status = ?, error = NULL, updated_at = CURRENT_TIMESTAMP
+        WHERE status = ?
+          AND channel_id IN (SELECT channel_id FROM channels WHERE sync_enabled = 1)
+      `).run(JOB_STATUS.PENDING, JOB_STATUS.ERROR);
+    }
+  }
+
+  // Queues a repair for each chat, or for every chat with sync on. A repair already
+  // queued for a chat starts over with the new bounds.
+  addRepairs({ chats = [], all = false, afterId = 0, sinceDate = null } = {}) {
+    const channelIds = all
+      ? this.db.prepare('SELECT channel_id FROM channels WHERE sync_enabled = 1 ORDER BY channel_id').all()
+        .map((row) => row.channel_id)
+      : chats.map((chat) => this._findRepairableChannelId(chat));
+    if (!channelIds.length) {
+      throw new Error('No chat has sync enabled.');
+    }
+    const upsert = this.db.prepare(`
+      INSERT INTO archive_repairs (channel_id, status, after_message_id, since_date)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(channel_id) DO UPDATE SET
+        status = excluded.status,
+        after_message_id = excluded.after_message_id,
+        since_date = excluded.since_date,
+        cursor_message_id = NULL,
+        checked_count = 0,
+        added_count = 0,
+        error = NULL,
+        generation = archive_repairs.generation + 1,
+        created_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+    `);
+    this.db.transaction(() => {
+      for (const channelId of channelIds) {
+        upsert.run(channelId, JOB_STATUS.PENDING, Math.max(0, Number(afterId) || 0), sinceDate ?? null);
+      }
+      if (all) {
+        this._setRepairNotNeeded('every synced chat repaired');
+      }
+    })();
+    return channelIds;
+  }
+
+  // Archives written before 2.2.5 can hold holes nothing fills by itself. Finding them
+  // costs as much as filling them, so this only says whether `--all` has run, or the
+  // archive was started by a version with the fixes.
+  isRepairSuggested() {
+    if (this.db.prepare("SELECT 1 FROM search_meta WHERE key = 'archive_repair'").get()) {
+      return false;
+    }
+    return Boolean(this.db.prepare(`
+      SELECT 1 FROM channels
+      WHERE sync_enabled = 1
+        AND EXISTS (SELECT 1 FROM messages WHERE messages.channel_id = channels.channel_id)
+      LIMIT 1
+    `).get());
+  }
+
+  _setRepairNotNeeded(reason) {
     this.db.prepare(`
-      UPDATE jobs
-      SET status = ?, error = NULL, updated_at = CURRENT_TIMESTAMP
-      WHERE status = ?
-        AND channel_id IN (SELECT channel_id FROM channels WHERE sync_enabled = 1)
-    `).run(JOB_STATUS.PENDING, JOB_STATUS.ERROR);
+      INSERT INTO search_meta (key, value) VALUES ('archive_repair', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(reason);
+  }
+
+  _findRepairableChannelId(chat) {
+    const key = String(chat ?? '').trim();
+    const channel = this.db.prepare(`
+      SELECT channel_id, sync_enabled FROM channels
+      WHERE channel_id = ? OR (username IS NOT NULL AND LOWER(username) = LOWER(?))
+    `).get(normalizeChannelKey(key), key.replace(/^@/, ''));
+    if (!channel) {
+      throw new Error(`Chat ${key} is not in the archive.`);
+    }
+    if (channel.sync_enabled !== 1) {
+      throw new Error(`Chat ${key} has sync disabled; enable it first if it belongs in the archive.`);
+    }
+    return channel.channel_id;
+  }
+
+  listRepairs({ channelIds = null } = {}) {
+    const filter = channelIds?.length
+      ? `WHERE archive_repairs.channel_id IN (${channelIds.map(() => '?').join(', ')})`
+      : '';
+    return this.db.prepare(`
+      SELECT archive_repairs.*, channels.peer_title
+      FROM archive_repairs
+      LEFT JOIN channels ON channels.channel_id = archive_repairs.channel_id
+      ${filter}
+      ORDER BY archive_repairs.created_at, archive_repairs.channel_id
+    `).all(...(channelIds ?? []));
+  }
+
+  // The one already under way first, so chats finish one after another.
+  _getNextRepair() {
+    return this.db.prepare(`
+      SELECT * FROM archive_repairs
+      WHERE status IN (?, ?)
+      ORDER BY status = ? DESC, created_at, channel_id
+      LIMIT 1
+    `).get(JOB_STATUS.PENDING, JOB_STATUS.IN_PROGRESS, JOB_STATUS.IN_PROGRESS);
+  }
+
+  // Reads one page of history below the repair's cursor and writes back what the archive
+  // lacks, down to the repair's bounds.
+  async _repairNextPage(repair) {
+    const channelId = repair.channel_id;
+    // Asking again for the chat bumps the generation, and this page's writes go nowhere.
+    const update = (assignments, ...params) => this.db.prepare(`
+      UPDATE archive_repairs SET ${assignments}, updated_at = CURRENT_TIMESTAMP
+      WHERE channel_id = ? AND generation = ?
+    `).run(...params, channelId, repair.generation);
+    const fail = (message) => update('status = ?, error = ?', JOB_STATUS.ERROR, message);
+
+    if (this._getChannel(channelId)?.sync_enabled !== 1) {
+      fail('Sync is disabled for this chat.');
+      return;
+    }
+    const floor = this._repairFloor(channelId, repair.after_message_id);
+    if (floor === null) {
+      update('status = ?, error = NULL', JOB_STATUS.IDLE);
+      return;
+    }
+    update('status = ?', JOB_STATUS.IN_PROGRESS);
+
+    try {
+      const { messages } = await this.telegramClient.getMessagesByChannelId(channelId, REPAIR_PAGE_SIZE, {
+        offsetId: repair.cursor_message_id ?? 0,
+      });
+      const inRange = messages.filter((message) => message.id > floor
+        && !(repair.since_date && message.date && message.date < repair.since_date));
+      const added = inRange.length ? this.archiveHistoryMessages(channelId, inRange) : 0;
+      const done = !messages.length || inRange.length < messages.length;
+      const cursor = messages.length
+        ? Math.min(...messages.map((message) => message.id))
+        : repair.cursor_message_id;
+      update(
+        'status = ?, cursor_message_id = ?, checked_count = checked_count + ?, added_count = added_count + ?, error = NULL',
+        done ? JOB_STATUS.IDLE : JOB_STATUS.IN_PROGRESS,
+        cursor ?? null,
+        inRange.length,
+        added,
+      );
+      if (added) {
+        console.log(`[sync] Channel ${channelId}: repair added ${added} message(s) at ${cursor}.`);
+      }
+      if (done) {
+        const row = this.db.prepare('SELECT checked_count, added_count FROM archive_repairs WHERE channel_id = ?').get(channelId);
+        console.log(`[sync] Channel ${channelId}: repair done, checked ${row?.checked_count}, added ${row?.added_count}.`);
+      }
+    } catch (error) {
+      if (this.stopRequested) {
+        return;
+      }
+      const waitSeconds = parseRequiredWaitSeconds(error);
+      if (waitSeconds !== null) {
+        update('error = ?', `Rate limited, waiting ${waitSeconds}s`);
+        console.log(`[sync] Channel ${channelId}: rate limited, waiting ${waitSeconds}s before the next page of the repair.`);
+        await this._delayUnlessStopped(waitSeconds * 1000);
+        return;
+      }
+      fail(error?.message ?? String(error));
+      console.error(`[sync] Channel ${channelId}: repair failed below message ${repair.cursor_message_id ?? 'newest'}: ${error?.message ?? error}`);
+    }
+  }
+
+  // Holes lie inside what the archive covers: above the lower of the backfill cursor and
+  // the oldest row. Older history is a backfill's business, and a chat with neither has
+  // nothing to repair.
+  _repairFloor(channelId, afterId) {
+    const row = this.db.prepare(`
+      SELECT MIN(message_id) AS oldest_row,
+        (SELECT oldest_message_id FROM channels WHERE channel_id = ?) AS oldest_cursor
+      FROM messages WHERE channel_id = ?
+    `).get(channelId, channelId);
+    const bounds = [row.oldest_row, row.oldest_cursor].filter((id) => Number.isInteger(id) && id > 0);
+    if (!bounds.length) {
+      return null;
+    }
+    return Math.max(afterId ?? 0, Math.min(...bounds) - 1);
   }
 
   searchMessages({ channelId, topicId, pattern, limit = 50, caseInsensitive = true }) {
