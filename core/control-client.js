@@ -176,18 +176,18 @@ export async function enqueueBackfill(storeDir, { chatId, depth, minDate } = {})
 
 // POST /control/repair → { channelIds }. Queues a repair of each chat (or of every
 // chat with sync on). Throws on a non-2xx response, e.g. a chat not in the archive.
-export async function enqueueRepair(storeDir, { chats, all, afterId, sinceDate } = {}) {
+export async function enqueueRepair(storeDir, { chats, all, afterId, sinceDate, dryRun = false } = {}) {
   const control = readControlFile(storeDir);
   if (!control) {
     throw new Error('No control server is running. Start one with `tgcli server`.');
   }
-  const { status, json } = await controlFetch(control, '/control/repair', {
+  const { status, json } = await controlFetch(control, dryRun ? '/control/repair/dry-run' : '/control/repair', {
     method: 'POST',
     body: { chats, all, afterId, sinceDate },
     timeoutMs: ENQUEUE_TIMEOUT_MS,
   });
   if (status === 404) {
-    throw new Error(`The running tgcli server (${control.version ?? 'unknown version'}, pid ${control.pid ?? '?'}) predates \`backfill repair\`; restart it and try again.`);
+    throw new Error(`The running tgcli server (${control.version ?? 'unknown version'}, pid ${control.pid ?? '?'}) predates \`backfill repair${dryRun ? ' --dry-run' : ''}\`; restart it and try again.`);
   }
   if (status !== 200) {
     throw new Error(json?.error ?? `Repair request failed (HTTP ${status})`);

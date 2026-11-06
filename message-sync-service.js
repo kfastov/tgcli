@@ -816,7 +816,8 @@ export default class MessageSyncService {
 
     // One repair per chat: a walk of its history from the newest message down to a
     // bound, writing back what the archive lacks. cursor_message_id is where the
-    // next page starts, so a restarted server carries on.
+    // next page starts, so a restarted server carries on. A dry run writes nothing and
+    // counts in added_count what it would have added.
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS archive_repairs (
         channel_id TEXT PRIMARY KEY,
@@ -828,10 +829,14 @@ export default class MessageSyncService {
         added_count INTEGER NOT NULL DEFAULT 0,
         error TEXT,
         generation INTEGER NOT NULL DEFAULT 0,
+        dry_run INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
     `);
+    if (!this.db.prepare('PRAGMA table_info(archive_repairs)').all().some((col) => col.name === 'dry_run')) {
+      this.db.exec('ALTER TABLE archive_repairs ADD COLUMN dry_run INTEGER NOT NULL DEFAULT 0');
+    }
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS message_links (
@@ -2608,7 +2613,7 @@ export default class MessageSyncService {
 
   // Queues a repair for each chat, or for every chat with sync on. A repair already
   // queued for a chat starts over with the new bounds.
-  addRepairs({ chats = [], all = false, afterId = 0, sinceDate = null } = {}) {
+  addRepairs({ chats = [], all = false, afterId = 0, sinceDate = null, dryRun = false } = {}) {
     // A chat the account has left gets no updates, so its holes are not losses: --all
     // leaves it alone, and asking for it by name still works.
     const channelIds = all
@@ -2622,12 +2627,13 @@ export default class MessageSyncService {
       throw new Error('No chat has sync enabled.');
     }
     const upsert = this.db.prepare(`
-      INSERT INTO archive_repairs (channel_id, status, after_message_id, since_date)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO archive_repairs (channel_id, status, after_message_id, since_date, dry_run)
+      VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(channel_id) DO UPDATE SET
         status = excluded.status,
         after_message_id = excluded.after_message_id,
         since_date = excluded.since_date,
+        dry_run = excluded.dry_run,
         cursor_message_id = NULL,
         checked_count = 0,
         added_count = 0,
@@ -2638,9 +2644,9 @@ export default class MessageSyncService {
     `);
     this.db.transaction(() => {
       for (const channelId of channelIds) {
-        upsert.run(channelId, JOB_STATUS.PENDING, Math.max(0, Number(afterId) || 0), sinceDate ?? null);
+        upsert.run(channelId, JOB_STATUS.PENDING, Math.max(0, Number(afterId) || 0), sinceDate ?? null, dryRun ? 1 : 0);
       }
-      if (all) {
+      if (all && !dryRun) {
         this._setRepairNotNeeded('every synced chat repaired');
       }
     })();
@@ -2731,7 +2737,10 @@ export default class MessageSyncService {
       });
       const inRange = messages.filter((message) => message.id > floor
         && !(sinceDate && message.date && message.date < sinceDate));
-      const added = inRange.length ? this.archiveHistoryMessages(channelId, inRange) : 0;
+      let added = 0;
+      if (inRange.length) {
+        added = repair.dry_run ? this._countMissingMessages(channelId, inRange) : this.archiveHistoryMessages(channelId, inRange);
+      }
       const done = !messages.length || inRange.length < messages.length;
       const cursor = messages.length
         ? Math.min(...messages.map((message) => message.id))
@@ -2743,12 +2752,13 @@ export default class MessageSyncService {
         inRange.length,
         added,
       );
+      const verb = repair.dry_run ? 'would add' : 'added';
       if (added) {
-        console.log(`[sync] Channel ${channelId}: repair added ${added} message(s) at ${cursor}.`);
+        console.log(`[sync] Channel ${channelId}: repair ${verb} ${added} message(s) at ${cursor}.`);
       }
       if (done) {
         const row = this.db.prepare('SELECT checked_count, added_count FROM archive_repairs WHERE channel_id = ?').get(channelId);
-        console.log(`[sync] Channel ${channelId}: repair done, checked ${row?.checked_count}, added ${row?.added_count}.`);
+        console.log(`[sync] Channel ${channelId}: repair done, checked ${row?.checked_count}, ${verb} ${row?.added_count}.`);
       }
     } catch (error) {
       if (this.stopRequested) {
@@ -2770,6 +2780,15 @@ export default class MessageSyncService {
       fail(error?.message ?? String(error));
       console.error(`[sync] Channel ${channelId}: repair failed below message ${repair.cursor_message_id ?? 'newest'}: ${error?.message ?? error}`);
     }
+  }
+
+  _countMissingMessages(channelId, messages) {
+    const ids = messages.map((message) => message.id);
+    const { present } = this.db.prepare(`
+      SELECT COUNT(*) AS present FROM messages
+      WHERE channel_id = ? AND message_id IN (SELECT value FROM json_each(?))
+    `).get(channelId, JSON.stringify(ids));
+    return ids.length - present;
   }
 
   // Holes lie where the archive followed the chat: from when the chat entered the archive,

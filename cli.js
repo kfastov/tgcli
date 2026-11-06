@@ -192,6 +192,7 @@ function buildProgram() {
     .option('--all', 'Repair every chat with sync enabled')
     .option('--since <date|duration>', `Lower bound: ISO date or duration such as 7d (default ${DEFAULT_REPAIR_SINCE})`)
     .option('--after-id <id>', 'Lower bound: only messages above this id (with --chat; no default date bound)')
+    .option('--dry-run', 'Count what is missing without writing anything')
     .option('--background', 'Enqueue and return immediately')
     .action(withGlobalOptions((globalFlags, options, command) =>
       runBackfillRepair(globalFlags, command.optsWithGlobals()),
@@ -1851,6 +1852,11 @@ function parseRepairSince(value, now = Date.now()) {
   return Math.floor((now - ms) / 1000);
 }
 
+// A dry run counts in added_count what it would have added.
+function addedWord(repair) {
+  return repair.dry_run ? 'missing' : 'added';
+}
+
 function repairLabel(repair) {
   return repair.peer_title || repair.channel_id;
 }
@@ -1862,12 +1868,17 @@ function summarizeRepairs(repairs) {
   const byStatus = {};
   let checked = 0;
   let added = 0;
+  let missing = 0;
   for (const repair of repairs) {
     byStatus[repair.status] = (byStatus[repair.status] ?? 0) + 1;
     checked += repair.checked_count ?? 0;
-    added += repair.added_count ?? 0;
+    if (repair.dry_run) {
+      missing += repair.added_count ?? 0;
+    } else {
+      added += repair.added_count ?? 0;
+    }
   }
-  return { chats: repairs.length, byStatus, checked, added };
+  return { chats: repairs.length, byStatus, checked, added, missing };
 }
 
 function repairSummary(repair) {
@@ -1876,7 +1887,9 @@ function repairSummary(repair) {
     title: repair.peer_title ?? null,
     status: repair.status,
     checked: repair.checked_count ?? 0,
-    added: repair.added_count ?? 0,
+    added: repair.dry_run ? 0 : repair.added_count ?? 0,
+    missing: repair.dry_run ? repair.added_count ?? 0 : null,
+    dryRun: Boolean(repair.dry_run),
     cursorMessageId: repair.cursor_message_id ?? null,
     error: repair.error ?? null,
   };
@@ -1907,13 +1920,15 @@ async function runBackfillRepair(globalFlags, options = {}) {
       all: Boolean(options.all),
       afterId,
       sinceDate,
+      dryRun: Boolean(options.dryRun),
     });
+    const kind = options.dryRun ? 'dry run of a repair' : 'repair';
 
     if (options.background) {
       if (globalFlags.json) {
         writeJson({ ok: true, channelIds });
       } else {
-        console.log(`Queued a repair of ${channelIds.length} chat(s). Follow it with \`tgcli backfill status\`.`);
+        console.log(`Queued a ${kind} of ${channelIds.length} chat(s). Follow it with \`tgcli backfill status\`.`);
       }
       return;
     }
@@ -1937,7 +1952,7 @@ async function runBackfillRepair(globalFlags, options = {}) {
           break;
         }
         const finished = repairs.filter((repair) => TERMINAL_REPAIR_STATUSES.has(repair.status)).length;
-        const line = `Repairing ${repairLabel(active)}: checked ${active.checked_count}, added ${active.added_count}`
+        const line = `${active.dry_run ? 'Checking' : 'Repairing'} ${repairLabel(active)}: checked ${active.checked_count}, ${addedWord(active)} ${active.added_count}`
           + (repairs.length > 1 ? ` (${finished}/${repairs.length} chats done)` : '');
         if (line !== lastLine && Date.now() - lastPrintedAt >= REPAIR_PROGRESS_INTERVAL_MS) {
           writeProgress(globalFlags, line);
@@ -1962,14 +1977,18 @@ async function runBackfillRepair(globalFlags, options = {}) {
         } else if (repair.status === 'skipped') {
           console.log(`Skipped ${repairLabel(repair)}: ${repair.error ?? 'Telegram refuses to read it'}`);
         } else if (repair.added_count > 0 || repairs.length === 1) {
-          console.log(`${repairLabel(repair)}: checked ${repair.checked_count}, added ${repair.added_count}.`);
+          console.log(`${repairLabel(repair)}: checked ${repair.checked_count}, ${addedWord(repair)} ${repair.added_count}.`);
         }
       }
       const added = repairs.reduce((sum, repair) => sum + (repair.added_count ?? 0), 0);
       if (repairs.length > 1) {
         const repaired = repairs.length - failed.length - skipped.length;
         const skippedNote = skipped.length ? `, skipped ${skipped.length}` : '';
-        console.log(`Repaired ${repaired}/${repairs.length} chat(s)${skippedNote}, added ${added} message(s).`);
+        const verb = options.dryRun ? 'Checked' : 'Repaired';
+        console.log(`${verb} ${repaired}/${repairs.length} chat(s)${skippedNote}, ${options.dryRun ? 'missing' : 'added'} ${added} message(s).`);
+      }
+      if (options.dryRun) {
+        console.log('Dry run: nothing written. Run it again without --dry-run to add them.');
       }
     } finally {
       process.off('SIGINT', onSigint);
@@ -2578,7 +2597,8 @@ async function runSyncStatus(globalFlags) {
     if (repairs.length) {
       // `--all` queues every synced chat, so name only the one under way and the failures.
       const counts = REPAIR_STATUS_ORDER.map((status) => `${status}=${repairTotals.byStatus[status] ?? 0}`).join(' ');
-      console.log(`REPAIRS: ${repairTotals.chats} chat(s) ${counts} checked=${repairTotals.checked} added=${repairTotals.added}`);
+      const missing = repairs.some((repair) => repair.dry_run) ? ` missing=${repairTotals.missing}` : '';
+      console.log(`REPAIRS: ${repairTotals.chats} chat(s) ${counts} checked=${repairTotals.checked} added=${repairTotals.added}${missing}`);
       const named = repairs.filter((repair) => repair.status === 'in_progress' || repair.status === 'error');
       for (const repair of named.slice(0, REPAIR_STATUS_LINES)) {
         const error = repair.error ? ` error=${repair.error}` : '';

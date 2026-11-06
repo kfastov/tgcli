@@ -71,7 +71,7 @@ one-shot client.
 - backfill cancel --chat <id|username>
   - Cancel a chat's backfills via the server when one is up; falls back to a
     direct cancel (same as `backfill jobs cancel --channel`) when none is.
-- backfill repair --chat <id|username>|--all [--since ISO|7d] [--after-id N] [--background]
+- backfill repair --chat <id|username>|--all [--since ISO|7d] [--after-id N] [--dry-run] [--background]
   - Fill holes that older versions left in the archive: walk the chat's history from
     the newest message down to the bound and write back what the archive lacks.
     Cursors stay put, and it goes no further back than when the chat entered the
@@ -81,7 +81,8 @@ one-shot client.
     did not have (ones the account left); `--chat` still takes them. Runs on the server
     between its other jobs, one page a second; follows progress like `backfill --chat`,
     and Ctrl-C detaches. A chat Telegram refuses to read is skipped; exits non-zero if a
-    repair fails. See [archive-recovery.md](archive-recovery.md).
+    repair fails. `--dry-run` reads the same pages and only counts what is missing; it
+    costs as many requests as the repair itself. See [archive-recovery.md](archive-recovery.md).
 - backfill (no --chat): track the server's queue (alias: `sync`)
   - `--follow`: auto-start the server if needed, track the queue with live
     progress, and exit once it drains. The server keeps running on its own

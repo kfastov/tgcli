@@ -130,7 +130,7 @@ describe('control API request handler', () => {
       body: { chats: ['-100'], afterId: 0, sinceDate: 1700000000 },
     });
     expect(status).toBe(200);
-    expect(service.addRepairs).toHaveBeenCalledWith({ chats: ['-100'], all: false, afterId: 0, sinceDate: 1700000000 });
+    expect(service.addRepairs).toHaveBeenCalledWith({ chats: ['-100'], all: false, afterId: 0, sinceDate: 1700000000, dryRun: false });
     expect(service.processQueue).toHaveBeenCalledTimes(1);
     expect(json).toEqual({ channelIds: ['-100'] });
   });
@@ -141,8 +141,18 @@ describe('control API request handler', () => {
       body: { all: true, sinceDate: 1700000000 },
     });
     expect(status).toBe(200);
-    expect(service.addRepairs).toHaveBeenCalledWith({ chats: [], all: true, afterId: undefined, sinceDate: 1700000000 });
+    expect(service.addRepairs).toHaveBeenCalledWith({ chats: [], all: true, afterId: undefined, sinceDate: 1700000000, dryRun: false });
     expect(json).toEqual({ channelIds: ['-100', '-200'] });
+  });
+
+  // An older server answers 404 on this path instead of ignoring a flag and writing.
+  it('POST /control/repair/dry-run queues a dry run', async () => {
+    const { status } = await request(port, 'POST', '/control/repair/dry-run', {
+      token: TOKEN,
+      body: { all: true, sinceDate: 1700000000 },
+    });
+    expect(status).toBe(200);
+    expect(service.addRepairs).toHaveBeenCalledWith({ chats: [], all: true, afterId: undefined, sinceDate: 1700000000, dryRun: true });
   });
 
   it('POST /control/repair requires chats or all', async () => {
