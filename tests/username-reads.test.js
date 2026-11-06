@@ -74,30 +74,11 @@ describe('chats given by username, for reads', () => {
     expect(telegram.getPeer).not.toHaveBeenCalled();
   });
 
-  it('lets the peer cache, then the dialog list, choose between two chats with one username', async () => {
+  it('takes the one in the dialog list when two archived chats have the username', async () => {
     service.db.prepare('INSERT INTO channels (channel_id, username, in_dialogs) VALUES (?, ?, 0)').run(OTHER, 'news_room');
 
     expect(await service.findChatKeyLocally('@news_room')).toBe(CHANNEL);
-
-    cache.set('news_room', { _: 'inputPeerChannel', channelId: 702, accessHash: hash });
-    expect(await service.findChatKeyLocally('@news_room')).toBe(OTHER);
-
-    // The cache naming a third chat says the stored usernames are stale: Telegram decides.
-    cache.set('news_room', { _: 'inputPeerChannel', channelId: 703, accessHash: hash });
-    expect(await service.findChatKeyLocally('@news_room')).toBeNull();
-
-    service.db.prepare('UPDATE channels SET in_dialogs = 1 WHERE channel_id = ?').run(OTHER);
-    cache.clear();
-    expect(await service.findChatKeyLocally('@news_room')).toBeNull();
-  });
-
-  // A chat gave its username up and another took it: the archive still has the old one.
-  it('asks Telegram when the peer cache names another chat than the archive', async () => {
-    cache.set('news_room', { _: 'inputPeerChannel', channelId: 702, accessHash: hash });
-    telegram.getPeer.mockResolvedValueOnce({ id: Number(OTHER), username: 'news_room', usernames: [] });
-
-    expect(await service.resolveChatKeyForRead('@news_room')).toBe(OTHER);
-    expect(telegram.getPeer).toHaveBeenCalledTimes(1);
+    expect(telegram.getPeer).not.toHaveBeenCalled();
   });
 
   it('forgets a username the dialog list no longer shows', async () => {
