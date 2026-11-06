@@ -15,6 +15,9 @@ import { pipeline } from 'stream/promises';
 import { nodeReadableToFuman } from '@fuman/node';
 import { resolveStoreDir, resolveStorePaths } from './core/store.js';
 
+// How long a session Telegram confirmed is taken as logged in without asking again.
+const AUTH_CHECK_TTL_MS = 5 * 60 * 1000;
+
 const timeoutPatchKey = Symbol.for('tgcli.timeoutPatch');
 if (!globalThis[timeoutPatchKey]) {
   const originalSetTimeout = globalThis.setTimeout;
@@ -664,6 +667,7 @@ class TelegramClient {
       console.warn('[warning] failed to destroy MTProto client during reset:', error?.message || error);
     }
     this.client = this._createClient();
+    this.authorizedUntil = 0;
     this.updatesRunning = false;
     this.rawUpdateHandler = null;
     this.updateEmitter.emit('clientReplaced');
@@ -693,11 +697,20 @@ class TelegramClient {
     return message.includes('AUTH_KEY') || message.includes('AUTHORIZATION') || message.includes('SESSION_PASSWORD_NEEDED');
   }
 
-  async _isAuthorized() {
+  // getMe is a request to Telegram, and ensureLogin runs before every page of history and
+  // every recheck, so a yes stands for AUTH_CHECK_TTL_MS: asking each time doubled the
+  // requests of a backfill or a repair. A revoked session still fails the request itself.
+  // fresh asks Telegram regardless, for login and for commands that report the state.
+  async _isAuthorized({ fresh = false } = {}) {
+    if (!fresh && Date.now() < (this.authorizedUntil ?? 0)) {
+      return true;
+    }
     try {
       await this.client.getMe();
+      this.authorizedUntil = Date.now() + AUTH_CHECK_TTL_MS;
       return true;
     } catch (error) {
+      this.authorizedUntil = 0;
       if (this._isUnauthorizedError(error)) {
         return false;
       }
@@ -706,7 +719,7 @@ class TelegramClient {
   }
 
   async isAuthorized() {
-    return this._isAuthorized();
+    return this._isAuthorized({ fresh: true });
   }
 
   async getCurrentUser() {
@@ -841,7 +854,7 @@ class TelegramClient {
 
   async login(retriedAfterReset = false, retriedAfterSessionReset = false) {
     try {
-      const hasExistingSession = await this._isAuthorized();
+      const hasExistingSession = await this._isAuthorized({ fresh: true });
 
       if (!hasExistingSession && !this.options.useQr && !this.phoneNumber) {
         throw new Error('TELEGRAM_PHONE_NUMBER is not configured.');
