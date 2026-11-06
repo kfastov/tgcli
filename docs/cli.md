@@ -196,8 +196,10 @@ Update available: tgcli 2.2.5 -> 2.3.0. Run `brew update && brew upgrade tgcli` 
     nothing from it, so the archive could not keep up. A synced chat missing from the
     dialog list is only a reason to ask Telegram, once a day; sync goes off when Telegram
     says you left or were removed, or the chat is gone, and comes back on, with what it
-    missed, when the chat returns to your dialog list. Chats you turned off yourself stay
-    off, and private chats are never asked about.
+    missed, when the chat returns to your dialog list. Chats you asked for yourself
+    (`channels watch`, `backfill --chat`) are never turned off this way, so a public
+    channel archived without joining keeps its sync; chats you turned off stay off, and
+    private chats are never asked about.
   - `channels sync --chat <id|username> --enable|--disable` remains as a hidden alias of watch/unwatch.
 
 ## topics (forum supergroups)
