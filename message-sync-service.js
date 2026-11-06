@@ -1662,8 +1662,14 @@ export default class MessageSyncService {
   }
 
   upsertChannels(dialogs = []) {
+    // The dialog list is the whole truth about a chat's username: one it no longer shows
+    // is gone, or reads by username would keep finding the chat under it.
+    const clearUsername = this.db.prepare('UPDATE channels SET username = NULL WHERE channel_id = ? AND username IS NOT NULL');
     const tx = this.db.transaction((items) => {
       for (const dialog of items) {
+        if (!dialog.username) {
+          clearUsername.run(String(dialog.id));
+        }
         this.upsertChannelStmt.get({
           channel_id: String(dialog.id),
           peer_title: dialog.title ?? null,
@@ -2546,9 +2552,6 @@ export default class MessageSyncService {
       SELECT channel_id, in_dialogs FROM channels
       WHERE username IS NOT NULL AND LOWER(username) = ? AND ${chatIdSql()}
     `).all(lower);
-    if (archived.length === 1) {
-      return archived[0].channel_id;
-    }
     let cached = null;
     try {
       const peer = await storage?.peers?.getByUsername?.(name);
@@ -2556,8 +2559,16 @@ export default class MessageSyncService {
     } catch {
       cached = null;
     }
-    if (cached && (!archived.length || archived.some((row) => row.channel_id === cached))) {
+    // A stored username can lag behind: when the archive and the cache disagree, or the
+    // cache names a chat other than the archive's, Telegram decides.
+    if (!archived.length) {
       return cached;
+    }
+    if (cached) {
+      return archived.some((row) => row.channel_id === cached) ? cached : null;
+    }
+    if (archived.length === 1) {
+      return archived[0].channel_id;
     }
     const inDialogs = archived.filter((row) => row.in_dialogs === 1);
     return inDialogs.length === 1 ? inDialogs[0].channel_id : null;
