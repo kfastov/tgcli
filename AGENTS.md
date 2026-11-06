@@ -34,6 +34,7 @@
 - PR descriptions should summarize intent, list manual verification (commands run, Telegram scenarios exercised), link related issues, and attach console excerpts when tool output changes.
 - Confirm no sensitive credentials or runtime artifacts from the tgcli store are committed before requesting review.
 - Releases are automated: merging the release PR that the Release workflow keeps open publishes to npm and Homebrew. Never bump the version, tag or publish by hand; see `docs/releasing.md`.
+- Squash-merge pull requests (`gh pr merge --squash`) with a user-facing Conventional Commit title: every `fix:`/`feat:` on `main` is a changelog line. Review fixes and refactors stay inside the squash.
 
 ## Workflow
 - On startup, read `backlog.md` and pull tasks from it.
