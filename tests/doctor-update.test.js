@@ -24,6 +24,7 @@ vi.mock('../core/services.js', () => ({
       getQueueStats: () => ({ pending: 0, in_progress: 0, idle: 0, error: 0, gaps: 0 }),
       isRepairSuggested: () => false,
       getLeftChatCounts: () => ({ syncOff: 0, stillJoined: 0 }),
+      listUnansweredChats: () => [],
       listUsernameKeyedChats: () => [],
       close: vi.fn().mockResolvedValue(undefined),
     },

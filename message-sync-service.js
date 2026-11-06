@@ -3297,6 +3297,27 @@ export default class MessageSyncService {
     return channelIds;
   }
 
+  // Synced chats missing from the dialog list that Telegram gave no answer about: most
+  // often a private chat the account was removed from, which Telegram refuses the same way
+  // it refuses a stale access hash, so the server leaves them for the user to turn off.
+  listUnansweredChats() {
+    return this.db.prepare(`
+      SELECT channel_id, peer_title, membership_checked_at FROM channels
+      WHERE sync_enabled = 1 AND in_dialogs = 0 AND membership = 'unknown'
+      ORDER BY channel_id
+    `).all();
+  }
+
+  unwatchUnansweredChats() {
+    return this.db.prepare(`
+      UPDATE channels
+      SET sync_enabled = 0, sync_by_user = 0, sync_off_reason = NULL, membership = NULL,
+        membership_checked_at = NULL, updated_at = CURRENT_TIMESTAMP
+      WHERE sync_enabled = 1 AND in_dialogs = 0 AND membership = 'unknown'
+      RETURNING channel_id
+    `).all().map((row) => row.channel_id).sort();
+  }
+
   // What the server did about synced chats missing from the dialog list.
   getLeftChatCounts() {
     return this.db.prepare(`

@@ -318,8 +318,9 @@ function buildProgram() {
     .command('unwatch')
     .description('Unsubscribe a chat from archiving (disable sync)')
     .option('--chat <id|username>', 'Channel identifier')
+    .option('--missing', 'Every chat doctor lists as missing from your dialogs with no answer from Telegram')
     .action(withGlobalOptions((globalFlags, options) =>
-      runChannelsSync(globalFlags, { ...options, disable: true }),
+      (options.missing ? runChannelsUnwatchMissing(globalFlags, options) : runChannelsSync(globalFlags, { ...options, disable: true })),
     ));
   // Hidden back-compat alias of watch/unwatch via explicit --enable/--disable.
   channels
@@ -1871,6 +1872,7 @@ function repairLabel(repair) {
 
 const REPAIR_STATUS_ORDER = ['idle', 'in_progress', 'pending', 'skipped', 'error'];
 const REPAIR_STATUS_LINES = 10;
+const DOCTOR_CHAT_LINES = 10;
 
 function summarizeRepairs(repairs) {
   const byStatus = {};
@@ -2765,6 +2767,11 @@ async function runDoctor(globalFlags, options = {}) {
     const queue = messageSyncService.getQueueStats();
     const repairSuggested = messageSyncService.isRepairSuggested();
     const leftChats = messageSyncService.getLeftChatCounts();
+    const unansweredChats = messageSyncService.listUnansweredChats().map((chat) => ({
+      channelId: chat.channel_id,
+      title: chat.peer_title ?? null,
+      checkedAt: chat.membership_checked_at ? new Date(chat.membership_checked_at).toISOString() : null,
+    }));
     const usernameKeys = messageSyncService.listUsernameKeyedChats();
     const update = getUpdateStatus({
       storeDir,
@@ -2783,6 +2790,7 @@ async function runDoctor(globalFlags, options = {}) {
       queue,
       repairSuggested,
       leftChats,
+      unansweredChats,
       usernameKeys,
       update,
     };
@@ -2803,6 +2811,15 @@ async function runDoctor(globalFlags, options = {}) {
     }
     if (leftChats.stillJoined) {
       console.log(`DIALOGS: ${leftChats.stillJoined} synced chat(s) are missing from your dialog list, though Telegram says you are still in them; sync stays on.`);
+    }
+    if (unansweredChats.length) {
+      console.log(`UNANSWERED: ${unansweredChats.length} synced chat(s) are missing from your dialog list, and Telegram gives no answer about them (most often a private chat you were removed from), so nothing arrives from them. Turn their sync off with \`tgcli channels unwatch --missing\`.`);
+      for (const chat of unansweredChats.slice(0, DOCTOR_CHAT_LINES)) {
+        console.log(`  ${chat.channelId}${chat.title ? ` ${chat.title}` : ''}`);
+      }
+      if (unansweredChats.length > DOCTOR_CHAT_LINES) {
+        console.log(`  … and ${unansweredChats.length - DOCTOR_CHAT_LINES} more; \`tgcli --json doctor\` lists them all.`);
+      }
     }
     if (repairSuggested) {
       console.log(`REPAIR: versions before 2.2.5 could lose messages; fill the holes with \`tgcli backfill repair --all\` (the last ${DEFAULT_REPAIR_SINCE} of every synced chat).`);
@@ -2843,6 +2860,20 @@ async function runChannelsShow(globalFlags, options = {}) {
     writeJson(channel);
   } else {
     console.log(JSON.stringify(channel, null, 2));
+  }
+}
+
+async function runChannelsUnwatchMissing(globalFlags, options = {}) {
+  if (options.chat) {
+    throw new Error('Use either --chat or --missing');
+  }
+  const { channelIds } = await runOperation(globalFlags, { op: 'channelsUnwatchMissing', args: {} });
+  if (globalFlags.json) {
+    writeJson({ ok: true, channelIds });
+  } else if (channelIds.length) {
+    console.log(`Sync disabled for ${channelIds.length} chat(s): ${channelIds.join(', ')}.`);
+  } else {
+    console.log('No chat is missing from your dialogs without an answer from Telegram.');
   }
 }
 

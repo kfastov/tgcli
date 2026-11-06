@@ -293,6 +293,11 @@ async function channelShow(ctx, args = {}) {
 // args: { chat, enable }. Toggle the per-chat archive flag; enabling also makes sure
 // a job fetches what arrived while the chat was off. Returns the new sync state plus
 // job info.
+// The chats doctor lists as missing from the dialog list with no answer from Telegram.
+async function channelsUnwatchMissing(ctx) {
+  return { channelIds: ctx.messageSyncService.unwatchUnansweredChats() };
+}
+
 async function channelSetSync(ctx, args = {}) {
   const chatId = await ctx.messageSyncService.resolveChatKey(args.chat);
   const result = ctx.messageSyncService.setChannelSync(chatId, Boolean(args.enable));
@@ -951,6 +956,7 @@ export const OPERATIONS = {
   listChannels,
   channelShow,
   channelSetSync,
+  channelsUnwatchMissing,
   messagesList,
   messagesSearch,
   messagesGet,
