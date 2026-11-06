@@ -11,6 +11,7 @@
 ## Build, Test, and Development Commands
 - `npm install`: Restore dependencies whenever `package-lock.json` changes.
 - `npm start`: Boot the MCP server on `http://localhost:8080/mcp` using Streamable HTTP transport; first run drives the Telegram login flow.
+- `node cli.js <command>`: Run the CLI from the clone (Node 22, see `.nvmrc`); `docs/development.md` covers trying a change on the real account with `node cli.js server restart`.
 - `node client.js`: Run the sample script to exercise the client API and inspect dialog listings.
 - `npm run build`: Currently a no-op placeholder—extend it only if a transpile/bundle step is introduced.
 - `npm test`: Placeholder that echoes a notice; replace with real checks once tests exist.

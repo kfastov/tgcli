@@ -4,6 +4,9 @@
   "type": "module",
   "description": "Telegram CLI + MCP server powered by MTProto and the official MCP SDK",
   "main": "mcp-server.js",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "client": "node mcp-client.js",
     "cli": "node cli.js",
