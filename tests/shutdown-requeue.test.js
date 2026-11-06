@@ -54,9 +54,7 @@ describe('teardown responsibility separation (#42)', () => {
   });
 
   afterEach(() => {
-    if (service?.db?.open) {
-      service.db.close();
-    }
+    service?.close();
     fs.rmSync(storeDir, { recursive: true, force: true });
   });
 
@@ -71,6 +69,25 @@ describe('teardown responsibility separation (#42)', () => {
     expect(statusOf(reopened, jobId)).toBe('in_progress');
     reopened.db.close();
     service = null;
+  });
+
+  it('close() stops a queue loop waiting between steps', async () => {
+    service = new MessageSyncService(makeFakeClient(), {
+      dbPath: path.join(storeDir, 'messages.db'),
+      interJobDelayMs: 50,
+    });
+    seedJob(service, '-1001', 'pending');
+    let stepDone;
+    const step = new Promise((resolve) => {
+      stepDone = resolve;
+    });
+    service._processJob = async () => stepDone();
+
+    const loop = service.processQueue();
+    await step;
+    service.close();
+
+    await expect(loop).resolves.toBeUndefined();
   });
 
   it('close() closes the DB handle without touching jobs', () => {
@@ -136,9 +153,7 @@ describe('worker job ownership lifecycle (#42)', () => {
   });
 
   afterEach(() => {
-    if (service?.db?.open) {
-      service.db.close();
-    }
+    service?.close();
     fs.rmSync(storeDir, { recursive: true, force: true });
   });
 
