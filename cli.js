@@ -14,6 +14,14 @@ import { createServices, createTelegramClient } from './core/services.js';
 import { withCommand, runWithTimeout, runOperation } from './core/command-context.js';
 import { readVersion } from './core/version.js';
 import {
+  detectInstallMethod,
+  formatDoctorUpdateLine,
+  getUpdateCheckDisabledReason,
+  getUpdateStatus,
+  maybePrintUpdateNotice,
+  scheduleUpdateCheck,
+} from './core/update-check.js';
+import {
   buildSendErrorPayload,
   buildSendSuccessPayload,
   classifySendError,
@@ -2459,6 +2467,11 @@ async function runDoctor(globalFlags, options = {}) {
     const search = messageSyncService.getSearchStatus();
     const queue = messageSyncService.getQueueStats();
     const repairSuggested = messageSyncService.isRepairSuggested();
+    const update = getUpdateStatus({
+      storeDir,
+      version: readVersion(),
+      installMethod: detectInstallMethod(),
+    });
 
     const payload = {
       storeDir,
@@ -2470,6 +2483,7 @@ async function runDoctor(globalFlags, options = {}) {
       ftsVersion: search.version,
       queue,
       repairSuggested,
+      update,
     };
 
     if (globalFlags.json) {
@@ -2486,6 +2500,7 @@ async function runDoctor(globalFlags, options = {}) {
     if (repairSuggested) {
       console.log(`REPAIR: versions before 2.2.5 could lose messages; fill the holes with \`tgcli backfill repair --all\` (the last ${DEFAULT_REPAIR_SINCE} of every synced chat).`);
     }
+    console.log(formatDoctorUpdateLine(update));
   });
 }
 
@@ -3604,12 +3619,63 @@ function shouldRunMain(entryPath = process.argv[1]) {
   }
 }
 
+// `server` runs unattended with its output in a log, so it neither checks nor
+// prints; `doctor` checks but prints its own UPDATE line instead of the notice.
+const UPDATE_CHECK_SKIPPED_COMMANDS = new Set(['server']);
+const UPDATE_NOTICE_SKIPPED_COMMANDS = new Set(['server', 'doctor']);
+
+function commandPath(command) {
+  const names = [];
+  for (let current = command; current?.parent; current = current.parent) {
+    names.unshift(current.name());
+  }
+  return names.join(' ');
+}
+
+// Hook the new-version notice into a program: before the action, start the daily
+// background registry check if it is due; after a successful action, print the
+// cached notice.
+function installUpdateNotice(program, deps = {}) {
+  const {
+    version = readVersion(),
+    installMethod = detectInstallMethod(),
+    env = process.env,
+    stderr = process.stderr,
+    now = () => Date.now(),
+    spawnFn,
+  } = deps;
+  const enabled = () => !getUpdateCheckDisabledReason({ env, version, installMethod });
+  program.hook('preAction', (_program, actionCommand) => {
+    if (UPDATE_CHECK_SKIPPED_COMMANDS.has(commandPath(actionCommand)) || !enabled()) return;
+    scheduleUpdateCheck({ storeDir: resolveStoreDir(), now: now(), spawnFn });
+  });
+  program.hook('postAction', (_program, actionCommand) => {
+    if (UPDATE_NOTICE_SKIPPED_COMMANDS.has(commandPath(actionCommand)) || !enabled()) return;
+    // A failed command ends on its error; the notice waits for the next run.
+    if (process.exitCode) return;
+    const options = actionCommand.optsWithGlobals();
+    maybePrintUpdateNotice({
+      storeDir: resolveStoreDir(),
+      version,
+      installMethod,
+      json: Boolean(options.json),
+      quiet: Boolean(options.quiet),
+      env,
+      stderr,
+      now: now(),
+    });
+  });
+  return program;
+}
+
 async function main() {
+  installUpdateNotice(CLI_PROGRAM);
   await CLI_PROGRAM.parseAsync(process.argv);
 }
 
 export {
   buildProgram,
+  installUpdateNotice,
   buildSendPhotoSuccessPayload,
   printSendOutcome,
   DEFAULT_SEND_TIMEOUT_MS,

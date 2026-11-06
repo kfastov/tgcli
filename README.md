@@ -61,6 +61,8 @@ Commands run through `tgcli server`, which the CLI starts on demand. After an up
 
 Use `tgcli [command] --help` for details. Add `--json` for machine-readable output.
 
+Once a day tgcli checks npm for a newer release in the background and, at a terminal, prints one line on stderr with the upgrade command (`brew update && brew upgrade tgcli` or `npm i -g @kfastov/tgcli`). Set `TGCLI_NO_UPDATE_CHECK=1` to turn it off; see [docs/cli.md](docs/cli.md#update-notice).
+
 ## MCP (optional)
 
 Enable it via config:
