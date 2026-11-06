@@ -197,6 +197,11 @@ it. `server restart` switches to the caller's version in any direction. See
   - `LEFT:` counts chats whose sync the server turned off because you left them (see
     `channels unwatch`), and `DIALOGS:` the synced chats missing from your dialog list
     that Telegram says you are still in. With `--json`: `leftChats`.
+  - `UNANSWERED:` lists synced chats missing from your dialog list that Telegram gives
+    no answer about, most often a private chat you were removed from (Telegram refuses
+    it the same way it refuses a stale access hash, so the server does not act on it).
+    Nothing arrives from them; `channels unwatch --missing` turns them all off. With
+    `--json`: `unansweredChats`.
 
 ## Update notice
 Once a day tgcli asks the npm registry for the latest `@kfastov/tgcli` and keeps the
@@ -237,8 +242,9 @@ Update available: tgcli 2.2.5 -> 2.3.0. Run `brew update && brew upgrade tgcli` 
 - channels show --chat <id|username>
 - channels watch --chat <id|username>
   - Subscribe a chat for archiving: enables sync and queues a backfill job; run `tgcli backfill --once` or `tgcli backfill --follow` to process it.
-- channels unwatch --chat <id|username>
-  - Unsubscribe a chat from archiving (disables sync).
+- channels unwatch --chat <id|username> | --missing
+  - Unsubscribe a chat from archiving (disables sync). `--missing` does it for every
+    chat `doctor` lists under `UNANSWERED:`.
   - The server does this by itself for a channel or group you left: Telegram sends
     nothing from it, so the archive could not keep up. A synced chat missing from the
     dialog list is only a reason to ask Telegram, once a day; sync goes off when Telegram

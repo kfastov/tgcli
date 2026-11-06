@@ -203,6 +203,17 @@ describe('channels watch / unwatch', () => {
     });
   });
 
+  it('`channels unwatch --missing` routes channelsUnwatchMissing to the server', async () => {
+    control.invoke.mockResolvedValueOnce({ channelIds: ['-1000000000820'] });
+    await runProgram(['channels', 'unwatch', '--missing']);
+    expect(control.invoke).toHaveBeenCalledWith('/tmp/tgcli-test-store', {
+      op: 'channelsUnwatchMissing',
+      args: {},
+      timeoutMs: undefined,
+      quiet: false,
+    });
+  });
+
   it('`channels watch` matches legacy `channels sync --enable` (same op + args)', async () => {
     await runProgram(['channels', 'watch', '--chat', '@chan']);
     const watchCalls = control.invoke.mock.calls.slice();
