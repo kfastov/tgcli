@@ -18,6 +18,8 @@ const JOB_STATUS = {
   IDLE: 'idle',
   ERROR: 'error',
 };
+// A repair Telegram refuses for good, such as in a chat the account has left.
+const REPAIR_STATUS = { ...JOB_STATUS, SKIPPED: 'skipped' };
 // Out of reach for this long, Telegram's catch-up is no longer trusted to be complete.
 const LONG_OUTAGE_MS = 5 * 60 * 1000;
 const PERIODIC_CHECK_INTERVAL_MS = 30 * 1000;
@@ -640,6 +642,7 @@ export default class MessageSyncService {
         oldest_message_date TEXT,
         gap_after_message_id INTEGER,
         newer_sync_pending INTEGER NOT NULL DEFAULT 0,
+        in_dialogs INTEGER,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
@@ -695,6 +698,8 @@ export default class MessageSyncService {
     this._ensureChannelColumn('chat_type', 'TEXT');
     this._ensureChannelColumn('is_forum', 'INTEGER');
     this._ensureChannelColumn('gap_after_message_id', 'INTEGER');
+    // 1 when the last full dialog list had the chat, 0 when it did not, NULL before any.
+    this._ensureChannelColumn('in_dialogs', 'INTEGER');
     if (this._ensureChannelColumn('newer_sync_pending', 'INTEGER NOT NULL DEFAULT 0')) {
       // Jobs queued before this column existed still have their newer sync ahead of them.
       this.db.prepare(`
@@ -1363,8 +1368,22 @@ export default class MessageSyncService {
   async refreshChannelsFromDialogs() {
     const dialogs = await this.telegramClient.listDialogs(0, { includeArchived: true });
     this.upsertChannels(dialogs);
+    this._markDialogMembership(dialogs);
     this._markGapsBehindDialogs(dialogs);
     return dialogs.length;
+  }
+
+  // A chat missing from the full dialog list is one the account left or lost: Telegram
+  // sends no updates for it, and the archive can no longer keep up with it. An empty list
+  // proves nothing, so it changes nothing.
+  _markDialogMembership(dialogs) {
+    if (!dialogs.length) {
+      return;
+    }
+    this.db.prepare(`
+      UPDATE channels
+      SET in_dialogs = channel_id IN (SELECT value FROM json_each(?))
+    `).run(JSON.stringify(dialogs.map((dialog) => String(dialog.id))));
   }
 
   // Catch-up cannot report everything: updates.differenceTooLong moves the pts without
@@ -2590,9 +2609,14 @@ export default class MessageSyncService {
   // Queues a repair for each chat, or for every chat with sync on. A repair already
   // queued for a chat starts over with the new bounds.
   addRepairs({ chats = [], all = false, afterId = 0, sinceDate = null } = {}) {
+    // A chat the account has left gets no updates, so its holes are not losses: --all
+    // leaves it alone, and asking for it by name still works.
     const channelIds = all
-      ? this.db.prepare('SELECT channel_id FROM channels WHERE sync_enabled = 1 ORDER BY channel_id').all()
-        .map((row) => row.channel_id)
+      ? this.db.prepare(`
+        SELECT channel_id FROM channels
+        WHERE sync_enabled = 1 AND in_dialogs IS NOT 0
+        ORDER BY channel_id
+      `).all().map((row) => row.channel_id)
       : chats.map((chat) => this._findRepairableChannelId(chat));
     if (!channelIds.length) {
       throw new Error('No chat has sync enabled.');
@@ -2698,11 +2722,7 @@ export default class MessageSyncService {
       fail('Sync is disabled for this chat.');
       return;
     }
-    const floor = this._repairFloor(channelId, repair.after_message_id);
-    if (floor === null) {
-      update('status = ?, error = NULL', JOB_STATUS.IDLE);
-      return;
-    }
+    const { floor, sinceDate } = this._repairBounds(channelId, repair);
     update('status = ?', JOB_STATUS.IN_PROGRESS);
 
     try {
@@ -2710,7 +2730,7 @@ export default class MessageSyncService {
         offsetId: repair.cursor_message_id ?? 0,
       });
       const inRange = messages.filter((message) => message.id > floor
-        && !(repair.since_date && message.date && message.date < repair.since_date));
+        && !(sinceDate && message.date && message.date < sinceDate));
       const added = inRange.length ? this.archiveHistoryMessages(channelId, inRange) : 0;
       const done = !messages.length || inRange.length < messages.length;
       const cursor = messages.length
@@ -2741,25 +2761,26 @@ export default class MessageSyncService {
         await this._delayUnlessStopped(waitSeconds * 1000);
         return;
       }
+      if (isRefusedRead(error)) {
+        // Not a member any more, or the chat is gone: asking again every hour changes nothing.
+        update('status = ?, error = ?', REPAIR_STATUS.SKIPPED, error?.message ?? String(error));
+        console.log(`[sync] Channel ${channelId}: repair skipped, Telegram refuses to read it: ${error?.message ?? error}`);
+        return;
+      }
       fail(error?.message ?? String(error));
       console.error(`[sync] Channel ${channelId}: repair failed below message ${repair.cursor_message_id ?? 'newest'}: ${error?.message ?? error}`);
     }
   }
 
-  // Holes lie inside what the archive covers: above the lower of the backfill cursor and
-  // the oldest row. Older history is a backfill's business, and a chat with neither has
-  // nothing to repair.
-  _repairFloor(channelId, afterId) {
+  // Holes lie where the archive followed the chat: from when the chat entered the archive,
+  // and within the asked bounds. History below that came from a backfill, which pages
+  // through it without gaps, or never came, which is what backfill --depth is for.
+  _repairBounds(channelId, repair) {
     const row = this.db.prepare(`
-      SELECT MIN(message_id) AS oldest_row,
-        (SELECT oldest_message_id FROM channels WHERE channel_id = ?) AS oldest_cursor
-      FROM messages WHERE channel_id = ?
-    `).get(channelId, channelId);
-    const bounds = [row.oldest_row, row.oldest_cursor].filter((id) => Number.isInteger(id) && id > 0);
-    if (!bounds.length) {
-      return null;
-    }
-    return Math.max(afterId ?? 0, Math.min(...bounds) - 1);
+      SELECT CAST(strftime('%s', created_at) AS INTEGER) AS entered_at FROM channels WHERE channel_id = ?
+    `).get(channelId);
+    const sinceDate = Math.max(repair.since_date ?? 0, row?.entered_at ?? 0) || null;
+    return { floor: repair.after_message_id ?? 0, sinceDate };
   }
 
   searchMessages({ channelId, topicId, pattern, limit = 50, caseInsensitive = true }) {

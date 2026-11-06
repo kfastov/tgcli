@@ -337,6 +337,22 @@ describe('backfill repair', () => {
     expect(errSpy.mock.calls.flat().join(' ')).toContain('Repair of Chan failed: CHANNEL_PRIVATE');
   });
 
+  it('reports a chat Telegram refuses as skipped, not failed', async () => {
+    services.current = makeFakeServices({
+      listRepairs: vi.fn(() => [
+        repair({ status: 'idle', checked_count: 10, added_count: 3 }),
+        repair({ channel_id: '-200', peer_title: 'Left', status: 'skipped', error: "You haven't joined this channel/supergroup." }),
+      ]),
+    });
+
+    await runProgram(['backfill', 'repair', '--all']);
+
+    expect(process.exitCode).toBe(0);
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain("Skipped Left: You haven't joined this channel/supergroup.");
+    expect(out).toContain('Repaired 1/2 chat(s), skipped 1, added 3 message(s).');
+  });
+
   it('--background --json returns the queued chats without following them', async () => {
     services.current = makeFakeServices();
 
