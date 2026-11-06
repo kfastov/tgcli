@@ -417,6 +417,20 @@ describe('backfill repair', () => {
     expect(lines).toContain('  … and 2 more; `tgcli --json backfill status` lists them all.');
   });
 
+  it('status names the chat under way before failures, and says missing for a dry run', async () => {
+    const failed = Array.from({ length: 11 }, (_, index) => repair({ channel_id: `-${500 + index}`, status: 'error', error: 'boom' }));
+    services.current = makeFakeServices({
+      listRepairs: vi.fn(() => [...failed, repair({ peer_title: 'Now', dry_run: 1, checked_count: 50, added_count: 6 })]),
+    });
+
+    await runProgram(['backfill', 'status']);
+
+    const lines = logSpy.mock.calls.flat().join('\n').split('\n');
+    expect(lines.find((line) => line.startsWith('  repair'))).toBe('  repair Now [in_progress] checked=50 missing=6');
+    expect(lines[0]).not.toContain('missing');
+    expect(lines.find((line) => line.startsWith('REPAIRS:'))).toContain('added=0 missing=6');
+  });
+
   it('status --json adds totals to the full list', async () => {
     services.current = makeFakeServices({
       listRepairs: vi.fn(() => [repair({ status: 'idle', checked_count: 7, added_count: 2 })]),

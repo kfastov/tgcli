@@ -227,6 +227,22 @@ function hasSequentialIds(channelId) {
 
 // Telegram refusing this chat will not change soon, unlike a dropped connection, an
 // expired session (401) or a failure of its own (5xx), which say nothing about the message.
+// Errors about the chat itself, the ones a repair can give up on: the account has left it,
+// it is gone, or Telegram does not know it. Anything else, such as a broken session,
+// would stop every chat in a row and must stay a failure that is retried.
+const CHAT_GONE_ERRORS = new Set([
+  'CHANNEL_INVALID',
+  'CHANNEL_PRIVATE',
+  'CHAT_FORBIDDEN',
+  'CHAT_ID_INVALID',
+  'PEER_ID_INVALID',
+  'USER_BANNED_IN_CHANNEL',
+]);
+
+function isChatGone(error) {
+  return error instanceof MtPeerNotFoundError || CHAT_GONE_ERRORS.has(error?.text);
+}
+
 function isRefusedRead(error) {
   const code = error?.code;
   return (code >= 400 && code < 500 && code !== 401) || error instanceof MtPeerNotFoundError;
@@ -2626,6 +2642,17 @@ export default class MessageSyncService {
     if (!channelIds.length) {
       throw new Error('No chat has sync enabled.');
     }
+    if (dryRun) {
+      // A dry run takes the chat's row, so over a repair still under way it would drop
+      // what that repair has yet to write.
+      const open = this.db.prepare(`
+        SELECT COUNT(*) AS n FROM archive_repairs
+        WHERE status IN (?, ?) AND dry_run = 0 AND channel_id IN (SELECT value FROM json_each(?))
+      `).get(JOB_STATUS.PENDING, JOB_STATUS.IN_PROGRESS, JSON.stringify(channelIds)).n;
+      if (open) {
+        throw new Error(`A repair is under way in ${open} of these chat(s); a dry run would replace it. Wait for it to finish (\`tgcli backfill status\`).`);
+      }
+    }
     const upsert = this.db.prepare(`
       INSERT INTO archive_repairs (channel_id, status, after_message_id, since_date, dry_run)
       VALUES (?, ?, ?, ?, ?)
@@ -2771,7 +2798,7 @@ export default class MessageSyncService {
         await this._delayUnlessStopped(waitSeconds * 1000);
         return;
       }
-      if (isRefusedRead(error)) {
+      if (isChatGone(error)) {
         // Not a member any more, or the chat is gone: asking again every hour changes nothing.
         update('status = ?, error = ?', REPAIR_STATUS.SKIPPED, error?.message ?? String(error));
         console.log(`[sync] Channel ${channelId}: repair skipped, Telegram refuses to read it: ${error?.message ?? error}`);
