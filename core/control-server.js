@@ -211,7 +211,10 @@ export function createControlRequestHandler({
         return;
       }
 
-      if (req.method === 'POST' && url.pathname === '/control/repair') {
+      // A dry run has a path of its own: a server that predates it answers 404 instead
+      // of ignoring the flag and writing.
+      if (req.method === 'POST' && (url.pathname === '/control/repair' || url.pathname === '/control/repair/dry-run')) {
+        const dryRun = url.pathname === '/control/repair/dry-run';
         const body = await readJsonBody(req);
         const chats = Array.isArray(body?.chats) ? body.chats.filter((chat) => String(chat ?? '').trim() !== '') : [];
         if (!body?.all && !chats.length) {
@@ -230,6 +233,7 @@ export function createControlRequestHandler({
             all: Boolean(body?.all),
             afterId: body?.afterId,
             sinceDate: body?.sinceDate,
+            dryRun,
           });
         } catch (error) {
           sendJson(res, 400, { error: error?.message ?? 'Repair request failed' });

@@ -191,6 +191,23 @@ describe('backfill repair', () => {
     expect(archivedIds(service)).toEqual(range(180, 200));
   });
 
+  it('counts in a dry run what is missing, and writes nothing', async () => {
+    const historyIds = range(10, 259);
+    const archived = historyIds.filter((id) => id !== 11 && id !== 137);
+    const service = setUp(historyIds, archived);
+
+    service.addRepairs({ chats: [CHANNEL_ID], dryRun: true });
+    await service.processQueue();
+
+    expect(archivedIds(service)).toEqual(archived);
+    expect(repairRow(service)).toMatchObject({ status: 'idle', dry_run: 1, checked_count: 250, added_count: 2 });
+
+    service.addRepairs({ chats: [CHANNEL_ID] });
+    await service.processQueue();
+    expect(archivedIds(service)).toEqual(historyIds);
+    expect(repairRow(service)).toMatchObject({ dry_run: 0, added_count: 2 });
+  });
+
   it('stops at the date bound', async () => {
     const service = setUp(range(100, 200), [100, 101, 200]);
 
@@ -465,6 +482,17 @@ describe('backfill repair', () => {
       checked_count: 0,
       added_count: 0,
     });
+  });
+
+  it('keeps suggesting a repair after a dry run of every chat', () => {
+    const service = setUp([10], [10]);
+    service._setRepairNotNeeded = vi.fn(service._setRepairNotNeeded.bind(service));
+    service.db.prepare("DELETE FROM search_meta WHERE key = 'archive_repair'").run();
+
+    service.addRepairs({ all: true, dryRun: true });
+
+    expect(service._setRepairNotNeeded).not.toHaveBeenCalled();
+    expect(service.isRepairSuggested()).toBe(true);
   });
 
   it('never suggests a repair for an archive started by this version', () => {

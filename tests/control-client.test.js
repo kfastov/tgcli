@@ -140,6 +140,16 @@ describe('enqueueBackfill / cancelBackfill', () => {
     expect(JSON.parse(init.body)).toEqual({ chats: ['@c'], all: false, afterId: 0, sinceDate: 1700000000 });
   });
 
+  it('sends a dry run to a path of its own, and says when the server is too old for it', async () => {
+    global.fetch.mockResolvedValue(jsonResponse(200, { channelIds: ['-100'] }));
+    await enqueueRepair(storeDir, { all: true, dryRun: true });
+    expect(global.fetch.mock.calls[0][0]).toBe('http://127.0.0.1:8765/control/repair/dry-run');
+
+    writeControl({ pid: 9, port: 8765, token: 'secret', startedAt: 's', version: '2.2.5' });
+    global.fetch.mockResolvedValue(jsonResponse(404, { error: 'Not found' }));
+    await expect(enqueueRepair(storeDir, { all: true, dryRun: true })).rejects.toThrow(/predates `backfill repair --dry-run`/);
+  });
+
   it('says to restart a server too old to know /control/repair', async () => {
     writeControl({ pid: 9, port: 8765, token: 'secret', startedAt: 's', version: '2.2.4' });
     global.fetch.mockResolvedValue(jsonResponse(404, { error: 'Not found' }));

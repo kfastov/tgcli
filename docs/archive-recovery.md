@@ -35,6 +35,8 @@ needs no repair and gets no reminder.
    date bound, and `--after-id 0` walks back to when the chat entered the archive. The command follows progress
    on stderr and prints what it added; Ctrl-C detaches and the server carries on.
    `--background` returns at once, and `tgcli backfill status` shows repairs under way.
+   `--dry-run` only counts what is missing and writes nothing. Finding a hole takes the
+   same reads as filling it, so a dry run costs as many requests as the repair.
 4. Check a message you know was missing. Ask SQLite rather than `tgcli messages show`,
    which falls back to Telegram when the archive has no such row:
    ```bash

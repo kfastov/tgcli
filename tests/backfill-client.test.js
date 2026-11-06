@@ -303,10 +303,11 @@ describe('backfill repair', () => {
       all: true,
       afterId: 0,
       sinceDate: Date.parse('2026-10-01') / 1000,
+      dryRun: false,
     });
 
     await runProgram(['sync', 'repair', '--chat', '-100', '--after-id', '500']);
-    expect(control.enqueueRepair.mock.calls[1][1]).toEqual({ chats: ['-100'], all: false, afterId: 500, sinceDate: null });
+    expect(control.enqueueRepair.mock.calls[1][1]).toEqual({ chats: ['-100'], all: false, afterId: 500, sinceDate: null, dryRun: false });
   });
 
   it.each([
@@ -351,6 +352,23 @@ describe('backfill repair', () => {
     const out = logSpy.mock.calls.flat().join('\n');
     expect(out).toContain("Skipped Left: You haven't joined this channel/supergroup.");
     expect(out).toContain('Repaired 1/2 chat(s), skipped 1, added 3 message(s).');
+  });
+
+  it('--dry-run asks the server for a dry run and reports what is missing', async () => {
+    services.current = makeFakeServices({
+      listRepairs: vi.fn(() => [
+        repair({ status: 'idle', dry_run: 1, checked_count: 40, added_count: 3 }),
+        repair({ channel_id: '-200', peer_title: 'Whole', status: 'idle', dry_run: 1, checked_count: 9 }),
+      ]),
+    });
+
+    await runProgram(['backfill', 'repair', '--all', '--dry-run']);
+
+    expect(control.enqueueRepair.mock.calls[0][1]).toMatchObject({ all: true, dryRun: true });
+    const out = logSpy.mock.calls.flat().join('\n');
+    expect(out).toContain('Chan: checked 40, missing 3.');
+    expect(out).toContain('Checked 2/2 chat(s), missing 3 message(s).');
+    expect(out).toContain('Dry run: nothing written.');
   });
 
   it('--background --json returns the queued chats without following them', async () => {
@@ -407,7 +425,7 @@ describe('backfill repair', () => {
     await runProgram(['--json', 'backfill', 'status']);
 
     const out = JSON.parse(stdoutText());
-    expect(out.repairTotals).toEqual({ chats: 1, byStatus: { idle: 1 }, checked: 7, added: 2 });
+    expect(out.repairTotals).toEqual({ chats: 1, byStatus: { idle: 1 }, checked: 7, added: 2, missing: 0 });
     expect(out.repairs).toHaveLength(1);
   });
 });
