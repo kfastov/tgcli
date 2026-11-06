@@ -1621,6 +1621,8 @@ async function runFeedback(globalFlags, messageParts, options = {}) {
 // A backfill job is terminal once the worker stops touching it: `idle` means the
 // backfill reached its target/exhausted history; `error` means it failed.
 const TERMINAL_JOB_STATUSES = new Set(['idle', 'error']);
+// A skipped repair is one Telegram refuses for good, such as in a chat the account left.
+const TERMINAL_REPAIR_STATUSES = new Set([...TERMINAL_JOB_STATUSES, 'skipped']);
 
 // Briefly take a read lock, read job state, then release — never held across a
 // poll loop. Holding it for the whole wait would block CLI writers like `send`,
@@ -1915,11 +1917,11 @@ async function runBackfillRepair(globalFlags, options = {}) {
       let lastPrintedAt = 0;
       while (!detached) {
         repairs = withReadSnapshot(storeDir, (service) => service.listRepairs({ channelIds }));
-        const active = repairs.find((repair) => !TERMINAL_JOB_STATUSES.has(repair.status));
+        const active = repairs.find((repair) => !TERMINAL_REPAIR_STATUSES.has(repair.status));
         if (!active) {
           break;
         }
-        const finished = repairs.length - repairs.filter((repair) => !TERMINAL_JOB_STATUSES.has(repair.status)).length;
+        const finished = repairs.filter((repair) => TERMINAL_REPAIR_STATUSES.has(repair.status)).length;
         const line = `Repairing ${repairLabel(active)}: checked ${active.checked_count}, added ${active.added_count}`
           + (repairs.length > 1 ? ` (${finished}/${repairs.length} chats done)` : '');
         if (line !== lastLine && Date.now() - lastPrintedAt >= REPAIR_PROGRESS_INTERVAL_MS) {
@@ -1938,16 +1940,21 @@ async function runBackfillRepair(globalFlags, options = {}) {
         writeJson({ ok: failed.length === 0, repairs: repairs.map(repairSummary) });
         return;
       }
+      const skipped = repairs.filter((repair) => repair.status === 'skipped');
       for (const repair of repairs) {
         if (repair.status === 'error') {
           console.error(`Repair of ${repairLabel(repair)} failed: ${repair.error ?? 'unknown error'}`);
+        } else if (repair.status === 'skipped') {
+          console.log(`Skipped ${repairLabel(repair)}: ${repair.error ?? 'Telegram refuses to read it'}`);
         } else if (repair.added_count > 0 || repairs.length === 1) {
           console.log(`${repairLabel(repair)}: checked ${repair.checked_count}, added ${repair.added_count}.`);
         }
       }
       const added = repairs.reduce((sum, repair) => sum + (repair.added_count ?? 0), 0);
       if (repairs.length > 1) {
-        console.log(`Repaired ${repairs.length - failed.length}/${repairs.length} chat(s), added ${added} message(s).`);
+        const repaired = repairs.length - failed.length - skipped.length;
+        const skippedNote = skipped.length ? `, skipped ${skipped.length}` : '';
+        console.log(`Repaired ${repaired}/${repairs.length} chat(s)${skippedNote}, added ${added} message(s).`);
       }
     } finally {
       process.off('SIGINT', onSigint);

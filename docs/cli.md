@@ -74,12 +74,14 @@ one-shot client.
 - backfill repair --chat <id|username>|--all [--since ISO|7d] [--after-id N] [--background]
   - Fill holes that older versions left in the archive: walk the chat's history from
     the newest message down to the bound and write back what the archive lacks.
-    Cursors stay put, and nothing below what the archive covers is added (the older
-    of the oldest archived message and the backfill cursor). Without a bound it reads
+    Cursors stay put, and it goes no further back than when the chat entered the
+    archive: older history is what `backfill --depth` is for. Without a bound it reads
     the last 30 days; `--since` takes an ISO date or a duration with a unit (`7d`), and
-    `--after-id` alone sets no date bound. Runs on the server between its other jobs, one page a second; follows
-    progress like `backfill --chat`, and Ctrl-C detaches. Exits non-zero if a repair
-    fails. See [archive-recovery.md](archive-recovery.md).
+    `--after-id` alone sets no date bound. `--all` leaves out chats the last dialog list
+    did not have (ones the account left); `--chat` still takes them. Runs on the server
+    between its other jobs, one page a second; follows progress like `backfill --chat`,
+    and Ctrl-C detaches. A chat Telegram refuses to read is skipped; exits non-zero if a
+    repair fails. See [archive-recovery.md](archive-recovery.md).
 - backfill (no --chat): track the server's queue (alias: `sync`)
   - `--follow`: auto-start the server if needed, track the queue with live
     progress, and exit once it drains. The server keeps running on its own

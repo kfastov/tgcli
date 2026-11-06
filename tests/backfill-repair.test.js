@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { Long } from '@mtcute/core';
+import { Long, tl } from '@mtcute/core';
 import { iterHistory } from '@mtcute/core/methods.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -70,17 +70,19 @@ describe('backfill repair', () => {
     return service;
   };
 
+  // enteredAt is when the chat entered the archive; by default before all its history.
   const setUp = (historyIds, archivedIds, {
     syncEnabled = 1,
     username = 'group',
     oldestCursor = archivedIds.length ? Math.min(...archivedIds) : null,
+    enteredAt = BASE_DATE,
   } = {}) => {
     answer = historyOf(historyIds);
     const service = makeService();
     service.db.prepare(`
-      INSERT INTO channels (channel_id, peer_title, username, sync_enabled, last_message_id, oldest_message_id)
-      VALUES (?, 'Group', ?, ?, ?, ?)
-    `).run(CHANNEL_ID, username, syncEnabled, Math.max(...historyIds), oldestCursor);
+      INSERT INTO channels (channel_id, peer_title, username, sync_enabled, last_message_id, oldest_message_id, created_at)
+      VALUES (?, 'Group', ?, ?, ?, ?, datetime(?, 'unixepoch'))
+    `).run(CHANNEL_ID, username, syncEnabled, Math.max(...historyIds), oldestCursor, enteredAt);
     service.insertMessagesTx(archivedIds.map((id) => service._buildMessageRecord(CHANNEL_ID, {
       id,
       date: BASE_DATE + id,
@@ -144,33 +146,49 @@ describe('backfill repair', () => {
     }
   });
 
-  it('stops at the oldest archived message: older history is a backfill, not a hole', async () => {
-    const service = setUp(range(100, 200), range(120, 200).filter((id) => id !== 150));
+  // Holes come from following the chat, so they lie after it entered the archive. History
+  // from before came from a backfill, which pages through it without gaps.
+  it('walks below its oldest row, back to when the chat entered the archive', async () => {
+    const service = setUp(range(100, 200), range(150, 200), { enteredAt: BASE_DATE + 120 });
 
     service.addRepairs({ chats: [CHANNEL_ID] });
     await service.processQueue();
 
     expect(archivedIds(service)).toEqual(range(120, 200));
+    expect(historyRequests).toHaveLength(1);
   });
 
-  it('goes down to the backfill cursor when the oldest rows themselves are missing', async () => {
-    const service = setUp(range(100, 200), range(120, 200), { oldestCursor: 105 });
+  // An edit or a reply can bring a message from long before into the archive; that row
+  // says nothing about what the archive followed.
+  it('takes no floor from a stray old row', async () => {
+    const service = setUp(range(100, 200), [105, ...range(150, 200).filter((id) => id !== 170)], {
+      enteredAt: BASE_DATE + 150,
+    });
 
     service.addRepairs({ chats: [CHANNEL_ID] });
     await service.processQueue();
 
-    expect(archivedIds(service)).toEqual(range(105, 200));
+    expect(archivedIds(service)).toEqual([105, ...range(150, 200)]);
+    expect(repairRow(service)).toMatchObject({ status: 'idle', added_count: 1 });
   });
 
-  it('has nothing to repair in a chat the archive does not cover yet', async () => {
-    const service = setUp(range(100, 200), []);
+  it('fills a chat with no rows from when it entered the archive', async () => {
+    const service = setUp(range(100, 200), [], { enteredAt: BASE_DATE + 190 });
 
     service.addRepairs({ chats: [CHANNEL_ID], afterId: 0 });
     await service.processQueue();
 
-    expect(historyRequests).toHaveLength(0);
-    expect(archivedIds(service)).toEqual([]);
-    expect(repairRow(service)).toMatchObject({ status: 'idle', checked_count: 0, added_count: 0 });
+    expect(archivedIds(service)).toEqual(range(190, 200));
+    expect(repairRow(service)).toMatchObject({ status: 'idle', checked_count: 11, added_count: 11 });
+  });
+
+  it('keeps to an asked bound older than the chat in the archive', async () => {
+    const service = setUp(range(100, 200), [200], { enteredAt: BASE_DATE + 150 });
+
+    service.addRepairs({ chats: [CHANNEL_ID], sinceDate: BASE_DATE + 180 });
+    await service.processQueue();
+
+    expect(archivedIds(service)).toEqual(range(180, 200));
   });
 
   it('stops at the date bound', async () => {
@@ -246,7 +264,7 @@ describe('backfill repair', () => {
     answer = (request) => {
       calls += 1;
       if (calls === 2) {
-        throw new Error('CHANNEL_PRIVATE');
+        throw new Error('Connection lost');
       }
       return history(request);
     };
@@ -309,17 +327,34 @@ describe('backfill repair', () => {
     const service = setUp(range(10, 30), [10]);
     const history = answer;
     answer = () => {
-      throw new Error('CHANNEL_PRIVATE');
+      throw new Error('Connection lost');
     };
 
     service.addRepairs({ chats: [CHANNEL_ID] });
     await service.processQueue();
-    expect(repairRow(service)).toMatchObject({ status: 'error', error: expect.stringContaining('CHANNEL_PRIVATE') });
+    expect(repairRow(service)).toMatchObject({ status: 'error', error: expect.stringContaining('Connection lost') });
 
     answer = history;
     service._resetErroredJobs();
     await service.processQueue();
     expect(repairRow(service)).toMatchObject({ status: 'idle', added_count: 20, error: null });
+  });
+
+  it('skips a chat Telegram refuses for good, and the hourly reset leaves it alone', async () => {
+    const service = setUp(range(10, 30), [10]);
+    answer = () => {
+      throw tl.RpcError.fromTl({ _: 'rpc_error', errorCode: 400, errorMessage: 'CHANNEL_PRIVATE' });
+    };
+
+    service.addRepairs({ chats: [CHANNEL_ID] });
+    await service.processQueue();
+    expect(repairRow(service)).toMatchObject({ status: 'skipped', error: expect.stringContaining("haven't joined") });
+
+    historyRequests = [];
+    service._resetErroredJobs();
+    await service.processQueue();
+    expect(historyRequests).toHaveLength(0);
+    expect(repairRow(service).status).toBe('skipped');
   });
 
   it('stops for a chat whose sync was turned off, and stays stopped while it is off', async () => {
@@ -385,6 +420,35 @@ describe('backfill repair', () => {
     insert.run(OFF_ID, 0);
 
     expect(service.addRepairs({ all: true }).sort()).toEqual([CHANNEL_ID, OTHER_ID].sort());
+  });
+
+  // Telegram sends nothing from a chat the account has left, so what the archive lacks
+  // there is no loss.
+  it('leaves out of --all the chats the last dialog list did not have, but repairs one by name', async () => {
+    const service = setUp([10], [10]);
+    service.db.prepare('INSERT INTO channels (channel_id, sync_enabled) VALUES (?, 1)').run(OTHER_ID);
+    service.telegramClient.listDialogs = vi.fn().mockResolvedValue([{ id: Number(OTHER_ID), title: 'Other' }]);
+
+    await service.refreshChannelsFromDialogs();
+
+    expect(service.addRepairs({ all: true })).toEqual([OTHER_ID]);
+    expect(service.addRepairs({ chats: [CHANNEL_ID] })).toEqual([CHANNEL_ID]);
+  });
+
+  it('marks who is in the dialog list only from a list with something in it', async () => {
+    const service = setUp([10], [10]);
+    service.db.prepare('INSERT INTO channels (channel_id, sync_enabled) VALUES (?, 1)').run(OTHER_ID);
+    const inDialogs = () => Object.fromEntries(service.db.prepare('SELECT channel_id, in_dialogs FROM channels').all()
+      .map((row) => [row.channel_id, row.in_dialogs]));
+    expect(inDialogs()).toEqual({ [CHANNEL_ID]: null, [OTHER_ID]: null });
+
+    service.telegramClient.listDialogs = vi.fn().mockResolvedValue([{ id: Number(CHANNEL_ID), title: 'Group' }]);
+    await service.refreshChannelsFromDialogs();
+    expect(inDialogs()).toEqual({ [CHANNEL_ID]: 1, [OTHER_ID]: 0 });
+
+    service.telegramClient.listDialogs = vi.fn().mockResolvedValue([]);
+    await service.refreshChannelsFromDialogs();
+    expect(inDialogs()).toEqual({ [CHANNEL_ID]: 1, [OTHER_ID]: 0 });
   });
 
   it('starts a repair asked for again from the top, with the new bounds', async () => {
