@@ -1,5 +1,5 @@
 import { TelegramClient as MtCuteClient } from '@mtcute/node';
-import { InputMedia, Message, PeersIndex } from '@mtcute/core';
+import { InputMedia, Message, MtPeerNotFoundError, PeersIndex } from '@mtcute/core';
 import { randomLong, toggleChannelIdMark } from '@mtcute/core/utils.js';
 import { html } from '@mtcute/html-parser';
 import { md } from '@mtcute/markdown-parser';
@@ -508,6 +508,43 @@ function resolveDownloadLocation(media) {
   return null;
 }
 
+// Errors about a chat itself: the account has left it or was removed, it is gone, or
+// Telegram does not know it. Anything else, such as a broken session, says nothing
+// about the chat.
+const CHAT_GONE_ERRORS = new Set([
+  'CHANNEL_INVALID',
+  'CHANNEL_PRIVATE',
+  'CHAT_FORBIDDEN',
+  'CHAT_ID_INVALID',
+  'PEER_ID_INVALID',
+  'USER_BANNED_IN_CHANNEL',
+]);
+
+export function isChatGone(error) {
+  return error instanceof MtPeerNotFoundError || CHAT_GONE_ERRORS.has(error?.text);
+}
+
+// What Telegram says about the account in a channel or group: 'member', 'left' (left on
+// its own), 'gone' (removed, banned, the chat deleted or migrated) or 'unknown' (not in
+// the local peer cache, so there is nothing to ask with).
+function membershipOf(chat) {
+  switch (chat?._) {
+    case 'channel':
+      return chat.left ? 'left' : 'member';
+    case 'chat':
+      if (chat.deactivated || chat.migratedTo) {
+        return 'gone';
+      }
+      return chat.left ? 'left' : 'member';
+    case 'channelForbidden':
+    case 'chatForbidden':
+    case 'chatEmpty':
+      return 'gone';
+    default:
+      return null;
+  }
+}
+
 export function normalizeChannelId(channelId) {
   if (typeof channelId === 'number') {
     return channelId;
@@ -853,6 +890,63 @@ class TelegramClient {
     await this.startUpdates();
     console.log('Dialogs ready.');
     return true;
+  }
+
+  // Asks Telegram about the account's membership in channels and groups, given marked
+  // ids, with one request per 100 of each kind. Returns a Map of id to 'member', 'left',
+  // 'gone' or 'unknown'; private chats have no membership and are left out.
+  async getChatMembership(chatIds) {
+    await this.ensureLogin();
+    const result = new Map();
+    const channels = [];
+    const groups = [];
+    for (const id of chatIds) {
+      let peer;
+      try {
+        peer = await this.client.resolvePeer(Number(id));
+      } catch (error) {
+        if (!(error instanceof MtPeerNotFoundError)) {
+          throw error;
+        }
+        result.set(String(id), 'unknown');
+        continue;
+      }
+      if (peer._ === 'inputPeerChannel') {
+        channels.push({ id: String(id), input: { _: 'inputChannel', channelId: peer.channelId, accessHash: peer.accessHash } });
+      } else if (peer._ === 'inputPeerChat') {
+        groups.push({ id: String(id), input: peer.chatId });
+      }
+    }
+
+    const ask = async (items, request, markedId) => {
+      for (let start = 0; start < items.length; start += 100) {
+        const batch = items.slice(start, start + 100);
+        let chats;
+        try {
+          ({ chats } = await this.client.call(request(batch.map((item) => item.input))));
+        } catch (error) {
+          if (!isChatGone(error)) {
+            throw error;
+          }
+          if (batch.length === 1) {
+            result.set(batch[0].id, 'gone');
+            continue;
+          }
+          // One refused chat fails the whole batch, so ask about each on its own.
+          for (const item of batch) {
+            await ask([item], request, markedId);
+          }
+          continue;
+        }
+        const byId = new Map(chats.map((chat) => [markedId(chat.id), membershipOf(chat)]));
+        for (const item of batch) {
+          result.set(item.id, byId.get(item.id) ?? 'unknown');
+        }
+      }
+    };
+    await ask(channels, (id) => ({ _: 'channels.getChannels', id }), (rawId) => String(toggleChannelIdMark(rawId)));
+    await ask(groups, (id) => ({ _: 'messages.getChats', id }), (rawId) => String(-rawId));
+    return result;
   }
 
   async listDialogs(limit = 50, { includeArchived = false, retriedAfterSessionReset = false } = {}) {

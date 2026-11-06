@@ -23,6 +23,7 @@ vi.mock('../core/services.js', () => ({
       getSearchStatus: () => ({ enabled: true, version: 5 }),
       getQueueStats: () => ({ pending: 0, in_progress: 0, idle: 0, error: 0, gaps: 0 }),
       isRepairSuggested: () => false,
+      getLeftChatCounts: () => ({ syncOff: 0, stillJoined: 0 }),
       close: vi.fn().mockResolvedValue(undefined),
     },
   })),
