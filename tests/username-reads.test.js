@@ -36,7 +36,8 @@ describe('chats given by username, for reads', () => {
         throw new Error('asked Telegram');
       }),
       storage: {
-        peers: { getByUsername: vi.fn(async (name) => cache.get(name) ?? null) },
+        // mtcute keeps usernames lowercased.
+        peers: { getByUsername: vi.fn(async (name) => cache.get(name.toLowerCase()) ?? null) },
         self: { fetch: vi.fn(async () => ({ userId: Number(USER), isBot: false })) },
       },
     };
@@ -81,9 +82,29 @@ describe('chats given by username, for reads', () => {
     cache.set('news_room', { _: 'inputPeerChannel', channelId: 702, accessHash: hash });
     expect(await service.findChatKeyLocally('@news_room')).toBe(OTHER);
 
+    // The cache naming a third chat says the stored usernames are stale: Telegram decides.
+    cache.set('news_room', { _: 'inputPeerChannel', channelId: 703, accessHash: hash });
+    expect(await service.findChatKeyLocally('@news_room')).toBeNull();
+
     service.db.prepare('UPDATE channels SET in_dialogs = 1 WHERE channel_id = ?').run(OTHER);
     cache.clear();
     expect(await service.findChatKeyLocally('@news_room')).toBeNull();
+  });
+
+  // A chat gave its username up and another took it: the archive still has the old one.
+  it('asks Telegram when the peer cache names another chat than the archive', async () => {
+    cache.set('news_room', { _: 'inputPeerChannel', channelId: 702, accessHash: hash });
+    telegram.getPeer.mockResolvedValueOnce({ id: Number(OTHER), username: 'news_room', usernames: [] });
+
+    expect(await service.resolveChatKeyForRead('@news_room')).toBe(OTHER);
+    expect(telegram.getPeer).toHaveBeenCalledTimes(1);
+  });
+
+  it('forgets a username the dialog list no longer shows', async () => {
+    service.upsertChannels([{ id: CHANNEL, title: 'News', username: null }, { id: USER, title: 'Friend', username: 'friend' }]);
+
+    expect(service.db.prepare('SELECT username FROM channels WHERE channel_id = ?').get(CHANNEL).username).toBeNull();
+    expect(service.db.prepare('SELECT username FROM channels WHERE channel_id = ?').get(USER).username).toBe('friend');
   });
 
   it('asks Telegram only for a username nothing here knows', async () => {
@@ -98,6 +119,18 @@ describe('chats given by username, for reads', () => {
 
     expect(await service.resolveChatKey('@News_Room')).toBe(CHANNEL);
     expect(telegram.getPeer).toHaveBeenCalledTimes(1);
+  });
+
+  // These ask Telegram anyway, so they take its word over a username stored here.
+  it('asks Telegram which chat a username is for live reads and for the live fallback', async () => {
+    const live = { getMessagesByChannelId: vi.fn(async () => ({ messages: [] })), getPeerMetadata: vi.fn(async () => ({})) };
+    telegram.getPeer.mockResolvedValue({ id: Number(OTHER), username: 'news_room', usernames: [] });
+
+    await OPERATIONS.messagesList({ messageSyncService: service, telegramClient: live }, { channelId: '@news_room', source: 'live', limit: 5 });
+    expect(live.getMessagesByChannelId).toHaveBeenLastCalledWith(OTHER, 5, {});
+
+    await OPERATIONS.messagesList({ messageSyncService: service, telegramClient: live }, { channelId: '@news_room', source: 'archive', limit: 5 });
+    expect(live.getMessagesByChannelId).toHaveBeenLastCalledWith(OTHER, 5, {});
   });
 
   it('lists archived messages by username without Telegram', async () => {
