@@ -99,16 +99,19 @@ describe('doctor unanswered chats', () => {
 });
 
 describe('turning off the unanswered chats', () => {
-  it('turns off only those, as if the user had, and leaves them off when they come back', async () => {
+  it('turns off only those, as if the user had', async () => {
     const service = new MessageSyncService(null, { dbPath: path.join(storeDir, 'messages.db') });
     for (const [sql, ...params] of [
       chat('-1000000000820'),
       chat('-1000000000821'),
       chat('-1000000000822', { membership: 'member' }),
-      chat('-1000000000823', { inDialogs: 1, membership: null }),
+      chat('-1000000000823', { inDialogs: 1 }),
+      chat('-1000000000824'),
     ]) {
       service.db.prepare(sql).run(...params);
     }
+    // One the user asked for stays theirs.
+    service.db.prepare('UPDATE channels SET sync_by_user = 1 WHERE channel_id = ?').run('-1000000000824');
 
     expect(service.unwatchUnansweredChats()).toEqual(['-1000000000820', '-1000000000821']);
     const rows = Object.fromEntries(service.db.prepare('SELECT channel_id, sync_enabled, sync_off_reason FROM channels').all()
@@ -118,6 +121,7 @@ describe('turning off the unanswered chats', () => {
       '-1000000000821': [0, null],
       '-1000000000822': [1, null],
       '-1000000000823': [1, null],
+      '-1000000000824': [1, null],
     });
     expect(service.listUnansweredChats()).toEqual([]);
     service.close();

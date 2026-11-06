@@ -3303,7 +3303,7 @@ export default class MessageSyncService {
   listUnansweredChats() {
     return this.db.prepare(`
       SELECT channel_id, peer_title, membership_checked_at FROM channels
-      WHERE sync_enabled = 1 AND in_dialogs = 0 AND membership = 'unknown'
+      WHERE sync_enabled = 1 AND in_dialogs = 0 AND membership = 'unknown' AND COALESCE(sync_by_user, 0) = 0
       ORDER BY channel_id
     `).all();
   }
@@ -3313,7 +3313,7 @@ export default class MessageSyncService {
       UPDATE channels
       SET sync_enabled = 0, sync_by_user = 0, sync_off_reason = NULL, membership = NULL,
         membership_checked_at = NULL, updated_at = CURRENT_TIMESTAMP
-      WHERE sync_enabled = 1 AND in_dialogs = 0 AND membership = 'unknown'
+      WHERE sync_enabled = 1 AND in_dialogs = 0 AND membership = 'unknown' AND COALESCE(sync_by_user, 0) = 0
       RETURNING channel_id
     `).all().map((row) => row.channel_id).sort();
   }
