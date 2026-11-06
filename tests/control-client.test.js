@@ -20,6 +20,7 @@ import {
   enqueueBackfill,
   enqueueRepair,
   ensureServer,
+  fetchServerStats,
   invoke,
   pingServer,
   readControlFile,
@@ -108,6 +109,51 @@ describe('pingServer', () => {
     writeControl({ pid: 9, port: 8765, token: 'secret', startedAt: 's' });
     global.fetch.mockResolvedValue(jsonResponse(401, { error: 'Unauthorized' }));
     expect(await pingServer(storeDir)).toBeNull();
+  });
+});
+
+describe('fetchServerStats', () => {
+  it('GETs /control/stats with the token and returns the counters', async () => {
+    writeControl({ pid: 9, port: 8765, token: 'secret', startedAt: 's' });
+    global.fetch.mockResolvedValue(jsonResponse(200, { pid: 9, sinceStart: {}, lastHour: {} }));
+
+    await expect(fetchServerStats(storeDir)).resolves.toEqual({ pid: 9, sinceStart: {}, lastHour: {} });
+    const [url, init] = global.fetch.mock.calls[0];
+    expect(url).toBe('http://127.0.0.1:8765/control/stats');
+    expect(init.method).toBe('GET');
+    expect(init.headers[CONTROL_TOKEN_HEADER]).toBe('secret');
+  });
+
+  it('says no server is running when there is no control file, and starts none', async () => {
+    await expect(fetchServerStats(storeDir)).rejects.toThrow(ServerUnavailableError);
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it('says no server is running when the control file outlived it', async () => {
+    writeControl({ pid: 9, port: 8765, token: 'secret', startedAt: 's' });
+    global.fetch.mockRejectedValue(Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } }));
+
+    await expect(fetchServerStats(storeDir)).rejects.toThrow('No tgcli server is running.');
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it('leaves a server on another version running', async () => {
+    writeControl({ pid: 9, port: 8765, token: 'secret', startedAt: 's', version: '0.0.1', autoStarted: true });
+    global.fetch.mockResolvedValue(jsonResponse(200, { pid: 9 }));
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    await fetchServerStats(storeDir);
+
+    expect(kill).not.toHaveBeenCalled();
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('says to restart a server too old to know /control/stats', async () => {
+    writeControl({ pid: 9, port: 8765, token: 'secret', startedAt: 's', version: '2.2.5' });
+    global.fetch.mockResolvedValue(jsonResponse(404, { error: 'Not found' }));
+
+    await expect(fetchServerStats(storeDir)).rejects.toThrow(/server \(2\.2\.5, pid 9\) predates `server stats`; restart it/);
   });
 });
 

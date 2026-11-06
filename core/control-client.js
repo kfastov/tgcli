@@ -33,6 +33,7 @@ const PACKAGE_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 const PING_TIMEOUT_MS = 1500;
 const ENQUEUE_TIMEOUT_MS = 30000;
+const STATS_TIMEOUT_MS = 5000;
 const SERVER_START_TIMEOUT_MS = 10000;
 const SERVER_STOP_TIMEOUT_MS = 15000;
 // `tgcli server stop` lets the queue worker finish the batch it is on.
@@ -191,6 +192,33 @@ export async function enqueueRepair(storeDir, { chats, all, afterId, sinceDate, 
   }
   if (status !== 200) {
     throw new Error(json?.error ?? `Repair request failed (HTTP ${status})`);
+  }
+  return json;
+}
+
+// GET /control/stats → the running server's counters (see core/server-stats.js).
+// Reads only: it neither starts a server nor replaces an outdated one, since a
+// fresh server has nothing to report.
+export async function fetchServerStats(storeDir) {
+  const control = readControlFile(storeDir);
+  if (!control?.port || !control?.token) {
+    throw new ServerUnavailableError('No tgcli server is running.');
+  }
+  let response;
+  try {
+    response = await controlFetch(control, '/control/stats', { timeoutMs: STATS_TIMEOUT_MS });
+  } catch (error) {
+    if (isFetchConnectionFailure(error)) {
+      throw new ServerUnavailableError('No tgcli server is running.', { cause: error });
+    }
+    throw error;
+  }
+  const { status, json } = response;
+  if (status === 404) {
+    throw new Error(`The running tgcli server (${control.version ?? 'unknown version'}, pid ${control.pid ?? '?'}) predates \`server stats\`; restart it and try again.`);
+  }
+  if (status !== 200) {
+    throw new Error(json?.error ?? `Stats request failed (HTTP ${status})`);
   }
   return json;
 }

@@ -122,6 +122,38 @@ one-shot client.
   - `--json`: `{ path, exists, lines }`; with `--follow`, one `{ "line": ... }` object
     per line.
 
+- server stats [--json]
+  - Counters of the running server, since it started and over the last hour (whole
+    minutes, so the window is 59–60 minutes and its start is printed). Reads only: it
+    neither starts a server nor replaces an outdated one, and exits non-zero when none
+    is running. A server too old to keep counters says to restart it. Asking does not
+    count as activity, so it keeps no idle server up.
+  - Requests to Telegram, by MTProto method. Counted once, right below mtcute's
+    flood-wait and internal-error retries, so each retry counts too. A resend mtcute
+    makes inside one send (a DC migration) counts once, and a call that fails before
+    it is sent (no connection) still counts, with its error.
+  - Request errors by name and method (`FLOOD_WAIT_23` counts as `FLOOD_WAIT`; a
+    request that throws, such as a timeout, counts under the exception's class, e.g.
+    `MtTimeoutError`), and the flood waits with the seconds Telegram asked for.
+  - Held back by mtcute: after a flood wait longer than it sleeps through, mtcute
+    answers further calls of that method with the remembered `FLOOD_WAIT` itself,
+    without asking Telegram. Those calls are neither requests nor request errors and
+    are listed here instead (only when there are any).
+  - Deleted messages read again: ids queued (a difference called them deleted, or a page
+    of history skipped them), reads done, found alive, put back in the archive, reads
+    that failed, and ids given up on.
+  - `backfill repair`: pages read, messages checked and added (a `--dry-run` counts what
+    it would add separately), repairs finished, skipped (the chat is gone) and failed.
+  - Gaps after a too-long channel difference: pages that brought new messages, messages
+    added, gaps closed, fills that failed.
+  - Backfill jobs: passes, jobs finished, passes that failed.
+  - `--json` prints `{ pid, version, startedAt, at, sinceStart, lastHour }`; each of the
+    last two has `since`, `requests { total, byMethod }`,
+    `errors { total, floodWait { count, seconds }, byError, byMethod, heldBack { total, byMethod } }`,
+    `rechecks`, `repair`, `gaps` and `jobs`.
+  - Counters live in memory and start over with the server. Only method names, error
+    names and counts are kept.
+
 Every command except `server` and `service` checks the running server's version
 before it runs. A server that an older CLI started on its own is replaced by this
 version right away, unless it has backfill jobs queued or is answering another
