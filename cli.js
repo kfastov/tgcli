@@ -2725,6 +2725,27 @@ async function runSyncJobsCancel(globalFlags, options = {}) {
   }, globalFlags.timeoutMs);
 }
 
+// Chats that older versions stored under a username, and what becomes of each.
+function formatUsernameKeyLines(chats) {
+  if (!chats.length) {
+    return [];
+  }
+  const lines = [`USERNAME KEYS: ${chats.length} chat(s) stored under a username instead of a Telegram id. The server moves each to its id after it logs in to Telegram; messages already under the id stay, duplicates are dropped.`];
+  for (const chat of chats) {
+    const messages = `${chat.messages} message(s)`;
+    if (chat.lastCheck) {
+      const { outcome, detail, checkedAt } = chat.lastCheck;
+      const next = outcome === 'failed' ? 'tried again when the server next starts' : 'asked again a day after that';
+      lines.push(`  ${chat.key}: ${messages}, stays as it is: ${detail} (${checkedAt}); ${next}.`);
+    } else if (chat.archivedAs) {
+      lines.push(`  ${chat.key}: ${messages}, to be merged with its Telegram id; the archive also has ${chat.archivedAs} under this username.`);
+    } else {
+      lines.push(`  ${chat.key}: ${messages}, no Telegram id known for it yet; the server asks Telegram for one.`);
+    }
+  }
+  return lines;
+}
+
 async function runDoctor(globalFlags, options = {}) {
   return withCommand(globalFlags, { need: 'full', lock: null }, async ({ storeDir, telegramClient, messageSyncService }) => {
     const lock = readStoreLock(storeDir);
@@ -2744,6 +2765,7 @@ async function runDoctor(globalFlags, options = {}) {
     const queue = messageSyncService.getQueueStats();
     const repairSuggested = messageSyncService.isRepairSuggested();
     const leftChats = messageSyncService.getLeftChatCounts();
+    const usernameKeys = messageSyncService.listUsernameKeyedChats();
     const update = getUpdateStatus({
       storeDir,
       version: readVersion(),
@@ -2761,6 +2783,7 @@ async function runDoctor(globalFlags, options = {}) {
       queue,
       repairSuggested,
       leftChats,
+      usernameKeys,
       update,
     };
 
@@ -2783,6 +2806,9 @@ async function runDoctor(globalFlags, options = {}) {
     }
     if (repairSuggested) {
       console.log(`REPAIR: versions before 2.2.5 could lose messages; fill the holes with \`tgcli backfill repair --all\` (the last ${DEFAULT_REPAIR_SINCE} of every synced chat).`);
+    }
+    for (const line of formatUsernameKeyLines(usernameKeys)) {
+      console.log(line);
     }
     console.log(formatDoctorUpdateLine(update));
   });

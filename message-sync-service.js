@@ -2,10 +2,11 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import { setTimeout as delay } from 'timers/promises';
-import { Message, MtPeerNotFoundError, PeersIndex, _messageMediaFromTl } from '@mtcute/core';
+import { Message, MtArgumentError, MtPeerNotFoundError, PeersIndex, _messageMediaFromTl, getMarkedPeerId } from '@mtcute/core';
 import { isChatGone, normalizeChannelId, summarizeMedia } from './telegram-client.js';
 import { resolveStoreDir, resolveStorePaths } from './core/store.js';
 import { parseRequiredWaitSeconds } from './core/send-utils.js';
+import { chatIdSql, isChatId } from './core/chat-key.js';
 
 const DEFAULT_DB_PATH = resolveStorePaths(resolveStoreDir()).dbPath;
 const DEFAULT_TARGET_MESSAGES = 1000;
@@ -20,6 +21,10 @@ const JOB_STATUS = {
 };
 // A repair Telegram refuses for good, such as in a chat the account has left.
 const REPAIR_STATUS = { ...JOB_STATUS, SKIPPED: 'skipped' };
+// A job or repair with work ahead of it: an error is retried when the server starts.
+const UNFINISHED_STATUSES = new Set([JOB_STATUS.PENDING, JOB_STATUS.IN_PROGRESS, JOB_STATUS.ERROR]);
+// Tables mergeChatKey moves by rules of their own rather than as plain copies.
+const MERGED_APART = new Set(['messages', 'message_links', 'message_media', 'jobs', 'archive_repairs']);
 // Out of reach for this long, Telegram's catch-up is no longer trusted to be complete.
 const LONG_OUTAGE_MS = 5 * 60 * 1000;
 const PERIODIC_CHECK_INTERVAL_MS = 30 * 1000;
@@ -41,6 +46,8 @@ const RETRY_BASE_MS = 60 * 1000;
 const REPAIR_PAGE_SIZE = 100;
 const REPAIR_PAGE_DELAY_MS = 1000;
 const RETRY_MAX_MS = 60 * 60 * 1000;
+// A username Telegram did not find is asked about again after this long.
+const USERNAME_RECHECK_MS = 24 * 60 * 60 * 1000;
 // Marked channel ids are below this. A text prefix would also match some basic groups.
 const MAX_MARKED_CHANNEL_ID = -1000000000000;
 const URL_PATTERN = /https?:\/\/[^\s<>"')]+/giu;
@@ -220,6 +227,42 @@ const TAG_RULES = [
 
 function normalizeChannelKey(channelId) {
   return String(normalizeChannelId(channelId));
+}
+
+// A username gets here only through resolveChatKey, which turns it into the id.
+function chatIdForWrite(channelId) {
+  const key = normalizeChannelKey(channelId);
+  if (!isChatId(key)) {
+    throw new Error(`Chat ${key} has to be resolved to its Telegram id before it is archived.`);
+  }
+  return key;
+}
+
+const USERNAME_NOT_FOUND_ERRORS = new Set(['USERNAME_INVALID', 'USERNAME_NOT_OCCUPIED']);
+
+function isChatNotFound(error) {
+  // mtcute says the same of a chat it found but cannot reach yet, which passes.
+  if (error instanceof MtPeerNotFoundError && /no access hash/.test(error.message ?? '')) {
+    return false;
+  }
+  return error instanceof MtArgumentError || USERNAME_NOT_FOUND_ERRORS.has(error?.text) || isChatGone(error);
+}
+
+function chatNotFound(key, cause) {
+  const error = new Error(`Telegram has no chat ${key}.`, { cause });
+  error.code = 'CHAT_NOT_FOUND';
+  return error;
+}
+
+// Whether Telegram's answer for a username is the chat that has it now. mtcute answers
+// from its own cache first, which can still name the account that had it before.
+function peerHasUsername(peer, key) {
+  const wanted = key.replace(/^@/, '').toLowerCase();
+  if (wanted === 'me' || wanted === 'self') {
+    return true;
+  }
+  const names = (peer?.usernames ?? []).map((entry) => entry.username?.toLowerCase());
+  return names.includes(wanted) || peer?.username?.toLowerCase() === wanted;
 }
 
 // Only in channels and supergroups, private chats and basic groups share them.
@@ -615,6 +658,12 @@ export default class MessageSyncService {
     // Only the queue worker owns its in-flight job; `shutdown()` requeues just
     // this one so it resumes next run, without touching jobs other processes own.
     this.ownedInProgressJobId = null;
+    // The run of migrateUsernameKeys under way, which the queue waits for, and the
+    // queue's step in flight, which the migration waits for.
+    this.usernameKeyMigration = null;
+    this.queueStep = null;
+    // Peers resolveChatKey found by username, by id, until a write describes the chat.
+    this.resolvedPeers = new Map();
 
     this._initDatabase();
   }
@@ -854,6 +903,18 @@ export default class MessageSyncService {
     if (!this.db.prepare('PRAGMA table_info(archive_repairs)').all().some((col) => col.name === 'dry_run')) {
       this.db.exec('ALTER TABLE archive_repairs ADD COLUMN dry_run INTEGER NOT NULL DEFAULT 0');
     }
+
+    // Chats still stored under a username that the last try could not move to their
+    // Telegram id, and why: Telegram did not find it, the try failed, or the messages
+    // under it name another chat than the one Telegram gave.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS username_key_checks (
+        chat_key TEXT PRIMARY KEY,
+        outcome TEXT NOT NULL,
+        detail TEXT,
+        checked_at INTEGER NOT NULL
+      );
+    `);
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS message_links (
@@ -1576,7 +1637,7 @@ export default class MessageSyncService {
   _getGapChannelIds() {
     return this.db.prepare(`
       SELECT channel_id FROM channels
-      WHERE gap_after_message_id IS NOT NULL AND sync_enabled = 1
+      WHERE gap_after_message_id IS NOT NULL AND sync_enabled = 1 AND ${chatIdSql()}
       ORDER BY channel_id
     `).all().map((row) => row.channel_id);
   }
@@ -1618,7 +1679,7 @@ export default class MessageSyncService {
   }
 
   upsertTopics(channelId, topics = []) {
-    const normalizedId = normalizeChannelKey(channelId);
+    const normalizedId = chatIdForWrite(channelId);
     const entries = [];
     for (const topic of topics || []) {
       const id = typeof topic.id === 'number' ? topic.id : Number(topic.id);
@@ -1647,7 +1708,7 @@ export default class MessageSyncService {
   }
 
   setChannelSync(channelId, enabled) {
-    const normalizedId = normalizeChannelKey(channelId);
+    const normalizedId = chatIdForWrite(channelId);
     const value = enabled ? 1 : 0;
     const stmt = this.db.prepare(`
       INSERT INTO channels (channel_id, sync_enabled, sync_by_user, updated_at)
@@ -1662,11 +1723,13 @@ export default class MessageSyncService {
       RETURNING channel_id, sync_enabled;
     `);
 
-    return stmt.get(normalizedId, value, value);
+    const row = stmt.get(normalizedId, value, value);
+    this._describeResolvedChat(normalizedId);
+    return row;
   }
 
   setChannelTags(channelId, tags, options = {}) {
-    const normalizedId = normalizeChannelKey(channelId);
+    const normalizedId = chatIdForWrite(channelId);
     const source = options.source ? String(options.source) : 'manual';
     const uniqueTags = new Set();
     for (const tag of tags || []) {
@@ -1682,6 +1745,7 @@ export default class MessageSyncService {
       VALUES (?, CURRENT_TIMESTAMP)
       ON CONFLICT(channel_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
     `).run(normalizedId);
+    this._describeResolvedChat(normalizedId);
 
     this.setChannelTagsTx(normalizedId, source, finalTags);
     return finalTags.map((entry) => entry.tag);
@@ -1993,9 +2057,12 @@ export default class MessageSyncService {
     const onlyMissing = Boolean(options.onlyMissing);
     const channelIds = Array.isArray(options.channelIds) ? options.channelIds : null;
 
+    // A chat under a username waits for migrateUsernameKeys, which would find these
+    // writes back under the username after it moved the rest.
     let rows;
     if (channelIds && channelIds.length) {
-      rows = channelIds.map((id) => this._getChannelWithMetadata(normalizeChannelKey(id))).filter(Boolean);
+      rows = channelIds.map((id) => this._getChannelWithMetadata(normalizeChannelKey(id)))
+        .filter((row) => row && isChatId(row.channel_id));
     } else {
       rows = this.db.prepare(`
         SELECT
@@ -2009,6 +2076,7 @@ export default class MessageSyncService {
           channel_metadata.updated_at AS metadata_updated_at
         FROM channels
         LEFT JOIN channel_metadata ON channel_metadata.channel_id = channels.channel_id
+        WHERE ${chatIdSql('channels.channel_id')}
         ORDER BY channels.updated_at DESC
         LIMIT ?
       `).all(limit);
@@ -2072,7 +2140,8 @@ export default class MessageSyncService {
 
     let rows;
     if (channelIds && channelIds.length) {
-      rows = channelIds.map((id) => this._getChannelWithMetadata(normalizeChannelKey(id))).filter(Boolean);
+      rows = channelIds.map((id) => this._getChannelWithMetadata(normalizeChannelKey(id)))
+        .filter((row) => row && isChatId(row.channel_id));
     } else {
       rows = this.db.prepare(`
         SELECT
@@ -2084,6 +2153,7 @@ export default class MessageSyncService {
           channel_metadata.updated_at AS metadata_updated_at
         FROM channels
         LEFT JOIN channel_metadata ON channel_metadata.channel_id = channels.channel_id
+        WHERE ${chatIdSql('channels.channel_id')}
         ORDER BY channels.updated_at DESC
         LIMIT ?
       `).all(limit);
@@ -2155,7 +2225,7 @@ export default class MessageSyncService {
   }
 
   addJob(channelId, options = {}) {
-    const normalizedId = normalizeChannelKey(channelId);
+    const normalizedId = chatIdForWrite(channelId);
     const target = options.depth && options.depth > 0 ? Number(options.depth) : DEFAULT_TARGET_MESSAGES;
     const minDate = options.minDate ? parseIsoDate(options.minDate) : null;
     const minDateIso = minDate ? new Date(minDate * 1000).toISOString() : null;
@@ -2173,6 +2243,7 @@ export default class MessageSyncService {
         sync_off_reason = NULL,
         updated_at = CURRENT_TIMESTAMP
     `).run(normalizedId);
+    this._describeResolvedChat(normalizedId);
 
     const stmt = this.db.prepare(`
       INSERT INTO jobs (
@@ -2225,9 +2296,13 @@ export default class MessageSyncService {
       params.push(status);
     }
 
-    if (channelId) {
+    if (channelId && isChatId(channelId)) {
       clauses.push('jobs.channel_id = ?');
       params.push(channelId);
+    } else if (channelId) {
+      // This reads without Telegram, so a username matches the archive's copy of it.
+      clauses.push('(jobs.channel_id = ? OR (channels.username IS NOT NULL AND LOWER(channels.username) = LOWER(?)))');
+      params.push(channelId, channelId.replace(/^@/, ''));
     }
 
     const whereClause = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -2275,15 +2350,17 @@ export default class MessageSyncService {
       throw new Error('jobId must be a number.');
     }
 
+    // A job under a username would only wait in the queue, and keep the server from
+    // exiting or making way for a newer version, until migrateUsernameKeys moves it.
     let ids = [];
     if (allErrors) {
       ids = this.db.prepare(`
         SELECT id
         FROM jobs
-        WHERE status = ?
+        WHERE status = ? AND ${chatIdSql()}
       `).all(JOB_STATUS.ERROR).map((row) => row.id);
     } else if (jobId !== null) {
-      const row = this.db.prepare('SELECT id FROM jobs WHERE id = ?').get(jobId);
+      const row = this.db.prepare(`SELECT id FROM jobs WHERE id = ? AND ${chatIdSql()}`).get(jobId);
       if (row) {
         ids = [row.id];
       }
@@ -2291,7 +2368,7 @@ export default class MessageSyncService {
       ids = this.db.prepare(`
         SELECT id
         FROM jobs
-        WHERE channel_id = ?
+        WHERE channel_id = ? AND ${chatIdSql()}
       `).all(channelId).map((row) => row.id);
     }
 
@@ -2416,6 +2493,381 @@ export default class MessageSyncService {
       enabled: Boolean(row?.name),
       version: version ? Number(version) : null,
     };
+  }
+
+  // The one place a chat given by username (or 'me') becomes the key the archive keeps
+  // it under, its Telegram id. An id comes back as it is, without asking Telegram.
+  async resolveChatKey(chat) {
+    const key = normalizeChannelKey(chat);
+    if (isChatId(key)) {
+      return key;
+    }
+    if (!key) {
+      throw new Error('A chat id or username is required.');
+    }
+    const peer = await this._getPeerByUsername(key);
+    const id = String(peer.id);
+    // A job or watch about to be written fills in the chat's title, type and username,
+    // which nothing else may bring in for a chat outside the dialog list.
+    this.resolvedPeers.delete(id);
+    this.resolvedPeers.set(id, peer);
+    if (this.resolvedPeers.size > 100) {
+      this.resolvedPeers.delete(this.resolvedPeers.keys().next().value);
+    }
+    return id;
+  }
+
+  _describeResolvedChat(channelId) {
+    const peer = this.resolvedPeers.get(channelId);
+    if (peer) {
+      this.resolvedPeers.delete(channelId);
+      this._ensureChannelFromPeer(channelId, peer);
+    }
+  }
+
+  async _getPeerByUsername(key) {
+    const client = this.telegramClient.client;
+    try {
+      const peer = await client.getPeer(key);
+      if (peerHasUsername(peer, key)) {
+        return peer;
+      }
+      return await client.getPeer(await client.resolvePeer(key, true));
+    } catch (error) {
+      throw isChatNotFound(error) ? chatNotFound(key, error) : error;
+    }
+  }
+
+  // Chats kept under a username instead of their Telegram id, as older versions
+  // stored a chat asked for that way. archivedAs is a chat under an id that has the
+  // same username, most likely the same chat; lastCheck says why the last try left it.
+  listUsernameKeyedChats() {
+    const keys = new Set();
+    for (const table of this._chatKeyedTables()) {
+      // A username sorts after every id, or before them when it starts with a sign
+      // other than '-', so the two ranges read only an index.
+      const rows = this.db.prepare(`
+        SELECT channel_id FROM "${table}" WHERE channel_id < '-'
+        UNION SELECT channel_id FROM "${table}" WHERE channel_id >= ':'
+      `).all();
+      for (const row of rows) {
+        keys.add(row.channel_id);
+      }
+    }
+    // Every way in leaves a job or a chat row, and both tables are small enough to
+    // check whole, which also finds a key such as '1a'.
+    for (const table of ['channels', 'jobs']) {
+      for (const row of this.db.prepare(`SELECT channel_id FROM ${table} WHERE NOT (${chatIdSql()})`).all()) {
+        keys.add(row.channel_id);
+      }
+    }
+    const checks = new Map(this.db.prepare('SELECT * FROM username_key_checks').all().map((row) => [row.chat_key, row]));
+    const countMessages = this.db.prepare('SELECT COUNT(*) AS n FROM messages WHERE channel_id = ?');
+    const findById = this.db.prepare(`
+      SELECT channel_id FROM channels
+      WHERE username IS NOT NULL AND LOWER(username) = LOWER(?) AND ${chatIdSql()}
+      ORDER BY channel_id
+      LIMIT 1
+    `);
+    return [...keys].sort().map((key) => {
+      const check = checks.get(key);
+      return {
+        key,
+        messages: countMessages.get(key).n,
+        archivedAs: findById.get(key.replace(/^@/, ''))?.channel_id ?? null,
+        lastCheck: check
+          ? { outcome: check.outcome, detail: check.detail, checkedAt: new Date(check.checked_at).toISOString() }
+          : null,
+      };
+    });
+  }
+
+  // Moves each chat still stored under a username to its Telegram id, which it asks
+  // Telegram for. The server runs this after every login, before the queue resumes,
+  // so an update brings an archive over without anyone running anything. A chat that
+  // Telegram does not find, or whose messages name another chat than the one Telegram
+  // gives, stays as it is with its work parked, and `tgcli doctor` names it.
+  migrateUsernameKeys({ now = Date.now() } = {}) {
+    this.usernameKeyMigration ??= this._migrateUsernameKeys(now).finally(() => {
+      this.usernameKeyMigration = null;
+    });
+    return this.usernameKeyMigration;
+  }
+
+  async _migrateUsernameKeys(now) {
+    const report = { moved: [], left: [], dropped: [] };
+    const chats = this.listUsernameKeyedChats();
+    if (!chats.length) {
+      return report;
+    }
+    console.log(`[archive] ${chats.length} chat(s) stored under a username, moving them to their Telegram ids.`);
+    for (const { key, lastCheck } of chats) {
+      if (this.stopRequested) {
+        break;
+      }
+      const left = (outcome, detail) => {
+        report.left.push({ key, outcome, detail });
+        console.log(`[archive] Chat ${key} stays under its username: ${detail}.`);
+        this._parkUsernameKey(key, outcome, detail, now);
+      };
+      // Telegram's answer to these does not change from one start to the next, and
+      // it limits how often a username can be looked up.
+      const recent = ['not_found', 'conflict'].includes(lastCheck?.outcome)
+        && now - Date.parse(lastCheck.checkedAt) < USERNAME_RECHECK_MS;
+      if (recent && lastCheck.outcome === 'conflict') {
+        report.left.push({ key, outcome: lastCheck.outcome, detail: lastCheck.detail });
+        continue;
+      }
+      let peer = null;
+      if (!recent) {
+        try {
+          peer = await this._getPeerByUsername(key);
+        } catch (error) {
+          if (this.stopRequested) {
+            break;
+          }
+          if (error?.code !== 'CHAT_NOT_FOUND') {
+            left('failed', `Telegram did not answer: ${error?.message ?? error}`);
+            continue;
+          }
+        }
+        if (this.stopRequested) {
+          break;
+        }
+      }
+      // One chat that cannot be moved, say with the archive busy, leaves the rest to go on.
+      let channelId = peer ? String(peer.id) : null;
+      try {
+        // Each message records the chat it came from. A username that has changed
+        // hands since would bring them into the chat that has it now.
+        const fromMessages = this._chatsOfMessages(key);
+        if (!peer) {
+          // Telegram no longer knows the username, so only the archive's own records can
+          // say which chat it was. A username stored on a chat has no date and may have
+          // belonged to someone else, so it is no evidence.
+          if (!fromMessages.total) {
+            const dropped = this.dropChatKey(key);
+            report.dropped.push(dropped);
+            console.log(`[archive] Chat ${key}: Telegram did not find it and no message is archived under it, so its rows are dropped: ${dropped.jobs} job(s), ${dropped.repairs} repair(s), ${dropped.rows} row(s) in all.`);
+            continue;
+          }
+          if (fromMessages.chats.size !== 1 || fromMessages.withPeer !== fromMessages.total) {
+            if (!recent) {
+              left('not_found', 'Telegram did not find it, and its messages do not all name one chat');
+            } else {
+              report.left.push({ key, outcome: lastCheck.outcome, detail: lastCheck.detail });
+            }
+            continue;
+          }
+          channelId = [...fromMessages.chats.keys()][0];
+        } else {
+          const others = [...fromMessages.chats.keys()].filter((id) => id !== channelId);
+          if (others.length) {
+            left('conflict', `Telegram gives ${channelId} for it, but its messages are from ${others.join(', ')}`);
+            continue;
+          }
+        }
+        // A queue started before this, by an update during login, finishes its step
+        // first; the next one waits for the migration.
+        await this.queueStep?.catch(() => {});
+        if (this.stopRequested) {
+          break;
+        }
+        const result = this.mergeChatKey(key, channelId, peer, { peerType: fromMessages.chats.get(channelId) });
+        report.moved.push(result);
+        const how = peer ? '' : ', found by its messages as Telegram did not find the username';
+        console.log(`[archive] Chat ${key} is now stored as ${channelId}${how}: ${result.messages} message(s) moved, ${result.duplicates} duplicate(s) dropped.`);
+      } catch (error) {
+        console.error(`[archive] Chat ${key}: moving it${channelId ? ` to ${channelId}` : ''} failed: ${error?.message ?? error}`);
+        try {
+          left('failed', `moving it${channelId ? ` to ${channelId}` : ''} failed: ${error?.message ?? error}`);
+        } catch {
+          // The archive refused the note too; the next start tries the chat again.
+        }
+      }
+    }
+    console.log(`[archive] Chats under a username: ${report.moved.length} moved to their ids, ${report.dropped.length} dropped as empty, ${report.left.length} left as they are.`);
+    return report;
+  }
+
+  // A chat under a username Telegram does not know, with no message under it, holds
+  // nothing worth keeping: its job can never run. Drops every row under the key.
+  dropChatKey(key) {
+    return this.db.transaction(() => {
+      const count = (table) => this.db.prepare(`SELECT COUNT(*) AS n FROM "${table}" WHERE channel_id = ?`).get(key).n;
+      const dropped = { key, jobs: count('jobs'), repairs: count('archive_repairs'), rows: 0 };
+      for (const table of this._chatKeyedTables()) {
+        dropped.rows += this.db.prepare(`DELETE FROM "${table}" WHERE channel_id = ?`).run(key).changes;
+      }
+      this.db.prepare('DELETE FROM username_key_checks WHERE chat_key = ?').run(key);
+      return dropped;
+    })();
+  }
+
+  // Moves everything under the username key to the chat's id in one transaction, so a
+  // stop halfway leaves the chat whole under one key or the other. Rows already under
+  // the id stay as they are: a message both have keeps the copy under the id, links
+  // and media included. Work still due under the username carries over.
+  mergeChatKey(key, channelId, peer = null, { peerType = null } = {}) {
+    const target = chatIdForWrite(channelId);
+    return this.db.transaction(() => {
+      const total = this.db.prepare('SELECT COUNT(*) AS n FROM messages WHERE channel_id = ?').get(key).n;
+      const isNewChat = !this._getChannel(target);
+      for (const table of ['message_links', 'message_media']) {
+        this._copyChatRows(table, key, target, 'AND message_id NOT IN (SELECT message_id FROM messages WHERE channel_id = ?)', [target]);
+      }
+      const moved = this._copyChatRows('messages', key, target);
+      for (const table of this._chatKeyedTables()) {
+        if (!MERGED_APART.has(table)) {
+          this._copyChatRows(table, key, target);
+        }
+      }
+      // The row under the username has the type Telegram gave a username, which is wrong.
+      // Without Telegram's answer the messages' own peer gives the type.
+      if (isNewChat && peer) {
+        this._ensureChannelFromPeer(target, peer);
+      } else if (isNewChat && peerType) {
+        this.db.prepare('UPDATE channels SET peer_type = ? WHERE channel_id = ?').run(peerType, target);
+      }
+      // Sync turned off under the username was the user's doing, as the server turns off
+      // only chats under an id, so it stays off under the id too. The id's cursors stay:
+      // backfill from its oldest message walks over the moved ones.
+      this.db.prepare(`
+        UPDATE channels SET sync_enabled = 0, sync_by_user = 1, sync_off_reason = NULL
+        WHERE channel_id = ? AND EXISTS (SELECT 1 FROM channels WHERE channel_id = ? AND sync_enabled = 0)
+      `).run(target, key);
+      this._mergeChatJob(key, target);
+      this._mergeChatRepair(key, target);
+      for (const table of this._chatKeyedTables()) {
+        this.db.prepare(`DELETE FROM "${table}" WHERE channel_id = ?`).run(key);
+      }
+      this.db.prepare('DELETE FROM username_key_checks WHERE chat_key = ?').run(key);
+      return { key, channelId: target, messages: moved, duplicates: total - moved };
+    })();
+  }
+
+  // Tables that key rows by chat, read from the schema so one added later moves too.
+  _chatKeyedTables() {
+    this.chatKeyedTables ??= this.db.prepare(`
+      SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name
+    `).all().map((row) => row.name).filter((name) => this._copyableColumns(name).includes('channel_id'));
+    return this.chatKeyedTables;
+  }
+
+  // Columns a copy of a row takes along: all but a rowid alias, which gets a new value.
+  _copyableColumns(table) {
+    const columns = this.db.prepare(`PRAGMA table_info("${table}")`).all();
+    const keyColumns = columns.filter((column) => column.pk > 0);
+    const rowid = keyColumns.length === 1 && keyColumns[0].type.toUpperCase() === 'INTEGER' ? keyColumns[0].name : null;
+    return columns.map((column) => column.name).filter((name) => name !== rowid);
+  }
+
+  _copyChatRows(table, key, target, filter = '', params = []) {
+    const columns = this._copyableColumns(table).filter((name) => name !== 'channel_id').map((name) => `"${name}"`);
+    const list = ['channel_id', ...columns].join(', ');
+    const values = ['?', ...columns].join(', ');
+    return this.db.prepare(`
+      INSERT OR IGNORE INTO "${table}" (${list})
+      SELECT ${values} FROM "${table}" WHERE channel_id = ? ${filter}
+    `).run(target, key, ...params).changes;
+  }
+
+  // One job per chat. Without one under the id the username's job becomes it; with
+  // one, the fetching the username's job still had ahead of it falls to that job.
+  _mergeChatJob(key, target) {
+    const from = this.db.prepare('SELECT * FROM jobs WHERE channel_id = ?').get(key);
+    if (!from) {
+      return;
+    }
+    const into = this.db.prepare('SELECT * FROM jobs WHERE channel_id = ?').get(target);
+    if (!into) {
+      this.db.prepare('UPDATE jobs SET channel_id = ? WHERE id = ?').run(target, from.id);
+    } else if (UNFINISHED_STATUSES.has(from.status)) {
+      // A depth or date bound left out asks for more, not less.
+      this.db.prepare(`
+        UPDATE jobs SET
+          status = CASE WHEN status = '${JOB_STATUS.IN_PROGRESS}' THEN status ELSE '${JOB_STATUS.PENDING}' END,
+          error = NULL,
+          target_message_count = MAX(COALESCE(target_message_count, 0), COALESCE(?, 0)),
+          backfill_min_date = CASE WHEN backfill_min_date IS NULL OR ? IS NULL THEN NULL ELSE MIN(backfill_min_date, ?) END,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).run(from.target_message_count, from.backfill_min_date, from.backfill_min_date, into.id);
+    }
+    // As addJob does: the request was the user's word on the chat.
+    if (UNFINISHED_STATUSES.has(from.status)) {
+      this.db.prepare(`
+        UPDATE channels SET
+          newer_sync_pending = 1,
+          sync_by_user = 1,
+          sync_enabled = CASE WHEN sync_off_reason = 'left' THEN 1 ELSE sync_enabled END,
+          sync_off_reason = NULL
+        WHERE channel_id = ?
+      `).run(target);
+    }
+  }
+
+  // One repair per chat. The username's one takes over only while it still has work
+  // and the id's has none; the new generation keeps a page in flight from writing to it.
+  _mergeChatRepair(key, target) {
+    const from = this.db.prepare('SELECT * FROM archive_repairs WHERE channel_id = ?').get(key);
+    if (!from) {
+      return;
+    }
+    const into = this.db.prepare('SELECT * FROM archive_repairs WHERE channel_id = ?').get(target);
+    if (into && (!UNFINISHED_STATUSES.has(from.status) || UNFINISHED_STATUSES.has(into.status))) {
+      return;
+    }
+    this.db.prepare('DELETE FROM archive_repairs WHERE channel_id = ?').run(target);
+    this.db.prepare('UPDATE archive_repairs SET channel_id = ?, generation = ? WHERE channel_id = ?')
+      .run(target, Math.max(from.generation, into?.generation ?? 0) + 1, key);
+  }
+
+  // The chats the messages under a key came from, by id with their peer type, and how
+  // many of the messages say at all.
+  _chatsOfMessages(key) {
+    const rows = this.db.prepare(`
+      SELECT type, id, COUNT(*) AS n FROM (
+        SELECT
+          CASE WHEN json_valid(raw_json) THEN json_extract(raw_json, '$.raw.peerId._') END AS type,
+          CASE WHEN json_valid(raw_json) THEN COALESCE(
+            json_extract(raw_json, '$.raw.peerId.userId'),
+            json_extract(raw_json, '$.raw.peerId.chatId'),
+            json_extract(raw_json, '$.raw.peerId.channelId')
+          ) END AS id
+        FROM messages
+        WHERE channel_id = ?
+      )
+      GROUP BY type, id
+    `).all(key);
+    const types = { peerUser: 'user', peerChat: 'chat', peerChannel: 'channel' };
+    const result = { total: 0, withPeer: 0, chats: new Map() };
+    for (const row of rows) {
+      result.total += row.n;
+      if (types[row.type] && Number.isFinite(Number(row.id))) {
+        result.withPeer += row.n;
+        result.chats.set(String(getMarkedPeerId(Number(row.id), types[row.type])), types[row.type]);
+      }
+    }
+    return result;
+  }
+
+  // Work under the username can only wait for the chat's id, and waiting would keep
+  // the server from exiting or making way for a newer version.
+  _parkUsernameKey(key, outcome, detail, now) {
+    this.db.transaction(() => {
+      this.db.prepare(`
+        INSERT INTO username_key_checks (chat_key, outcome, detail, checked_at) VALUES (?, ?, ?, ?)
+        ON CONFLICT(chat_key) DO UPDATE SET
+          outcome = excluded.outcome, detail = excluded.detail, checked_at = excluded.checked_at
+      `).run(key, outcome, detail, now);
+      for (const table of ['jobs', 'archive_repairs']) {
+        this.db.prepare(`
+          UPDATE ${table} SET status = ?, error = ?, updated_at = CURRENT_TIMESTAMP
+          WHERE channel_id = ? AND status IN (?, ?)
+        `).run(JOB_STATUS.ERROR, `Stored under the username ${key}: ${detail}.`, key, JOB_STATUS.PENDING, JOB_STATUS.IN_PROGRESS);
+      }
+    })();
   }
 
   startRealtimeSync() {
@@ -2592,26 +3044,44 @@ export default class MessageSyncService {
     this.processing = true;
     try {
       while (true) {
+        // The migration merges jobs and repairs into the ones under the id, which
+        // must not be under way meanwhile. It waits for the step in flight.
+        await this._waitForUsernameKeyMigration();
         if (this.stopRequested) {
           break;
         }
         const job = this._getNextJob();
         const gapChannelId = job ? null : this._getNextGapChannelId();
         const repair = job || gapChannelId ? null : this._getNextRepair();
+        let step;
         if (job) {
-          await this._processJob(job);
+          step = this._processJob(job);
         } else if (gapChannelId) {
-          await this._fillChannelGap(gapChannelId);
+          step = this._fillChannelGap(gapChannelId);
         } else if (repair) {
-          await this._repairNextPage(repair);
+          step = this._repairNextPage(repair);
         } else {
           this._scheduleNextGapRetry();
           break;
+        }
+        this.queueStep = step;
+        try {
+          await step;
+        } finally {
+          this.queueStep = null;
         }
         await delay(repair ? this.repairPageDelayMs : this.interJobDelayMs);
       }
     } finally {
       this.processing = false;
+    }
+  }
+
+  // Waits out a migration under way, but not a stop: a lookup stuck on a dead
+  // connection must not hold up shutdown.
+  async _waitForUsernameKeyMigration() {
+    while (this.usernameKeyMigration && !this.stopRequested) {
+      await Promise.race([this.usernameKeyMigration.catch(() => {}), delay(1000)]);
     }
   }
 
@@ -2702,10 +3172,11 @@ export default class MessageSyncService {
     }
   }
 
+  // Work under a username waits for migrateUsernameKeys to move it to the chat's id.
   _getNextJob() {
     return this.db.prepare(`
       SELECT * FROM jobs
-      WHERE status IN ('${JOB_STATUS.PENDING}', '${JOB_STATUS.IN_PROGRESS}')
+      WHERE status IN ('${JOB_STATUS.PENDING}', '${JOB_STATUS.IN_PROGRESS}') AND ${chatIdSql()}
       ORDER BY updated_at ASC
       LIMIT 1
     `).get();
@@ -2717,7 +3188,7 @@ export default class MessageSyncService {
       this.db.prepare(`
         UPDATE ${table}
         SET status = ?, error = NULL, updated_at = CURRENT_TIMESTAMP
-        WHERE status = ?
+        WHERE status = ? AND ${chatIdSql()}
           AND channel_id IN (SELECT channel_id FROM channels WHERE sync_enabled = 1)
       `).run(JOB_STATUS.PENDING, JOB_STATUS.ERROR);
     }
@@ -2731,7 +3202,7 @@ export default class MessageSyncService {
     const channelIds = all
       ? this.db.prepare(`
         SELECT channel_id FROM channels
-        WHERE sync_enabled = 1 AND in_dialogs IS NOT 0
+        WHERE sync_enabled = 1 AND in_dialogs IS NOT 0 AND ${chatIdSql()}
         ORDER BY channel_id
       `).all().map((row) => row.channel_id)
       : chats.map((chat) => this._findRepairableChannelId(chat));
@@ -2812,8 +3283,11 @@ export default class MessageSyncService {
     const key = String(chat ?? '').trim();
     const channel = this.db.prepare(`
       SELECT channel_id, sync_enabled FROM channels
-      WHERE channel_id = ? OR (username IS NOT NULL AND LOWER(username) = LOWER(?))
+      WHERE (channel_id = ? OR (username IS NOT NULL AND LOWER(username) = LOWER(?))) AND ${chatIdSql()}
     `).get(normalizeChannelKey(key), key.replace(/^@/, ''));
+    if (!channel && this._getChannel(normalizeChannelKey(key))) {
+      throw new Error(`Chat ${key} is still stored under its username, not its Telegram id; \`tgcli doctor\` says why.`);
+    }
     if (!channel) {
       throw new Error(`Chat ${key} is not in the archive.`);
     }
@@ -2840,7 +3314,7 @@ export default class MessageSyncService {
   _getNextRepair() {
     return this.db.prepare(`
       SELECT * FROM archive_repairs
-      WHERE status IN (?, ?)
+      WHERE status IN (?, ?) AND ${chatIdSql()}
       ORDER BY status = ? DESC, created_at, channel_id
       LIMIT 1
     `).get(JOB_STATUS.PENDING, JOB_STATUS.IN_PROGRESS, JOB_STATUS.IN_PROGRESS);
@@ -3812,7 +4286,7 @@ export default class MessageSyncService {
     const searchFields = buildSearchFields(message);
     const mediaSummary = extractMediaSummary(message);
     return {
-      channel_id: channelId,
+      channel_id: chatIdForWrite(channelId),
       message_id: message.id,
       topic_id: message.topic_id ?? null,
       date: message.date ?? null,

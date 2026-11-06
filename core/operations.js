@@ -18,6 +18,7 @@ import {
   SendCommandError,
   formatErrorMessage,
 } from './send-utils.js';
+import { isChatId } from './chat-key.js';
 
 // --- shared helpers ---
 
@@ -199,6 +200,30 @@ function buildMessageListPayload(source, messages, requestedLimit) {
   return payload;
 }
 
+// Archive reads by username look under the chat's id, where writes put it. One that
+// Telegram does not know still finds what an older version left under the username.
+async function archiveKey(ctx, chat) {
+  if (isChatId(chat)) {
+    return chat;
+  }
+  try {
+    return await ctx.messageSyncService.resolveChatKey(chat);
+  } catch (error) {
+    if (error?.code === 'CHAT_NOT_FOUND') {
+      return String(chat).trim();
+    }
+    throw error;
+  }
+}
+
+async function archiveKeys(ctx, chats) {
+  const keys = [];
+  for (const chat of chats) {
+    keys.push(await archiveKey(ctx, chat));
+  }
+  return keys;
+}
+
 function normalizeChannelIds(value) {
   if (Array.isArray(value)) {
     return value.filter((id) => id !== null && id !== undefined && String(id).trim() !== '');
@@ -237,7 +262,7 @@ async function listChannels(ctx, args = {}) {
 // args: { chat }. Returns the archive channel record, or a live-metadata-derived
 // record when the chat is not tracked in the archive.
 async function channelShow(ctx, args = {}) {
-  let channel = ctx.messageSyncService.getChannel(args.chat);
+  let channel = ctx.messageSyncService.getChannel(await archiveKey(ctx, args.chat));
   if (channel) {
     return channel;
   }
@@ -266,9 +291,10 @@ async function channelShow(ctx, args = {}) {
 // a job fetches what arrived while the chat was off. Returns the new sync state plus
 // job info.
 async function channelSetSync(ctx, args = {}) {
-  const result = ctx.messageSyncService.setChannelSync(args.chat, Boolean(args.enable));
+  const chatId = await ctx.messageSyncService.resolveChatKey(args.chat);
+  const result = ctx.messageSyncService.setChannelSync(chatId, Boolean(args.enable));
   const { job, queued } = args.enable
-    ? ctx.messageSyncService.queueResyncJob(args.chat)
+    ? ctx.messageSyncService.queueResyncJob(chatId)
     : { job: null, queued: false };
   return {
     channelId: result.channel_id,
@@ -322,7 +348,8 @@ async function fetchLiveMessagesForChannel(ctx, id, options = {}) {
 // can hint the user. Returns a list payload plus { usedLiveFallback }.
 async function messagesList(ctx, args = {}) {
   const resolvedSource = resolveSource(args.source);
-  const channelIds = normalizeChannelIds(args.channelIds ?? args.channelId);
+  // One key per chat for archive and live alike, or --source both shows a message twice.
+  const channelIds = await archiveKeys(ctx, normalizeChannelIds(args.channelIds ?? args.channelId));
   const topicId = args.topicId ?? null;
   const limit = args.limit ?? 50;
   const beforeId = args.beforeId ?? null;
@@ -400,7 +427,7 @@ async function messagesList(ctx, args = {}) {
 // { source, returned, messages, usedLiveFallback }.
 async function messagesSearch(ctx, args = {}) {
   const resolvedSource = resolveSource(args.source);
-  const channelIds = normalizeChannelIds(args.channelIds ?? args.channelId);
+  const channelIds = await archiveKeys(ctx, normalizeChannelIds(args.channelIds ?? args.channelId));
   const tagList = normalizeChannelIds(args.tags ?? args.tag);
   const topicId = args.topicId ?? null;
   const limit = args.limit ?? 100;
@@ -532,7 +559,7 @@ async function messagesGet(ctx, args = {}) {
   };
 
   const fetchArchive = async () => {
-    const archived = ctx.messageSyncService.getArchivedMessage({ channelId, messageId });
+    const archived = ctx.messageSyncService.getArchivedMessage({ channelId: await archiveKey(ctx, channelId), messageId });
     return archived ? { ...archived, source: 'archive' } : null;
   };
 
@@ -575,7 +602,7 @@ async function messagesContext(ctx, args = {}) {
 
   const fetchArchive = async () => {
     const archiveContext = ctx.messageSyncService.getArchivedMessageContext({
-      channelId,
+      channelId: await archiveKey(ctx, channelId),
       messageId,
       before: safeBefore,
       after: safeAfter,
@@ -703,8 +730,9 @@ async function topicsList(ctx, args = {}) {
   if (args.query) {
     listOptions.query = args.query;
   }
+  const chatId = await ctx.messageSyncService.resolveChatKey(args.channelId);
   const topics = await ctx.telegramClient.listForumTopics(args.channelId, listOptions);
-  ctx.messageSyncService.upsertTopics(args.channelId, topics);
+  ctx.messageSyncService.upsertTopics(chatId, topics);
   return { total: topics.total ?? topics.length, topics };
 }
 
@@ -712,10 +740,16 @@ async function topicsList(ctx, args = {}) {
 
 // args: { chat, tags, source? }. Returns the channel's tags after the set.
 async function tagsSet(ctx, args = {}) {
-  const finalTags = ctx.messageSyncService.setChannelTags(args.chat, args.tags, {
+  const chatId = await ctx.messageSyncService.resolveChatKey(args.chat);
+  const finalTags = ctx.messageSyncService.setChannelTags(chatId, args.tags, {
     source: args.source,
   });
-  return { channelId: args.chat, tags: finalTags };
+  return { channelId: chatId, tags: finalTags };
+}
+
+// args: { chat, source? }. Returns the channel's tags.
+async function tagsList(ctx, args = {}) {
+  return ctx.messageSyncService.listChannelTags(await archiveKey(ctx, args.chat), { source: args.source });
 }
 
 // args: { channelIds?, limit?, source?, refreshMetadata? }. Auto-tags channels.
@@ -723,7 +757,7 @@ async function tagsAuto(ctx, args = {}) {
   const channelIds = normalizeChannelIds(args.channelIds ?? args.channelId);
   const limit = args.limit ?? 50;
   return ctx.messageSyncService.autoTagChannels({
-    channelIds: channelIds.length ? channelIds : null,
+    channelIds: channelIds.length ? await archiveKeys(ctx, channelIds) : null,
     limit,
     source: args.source,
     refreshMetadata: args.refreshMetadata !== false,
@@ -734,7 +768,7 @@ async function tagsAuto(ctx, args = {}) {
 
 // args: { chat }. Returns cached channel metadata, falling back to a live lookup.
 async function metadataGet(ctx, args = {}) {
-  const metadata = ctx.messageSyncService.getChannelMetadata(args.chat);
+  const metadata = ctx.messageSyncService.getChannelMetadata(await archiveKey(ctx, args.chat));
   if (metadata) {
     return metadata;
   }
@@ -757,7 +791,7 @@ async function metadataRefresh(ctx, args = {}) {
   const channelIds = normalizeChannelIds(args.channelIds ?? args.channelId);
   const limit = args.limit ?? 20;
   return ctx.messageSyncService.refreshChannelMetadata({
-    channelIds: channelIds.length ? channelIds : null,
+    channelIds: channelIds.length ? await archiveKeys(ctx, channelIds) : null,
     limit,
     force: Boolean(args.force),
     onlyMissing: Boolean(args.onlyMissing),
@@ -881,7 +915,6 @@ async function foldersCreate(ctx, args = {}) {
 const PASSTHROUGHS = {
   channelMarkRead: ['telegramClient', 'markChannelRead', (a) => [a.chat, a.messageId]],
   mediaDownload: ['telegramClient', 'downloadMessageMedia', (a) => [a.channelId, a.messageId, { outputPath: a.outputPath }]],
-  tagsList: ['messageSyncService', 'listChannelTags', (a) => [a.chat, { source: a.source }]],
   tagsSearch: ['messageSyncService', 'listTaggedChannels', (a) => [a.tag, { source: a.source, limit: a.limit ?? 100 }]],
   groupsList: ['telegramClient', 'listGroups', (a) => [{ query: a.query, limit: a.limit ?? 100 }]],
   groupsInfo: ['telegramClient', 'getGroupInfo', (a) => [a.chat]],
@@ -918,6 +951,7 @@ export const OPERATIONS = {
   sendFile,
   topicsList,
   tagsSet,
+  tagsList,
   tagsAuto,
   metadataGet,
   metadataRefresh,
@@ -941,6 +975,7 @@ export const OPERATIONS = {
 // live/merged message sets with the same formatting the ops produce rather than
 // re-deriving it.
 export {
+  archiveKey,
   buildSendSuccessPayload,
   formatLiveMessage,
   mergeMessageSets,

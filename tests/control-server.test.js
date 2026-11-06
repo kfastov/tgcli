@@ -15,8 +15,22 @@ import { OPERATIONS } from '../core/operations.js';
 
 const TOKEN = 'test-token-abc123';
 
+// '@chan' is the one username Telegram knows here.
+async function resolveChatKey(chat) {
+  if (/^-?\d+$/.test(String(chat))) {
+    return String(chat);
+  }
+  if (chat === '@chan') {
+    return '9001';
+  }
+  const error = new Error(`Telegram has no chat ${chat}.`);
+  error.code = 'CHAT_NOT_FOUND';
+  throw error;
+}
+
 function makeService(overrides = {}) {
   return {
+    resolveChatKey: vi.fn(resolveChatKey),
     getJobCounts: vi.fn(() => ({ pending: 1, inProgress: 2 })),
     addJob: vi.fn((chatId, opts) => ({
       id: 42,
@@ -161,6 +175,59 @@ describe('control API request handler', () => {
     });
     expect(service.processQueue).toHaveBeenCalledTimes(1);
     expect(json).toEqual({ jobId: 42, channelId: '777', status: 'pending' });
+  });
+
+  it('POST /control/backfill queues a chat given by username under its Telegram id', async () => {
+    const { status, json } = await request(port, 'POST', '/control/backfill', {
+      token: TOKEN,
+      body: { chatId: '@chan', depth: 50 },
+    });
+    expect(status).toBe(200);
+    expect(service.addJob).toHaveBeenCalledWith('9001', { depth: 50, minDate: undefined });
+    expect(json).toEqual({ jobId: 42, channelId: '9001', status: 'pending' });
+  });
+
+  it('POST /control/backfill answers 400 for a username Telegram does not know, and queues nothing', async () => {
+    const { status, json } = await request(port, 'POST', '/control/backfill', {
+      token: TOKEN,
+      body: { chatId: '@nobody' },
+    });
+    expect(status).toBe(400);
+    expect(json).toEqual({ error: 'Telegram has no chat @nobody.' });
+    expect(service.addJob).not.toHaveBeenCalled();
+    expect(service.processQueue).not.toHaveBeenCalled();
+  });
+
+  it('POST /control/cancel and /control/retry find a chat given by username under its id', async () => {
+    await request(port, 'POST', '/control/cancel', { token: TOKEN, body: { chatId: '@chan' } });
+    expect(service.cancelJobs).toHaveBeenCalledWith({ channelId: '9001', jobId: undefined });
+    await request(port, 'POST', '/control/retry', { token: TOKEN, body: { channelId: '@chan' } });
+    expect(service.retryJobs).toHaveBeenCalledWith({ jobId: undefined, channelId: '9001', allErrors: false });
+  });
+
+  // What is left under a username Telegram no longer has can still be canceled.
+  it('POST /control/cancel falls back to the username itself when Telegram does not know it', async () => {
+    const { status } = await request(port, 'POST', '/control/cancel', { token: TOKEN, body: { chatId: '@nobody' } });
+    expect(status).toBe(200);
+    expect(service.cancelJobs).toHaveBeenCalledWith({ channelId: '@nobody', jobId: undefined });
+  });
+
+  it('POST /control/repair looks a chat given by username up under its id', async () => {
+    const { status } = await request(port, 'POST', '/control/repair', {
+      token: TOKEN,
+      body: { chats: ['@chan', '@nobody'] },
+    });
+    expect(status).toBe(200);
+    expect(service.addRepairs).toHaveBeenCalledWith(expect.objectContaining({ chats: ['9001', '@nobody'] }));
+  });
+
+  it('POST /control/cancel looks the username up as it is when Telegram does not answer', async () => {
+    service.resolveChatKey.mockRejectedValueOnce(new Error('Connection closed'));
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { status } = await request(port, 'POST', '/control/cancel', { token: TOKEN, body: { chatId: '@chan' } });
+    logged.mockRestore();
+    expect(status).toBe(200);
+    expect(service.cancelJobs).toHaveBeenCalledWith({ channelId: '@chan', jobId: undefined });
   });
 
   it('POST /control/backfill requires chatId', async () => {
@@ -343,7 +410,8 @@ describe('POST /control/invoke', () => {
         getGroupInviteLink: vi.fn(() => Promise.resolve({ link: 'https://t.me/+warm' })),
       },
       messageSyncService: {
-        setChannelSync: vi.fn(() => ({ channel_id: '@g', sync_enabled: 1 })),
+        resolveChatKey: vi.fn(async () => '1001'),
+        setChannelSync: vi.fn(() => ({ channel_id: '1001', sync_enabled: 1 })),
         queueResyncJob: vi.fn(() => ({ job: { id: 5, status: 'pending' }, queued: true })),
       },
     };
@@ -384,9 +452,10 @@ describe('POST /control/invoke', () => {
       body: { op: 'channelSetSync', args: { chat: '@g', enable: true } },
     });
     expect(status).toBe(200);
-    expect(warmServices.messageSyncService.setChannelSync).toHaveBeenCalledWith('@g', true);
-    expect(warmServices.messageSyncService.queueResyncJob).toHaveBeenCalledWith('@g');
-    expect(json.result).toMatchObject({ channelId: '@g', syncEnabled: true, jobId: 5, jobQueued: true });
+    expect(warmServices.messageSyncService.resolveChatKey).toHaveBeenCalledWith('@g');
+    expect(warmServices.messageSyncService.setChannelSync).toHaveBeenCalledWith('1001', true);
+    expect(warmServices.messageSyncService.queueResyncJob).toHaveBeenCalledWith('1001');
+    expect(json.result).toMatchObject({ channelId: '1001', syncEnabled: true, jobId: 5, jobQueued: true });
     expect(ensureLogin).toHaveBeenCalledTimes(1);
   });
 

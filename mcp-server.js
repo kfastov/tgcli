@@ -24,7 +24,8 @@ import { readVersion } from "./core/version.js";
 import { captureServerOutput } from "./core/server-log.js";
 import { readJsonBody } from "./core/http-util.js";
 import { parseDuration } from "./core/duration.js";
-import { OPERATIONS } from "./core/operations.js";
+import { OPERATIONS, archiveKey } from "./core/operations.js";
+import { isChatId } from "./core/chat-key.js";
 
 const SERVICE_STATE_FILE = "service-state.json";
 
@@ -617,6 +618,13 @@ function createServerInstance() {
   // The shared operation handlers run against the same warm services the control
   // API uses, so an MCP tool and the matching CLI command execute identical logic.
   const warmServices = { telegramClient, messageSyncService };
+  // A username needs Telegram to find the id the archive keeps the chat under.
+  const archiveKeyFor = async (chat) => {
+    if (!isChatId(chat)) {
+      await ensureTelegramConnected();
+    }
+    return archiveKey(warmServices, chat);
+  };
 
   server.tool(
     "listChannels",
@@ -679,6 +687,9 @@ function createServerInstance() {
     "Assign tags to a channel for later cross-channel search.",
     setChannelTagsSchema,
     async ({ channelId, tags, source }) => {
+      if (!isChatId(channelId)) {
+        await ensureTelegramConnected();
+      }
       const result = await OPERATIONS.tagsSet(warmServices, { chat: channelId, tags, source });
 
       return {
@@ -697,6 +708,9 @@ function createServerInstance() {
     "List tags attached to a channel.",
     listChannelTagsSchema,
     async ({ channelId, source }) => {
+      if (!isChatId(channelId)) {
+        await ensureTelegramConnected();
+      }
       const tags = await OPERATIONS.tagsList(warmServices, { chat: channelId, source });
 
       return {
@@ -757,7 +771,7 @@ function createServerInstance() {
     "Returns cached metadata for a channel.",
     getChannelMetadataSchema,
     async ({ channelId }) => {
-      const metadata = messageSyncService.getChannelMetadata(channelId);
+      const metadata = messageSyncService.getChannelMetadata(await archiveKeyFor(channelId));
 
       return {
         content: [
@@ -1413,7 +1427,8 @@ function createServerInstance() {
     scheduleMessageSyncSchema,
     async ({ channelId, depth, minDate }) => {
       await ensureTelegramConnected();
-      const job = messageSyncService.addJob(channelId, { depth, minDate });
+      const chatId = await messageSyncService.resolveChatKey(channelId);
+      const job = messageSyncService.addJob(chatId, { depth, minDate });
       void messageSyncService.processQueue();
 
       return {
@@ -1439,7 +1454,7 @@ function createServerInstance() {
         .describe("Numeric channel ID or username"),
     },
     async ({ channelId }) => {
-      const stats = messageSyncService.getMessageStats(channelId);
+      const stats = messageSyncService.getMessageStats(await archiveKeyFor(channelId));
 
       return {
         content: [

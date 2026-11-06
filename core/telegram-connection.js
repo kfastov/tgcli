@@ -8,6 +8,12 @@ export function createTelegramConnector({ telegramClient, messageSyncService }) 
   let telegramConnectPromise = null;
 
   async function seedArchiveInBackground() {
+    // Before the queue resumes, so no job runs under a username the migration moves.
+    try {
+      await messageSyncService.migrateUsernameKeys();
+    } catch (error) {
+      console.error(`[startup] Moving chats stored under a username failed: ${error?.message ?? error}`);
+    }
     try {
       const dialogCount = await messageSyncService.reconcileWithDialogs();
       if (dialogCount === null) {
