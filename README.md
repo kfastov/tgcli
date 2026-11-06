@@ -43,7 +43,7 @@ tgcli server
 tgcli auth           Authentication and session setup
 tgcli config         View and edit config
 tgcli sync           Archive backfill and realtime sync
-tgcli server         Run background sync service (MCP optional)
+tgcli server         Run background sync service (MCP optional); stop, restart, logs
 tgcli service        Install/start/stop/status/logs for background service
 tgcli channels       List/search channels
 tgcli messages       List/search messages
@@ -57,7 +57,7 @@ tgcli groups         Group management
 tgcli doctor         Diagnostics and sanity checks
 ```
 
-Commands run through `tgcli server`, which the CLI starts on demand. After an upgrade, the CLI replaces a server it started itself as soon as its backfill queue is empty. A server you started yourself with `tgcli server` or `tgcli service` keeps running the old code until you restart it; the CLI warns about this on stderr.
+Commands run through `tgcli server`, which the CLI starts on demand. After an upgrade, the next command of any kind replaces a server the CLI started itself, as soon as its backfill queue is empty. A server you started yourself with `tgcli server` or `tgcli service` keeps running the old code until you restart it; the CLI warns about this on stderr. `tgcli server restart` restarts the server on the CLI's version, `tgcli server stop` stops it, and `tgcli server logs --follow` shows its log.
 
 Use `tgcli [command] --help` for details. Add `--json` for machine-readable output.
 
@@ -86,3 +86,7 @@ The tgcli store lives in the OS app-data directory and contains `config.json`, s
 Override the location with `TGCLI_STORE`.
 
 Legacy version: see `MIGRATION.md`.
+
+## Development
+
+Run it from a clone with Node 22: `npm ci`, then `node cli.js`. See `docs/development.md` for tests and for trying a change on your own account.
