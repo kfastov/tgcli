@@ -1,10 +1,15 @@
+import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   createControlRequestHandler,
   CONTROL_CLIENT_VERSION_HEADER,
   CONTROL_TOKEN_HEADER,
+  removeControlFile,
+  writeControlFile,
 } from '../core/control-server.js';
 import { OPERATIONS } from '../core/operations.js';
 
@@ -421,5 +426,61 @@ describe('control API shutdown and client versions', () => {
     expect((await ping('2.2.6-dev+abc1234')).ownClientIdleMs).toBe(0);
     clock += 700;
     expect((await ping('2.2.5')).ownClientIdleMs).toBe(700);
+  });
+});
+
+describe('control API requests in flight', () => {
+  it('counts the requests it is still answering in the ping, and reports where it runs from', async () => {
+    let finish;
+    const warmServices = {
+      telegramClient: { listDialogs: vi.fn(() => new Promise((resolve) => { finish = () => resolve([]); })) },
+    };
+    const handler = createControlRequestHandler({
+      service: makeService(),
+      warmServices,
+      token: TOKEN,
+      pid: 1,
+      version: '1.0.0',
+      startedAt: 's',
+      root: '/opt/tgcli',
+    });
+    const { server, port } = await startServer(handler);
+    try {
+      const slow = request(port, 'POST', '/control/invoke', { token: TOKEN, body: { op: 'listChannels', args: {} } });
+      await vi.waitFor(() => expect(handler.inFlight()).toBe(1));
+      const { json } = await request(port, 'GET', '/control/ping', { token: TOKEN });
+      expect(json).toMatchObject({ inFlight: 1, root: '/opt/tgcli' });
+      finish();
+      await slow;
+      expect(handler.inFlight()).toBe(0);
+      expect((await request(port, 'GET', '/control/ping', { token: TOKEN })).json.inFlight).toBe(0);
+    } finally {
+      server.close();
+    }
+  });
+});
+
+describe('removeControlFile', () => {
+  let storeDir;
+
+  beforeEach(() => {
+    storeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tgcli-control-file-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(storeDir, { recursive: true, force: true });
+  });
+
+  it("leaves the file of the server that replaced this one", () => {
+    writeControlFile(storeDir, { pid: 2, token: 'new' });
+    removeControlFile(storeDir, { pid: 1, token: 'old' });
+    expect(JSON.parse(fs.readFileSync(path.join(storeDir, 'control.json'), 'utf8'))).toMatchObject({ pid: 2 });
+  });
+
+  it('removes its own file, and copes with none', () => {
+    writeControlFile(storeDir, { pid: 1, token: 'old' });
+    removeControlFile(storeDir, { pid: 1, token: 'old' });
+    expect(fs.existsSync(path.join(storeDir, 'control.json'))).toBe(false);
+    expect(() => removeControlFile(storeDir, { pid: 1, token: 'old' })).not.toThrow();
   });
 });

@@ -18,12 +18,15 @@ const CONTROL_SERVER_MODULE = fileURLToPath(new URL('../core/control-server.js',
 // Modes: 'current' answers /control/shutdown; 'legacy' predates it and only
 // stops on SIGTERM, like 2.2.5; 'stubborn' ignores both.
 const FAKE_SERVER = `
+import fs from 'node:fs';
 import http from 'node:http';
+import path from 'node:path';
 import { createControlRequestHandler, removeControlFile, writeControlFile } from ${JSON.stringify(CONTROL_SERVER_MODULE)};
 
 const [storeDir, mode, version, idleMs = '0'] = process.argv.slice(2);
 let server;
-const stop = () => {
+const stop = (how) => {
+  fs.writeFileSync(path.join(storeDir, 'stopped-by'), how);
   server.close();
   removeControlFile(storeDir);
   setTimeout(() => process.exit(0), 100);
@@ -35,7 +38,7 @@ const handler = createControlRequestHandler({
   pid: process.pid,
   version,
   startedAt: new Date().toISOString(),
-  onShutdown: mode === 'current' ? stop : mode === 'stubborn' ? () => {} : undefined,
+  onShutdown: mode === 'current' ? () => stop('control') : mode === 'stubborn' ? () => {} : undefined,
   // Pretends no CLI of its own version has called for idleMs.
   now: () => {
     const now = firstClockRead ? Date.now() - Number(idleMs) : Date.now();
@@ -43,7 +46,7 @@ const handler = createControlRequestHandler({
     return now;
   },
 });
-process.on('SIGTERM', mode === 'stubborn' ? () => {} : stop);
+process.on('SIGTERM', mode === 'stubborn' ? () => {} : () => stop('signal'));
 server = http.createServer((req, res) => void handler(req, res));
 server.listen(0, '127.0.0.1', () => {
   writeControlFile(storeDir, {
@@ -104,6 +107,7 @@ describe('stopServer', () => {
     const onStopping = vi.fn();
     const result = await stopServer(storeDir, { onStopping });
     expect(result).toMatchObject({ running: true, stopped: true, method: 'control', pid, version: '2.2.6', autoStarted: true });
+    expect(fs.readFileSync(path.join(storeDir, 'stopped-by'), 'utf8')).toBe('control');
     expect(onStopping).toHaveBeenCalledWith(expect.objectContaining({ pid, version: '2.2.6' }));
     expect(isPidAlive(pid)).toBe(false);
     expect(fs.existsSync(path.join(storeDir, 'control.json'))).toBe(false);
@@ -113,6 +117,7 @@ describe('stopServer', () => {
     const pid = await startFakeServer({ mode: 'legacy', version: '2.2.5' });
     const result = await stopServer(storeDir);
     expect(result).toMatchObject({ stopped: true, method: 'signal', pid });
+    expect(fs.readFileSync(path.join(storeDir, 'stopped-by'), 'utf8')).toBe('signal');
     expect(isPidAlive(pid)).toBe(false);
   });
 
@@ -135,6 +140,7 @@ describe('a CLI meeting a server on another version', () => {
     const error = await invoke(storeDir, { op: 'listChannels', args: {} }).catch((e) => e);
     expect(error).toBeInstanceOf(ServerUnavailableError);
     expect(isPidAlive(pid)).toBe(false);
+    expect(fs.readFileSync(path.join(storeDir, 'stopped-by'), 'utf8')).toBe('control');
     expect(console.error).toHaveBeenCalledWith(expect.stringContaining('Restarting tgcli server (0.0.1 -> '));
   });
 

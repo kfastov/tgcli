@@ -43,7 +43,7 @@ import {
   stopServer,
   syncServerVersion,
 } from './core/control-client.js';
-import { appendServerLog, followServerLog, readServerLogTail } from './core/server-log.js';
+import { appendServerLog, followServerLog, openServerLog, readServerLogTail } from './core/server-log.js';
 
 const CLI_PATH = fileURLToPath(import.meta.url);
 const SERVICE_STATE_FILE = 'service-state.json';
@@ -709,14 +709,27 @@ function managesServerItself(command) {
 }
 
 // Before any command runs, a server on another version is replaced by this one
-// (see syncServerVersion). A failed check never blocks the command itself.
+// (see syncServerVersion). A failed check never blocks the command itself, and
+// --timeout bounds it like the command.
 async function keepServerOnThisVersion(actionCommand) {
   if (managesServerItself(actionCommand)) {
     return;
   }
-  const quiet = Boolean(actionCommand.optsWithGlobals().quiet);
+  let globalFlags;
   try {
-    await syncServerVersion(resolveStoreDir(), { quiet });
+    globalFlags = getGlobalFlags(actionCommand);
+  } catch {
+    // The command reports its own bad flags.
+    return;
+  }
+  const { quiet } = globalFlags;
+  try {
+    await runWithTimeout(
+      () => syncServerVersion(resolveStoreDir(), { quiet }),
+      globalFlags.timeoutMs,
+      undefined,
+      `timed out after ${globalFlags.timeout}`,
+    );
   } catch (error) {
     if (!quiet) {
       process.stderr.write(`Warning: could not bring tgcli server to this version: ${error?.message ?? error}\n`);
@@ -1988,25 +2001,40 @@ async function runServer(globalFlags, options = {}) {
       childArgs.push('--auto-started');
     }
 
+    // This process writes the server's log, so the log also has what the server
+    // prints before it could log anything itself (a module that fails to load)
+    // and how it ended (a signal). The output still goes where it went before:
+    // the terminal, a service manager's log, or nowhere for an auto-started one.
+    const log = openServerLog(storeDir);
     child = spawn(process.execPath, childArgs, {
-      stdio: 'inherit',
-      env: process.env,
+      stdio: ['inherit', 'pipe', 'pipe'],
+      env: { ...process.env, TGCLI_SERVER_LOG: 'wrapper' },
     });
+    for (const [source, from, to] of [['stdout', child.stdout, process.stdout], ['stderr', child.stderr, process.stderr]]) {
+      to.on('error', () => {});
+      from.on('data', (chunk) => {
+        log.write(chunk, source);
+        to.write(chunk);
+      });
+    }
 
     child.on('error', (error) => {
       cleanup();
+      log.close();
       reject(error);
     });
 
-    child.on('exit', (code, signal) => {
+    // 'close' comes after the child's output has all been read.
+    child.on('close', (code, signal) => {
       cleanup();
       if (code === 0 || signal === 'SIGINT' || signal === 'SIGTERM') {
+        log.close();
         resolve();
         return;
       }
       const message = `Server exited with code ${code ?? 'null'}${signal ? ` (${signal})` : ''}`;
-      // A server that dies of a signal writes nothing itself.
-      appendServerLog(storeDir, `[server] ${message}`);
+      log.write(`[server] ${message}\n`, 'server');
+      log.close();
       reject(new Error(message));
     });
   });
@@ -2088,6 +2116,9 @@ async function runServerRestart(globalFlags, options = {}) {
     });
     if (previous.running && !previous.stopped) {
       throw notStoppedError(previous, force);
+    }
+    if (!current) {
+      throw new Error(`Stopped ${serverLabel(previous)}, but ${previous.manager} has not started it again; \`tgcli service start\` does.`);
     }
     const currentPayload = { pid: current.pid, version: current.version ?? null, startedAt: current.startedAt ?? null };
     if (globalFlags.json) {

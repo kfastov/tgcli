@@ -29,9 +29,25 @@ export function writeControlFile(storeDir, descriptor) {
   return descriptor;
 }
 
-export function removeControlFile(storeDir) {
+// With owner ({ pid, token }), removes the file only while it still describes
+// that server: one that took long to shut down must not delete the control.json
+// of the server that started in its place.
+export function removeControlFile(storeDir, owner = null) {
   const filePath = path.join(storeDir, CONTROL_FILE);
   try {
+    if (owner) {
+      let current = null;
+      try {
+        current = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      } catch (error) {
+        if (error?.code === 'ENOENT') {
+          return;
+        }
+      }
+      if (current && (current.pid !== owner.pid || current.token !== owner.token)) {
+        return;
+      }
+    }
     fs.unlinkSync(filePath);
   } catch (error) {
     if (error?.code !== 'ENOENT') {
@@ -80,6 +96,10 @@ export function isIdle({ jobCounts, watchedCount, lastActivityAt, now, idleExitM
  * @param {Function} [deps.onShutdown] Runs the server's graceful shutdown; called
  *                                     once the /control/shutdown reply is sent.
  * @param {Function} [deps.now]        Clock in ms, for tests.
+ * @param {string} [deps.root]         Directory the server's code runs from.
+ *
+ * The handler's inFlight() counts the requests it is still answering, other
+ * than pings and shutdowns, so a shutdown can let them finish.
  */
 export function createControlRequestHandler({
   service,
@@ -92,11 +112,13 @@ export function createControlRequestHandler({
   ensureLogin,
   onShutdown,
   now = Date.now,
+  root = null,
 }) {
   // The CLI that started this server ran its version, so the clock starts now.
   let ownClientAt = now();
+  let inFlight = 0;
 
-  return async function handleControlRequest(req, res) {
+  async function handleControlRequest(req, res) {
     let url;
     try {
       url = new URL(req.url ?? '', 'http://127.0.0.1');
@@ -123,8 +145,8 @@ export function createControlRequestHandler({
       ownClientAt = now();
     }
 
-    try {
-      if (req.method === 'GET' && url.pathname === '/control/ping') {
+    if (req.method === 'GET' && url.pathname === '/control/ping') {
+      try {
         sendJson(res, 200, {
           ok: true,
           pid,
@@ -132,10 +154,30 @@ export function createControlRequestHandler({
           startedAt,
           jobs: service.getJobCounts(),
           ownClientIdleMs: Math.max(0, now() - ownClientAt),
+          inFlight,
+          root,
         });
-        return;
+      } catch (error) {
+        sendJson(res, 500, { error: error?.message ?? 'Internal error' });
       }
+      return;
+    }
 
+    const counted = url.pathname !== '/control/shutdown';
+    if (counted) {
+      inFlight += 1;
+    }
+    try {
+      await routeRequest(req, res, url);
+    } finally {
+      if (counted) {
+        inFlight -= 1;
+      }
+    }
+  }
+
+  async function routeRequest(req, res, url) {
+    try {
       if (req.method === 'POST' && url.pathname === '/control/shutdown') {
         if (typeof onShutdown !== 'function') {
           sendJson(res, 501, { error: 'Shutdown is not available on this server' });
@@ -281,5 +323,8 @@ export function createControlRequestHandler({
         sendJson(res, 500, { error: error?.message ?? 'Internal error' });
       }
     }
-  };
+  }
+
+  handleControlRequest.inFlight = () => inFlight;
+  return handleControlRequest;
 }
