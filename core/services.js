@@ -56,6 +56,7 @@ export function createTelegramClient(options = {}) {
       qrFilePath: options.qrFilePath ?? null,
       json: options.json ?? false,
       disableUpdates: options.disableUpdates ?? false,
+      stats: options.stats ?? null,
     },
   );
 
@@ -74,6 +75,7 @@ export function createMessageSyncService(telegramClient, options = {}) {
     batchSize: options.batchSize ?? DEFAULT_BATCH_SIZE,
     interJobDelayMs: options.interJobDelayMs ?? DEFAULT_INTER_JOB_DELAY_MS,
     interBatchDelayMs: options.interBatchDelayMs ?? DEFAULT_INTER_BATCH_DELAY_MS,
+    stats: options.stats ?? null,
   });
 
   return {

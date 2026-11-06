@@ -70,6 +70,7 @@ tgcli backfill repair --all                    # fill holes older versions left 
 tgcli channels watch --chat @channel           # subscribe a chat for archiving (queues a backfill)
 tgcli channels unwatch --chat @channel         # stop archiving a chat
 tgcli backfill --follow                         # track the server's queue to completion (`sync` is a silent alias)
+tgcli server stats                             # what the running server asked Telegram (by method), errors and archive work, since start and last hour
 tgcli service install
 tgcli service start
 ```

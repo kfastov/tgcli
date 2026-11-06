@@ -19,6 +19,7 @@ import {
   removeControlFile,
   isIdle,
 } from "./core/control-server.js";
+import { ServerStats } from "./core/server-stats.js";
 import { readVersion } from "./core/version.js";
 import { captureServerOutput } from "./core/server-log.js";
 import { readJsonBody } from "./core/http-util.js";
@@ -71,7 +72,8 @@ const IDLE_CHECK_INTERVAL_MS = 5000;
 const CONTROL_DRAIN_MS = 10000;
 console.log(`[startup] tgcli server ${readVersion()} (pid ${process.pid}, ${AUTO_STARTED ? "auto-started" : "started by hand"}${IDLE_EXIT_MS > 0 ? `, idle exit after ${IDLE_EXIT_MS}ms` : ""})`);
 
-const { telegramClient, messageSyncService } = createServices({ storeDir, config });
+const stats = new ServerStats();
+const { telegramClient, messageSyncService } = createServices({ storeDir, config, stats });
 
 const ensureTelegramConnected = createTelegramConnector({ telegramClient, messageSyncService });
 
@@ -1765,6 +1767,7 @@ if (controlEnabled) {
       void shutdown("stop requested over the control API").finally(() => process.exit(0));
     },
     root: path.dirname(fileURLToPath(import.meta.url)),
+    stats,
   });
   controlHandler = handleControlRequest;
 

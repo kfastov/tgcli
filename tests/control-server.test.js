@@ -66,12 +66,14 @@ async function request(port, method, pathname, { token, body } = {}) {
 describe('control API request handler', () => {
   let service;
   let onActivity;
+  let stats;
   let server;
   let port;
 
   beforeEach(async () => {
     service = makeService();
     onActivity = vi.fn();
+    stats = { snapshot: vi.fn(() => ({ at: 'now', sinceStart: { requests: { total: 3 } }, lastHour: { requests: { total: 1 } } })) };
     const handler = createControlRequestHandler({
       service,
       token: TOKEN,
@@ -80,6 +82,7 @@ describe('control API request handler', () => {
       startedAt: '2026-06-02T00:00:00.000Z',
       onActivity,
       ensureLogin: vi.fn(() => Promise.resolve()),
+      stats,
     });
     ({ server, port } = await startServer(handler));
   });
@@ -99,6 +102,51 @@ describe('control API request handler', () => {
       jobs: { pending: 1, inProgress: 2 },
     });
     expect(onActivity).toHaveBeenCalledTimes(1);
+  });
+
+  it('GET /control/stats returns the counters with who is counting', async () => {
+    const { status, json } = await request(port, 'GET', '/control/stats', { token: TOKEN });
+    expect(status).toBe(200);
+    expect(json).toEqual({
+      pid: 12345,
+      version: '9.9.9',
+      startedAt: '2026-06-02T00:00:00.000Z',
+      at: 'now',
+      sinceStart: { requests: { total: 3 } },
+      lastHour: { requests: { total: 1 } },
+    });
+  });
+
+  it('GET /control/stats requires the token', async () => {
+    const { status } = await request(port, 'GET', '/control/stats', { token: 'wrong' });
+    expect(status).toBe(401);
+    expect(stats.snapshot).not.toHaveBeenCalled();
+  });
+
+  it('GET /control/stats does not keep an idle server up', async () => {
+    await request(port, 'GET', '/control/stats', { token: TOKEN });
+    expect(onActivity).not.toHaveBeenCalled();
+  });
+
+  it('GET /control/stats answers 500 when the counters fail, and the server keeps serving', async () => {
+    stats.snapshot.mockImplementationOnce(() => {
+      throw new Error('broken');
+    });
+    const failed = await request(port, 'GET', '/control/stats', { token: TOKEN });
+    expect(failed).toEqual({ status: 500, json: { error: 'broken' } });
+    const { status } = await request(port, 'GET', '/control/stats', { token: TOKEN });
+    expect(status).toBe(200);
+  });
+
+  it('GET /control/stats is not found on a server that keeps no counters', async () => {
+    const handler = createControlRequestHandler({ service, token: TOKEN, pid: 1, version: '9.9.9', startedAt: 's' });
+    const bare = await startServer(handler);
+    try {
+      const { status } = await request(bare.port, 'GET', '/control/stats', { token: TOKEN });
+      expect(status).toBe(404);
+    } finally {
+      bare.server.close();
+    }
   });
 
   it('POST /control/backfill enqueues via addJob and kicks the queue', async () => {
@@ -436,6 +484,18 @@ describe('control API shutdown and client versions', () => {
     expect((await ping('2.2.6-dev+abc1234')).ownClientIdleMs).toBe(0);
     clock += 700;
     expect((await ping('2.2.5')).ownClientIdleMs).toBe(700);
+  });
+
+  it('counts a stats read by a CLI of its own version as that CLI being around, not as activity', async () => {
+    const onActivity = vi.fn();
+    await start({ onActivity, stats: { snapshot: () => ({}) } });
+    clock += 5000;
+    const res = await fetch(`http://127.0.0.1:${port}/control/stats`, {
+      headers: { [CONTROL_TOKEN_HEADER]: TOKEN, [CONTROL_CLIENT_VERSION_HEADER]: '2.2.6-dev+abc1234' },
+    });
+    expect(res.status).toBe(200);
+    expect(onActivity).not.toHaveBeenCalled();
+    expect((await ping('2.2.5')).ownClientIdleMs).toBe(0);
   });
 });
 

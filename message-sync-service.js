@@ -586,6 +586,8 @@ export default class MessageSyncService {
     this.interJobDelayMs = options.interJobDelayMs || 3000;
     this.interBatchDelayMs = options.interBatchDelayMs || 1000;
     this.repairPageDelayMs = options.repairPageDelayMs ?? REPAIR_PAGE_DELAY_MS;
+    // ServerStats of the running server; see core/server-stats.js.
+    this.stats = options.stats ?? null;
     this.processing = false;
     this.stopRequested = false;
     this.recheckingMessages = false;
@@ -2637,6 +2639,7 @@ export default class MessageSyncService {
       const attempts = (this.gapRetries.get(channelId)?.attempts ?? 0) + 1;
       const retryMs = Math.min(RETRY_BASE_MS * 2 ** (attempts - 1), RETRY_MAX_MS);
       this.gapRetries.set(channelId, { attempts, retryAt: Date.now() + retryMs });
+      this.stats?.count('gaps.failed');
       console.error(`[sync] Channel ${channelId}: failed to fill gap (attempt ${attempts}), retrying in ${retryMs / 1000}s: ${error?.message ?? error}`);
     }
   }
@@ -2856,6 +2859,7 @@ export default class MessageSyncService {
 
     if (this._getChannel(channelId)?.sync_enabled !== 1) {
       fail('Sync is disabled for this chat.');
+      this.stats?.count('repair.failed');
       return;
     }
     const { floor, sinceDate } = this._repairBounds(channelId, repair);
@@ -2883,6 +2887,12 @@ export default class MessageSyncService {
         added,
       );
       const verb = repair.dry_run ? 'would add' : 'added';
+      this.stats?.count('repair.pages');
+      this.stats?.count('repair.checked', inRange.length);
+      this.stats?.count(repair.dry_run ? 'repair.wouldAdd' : 'repair.added', added);
+      if (done) {
+        this.stats?.count('repair.completed');
+      }
       if (added) {
         console.log(`[sync] Channel ${channelId}: repair ${verb} ${added} message(s) at ${cursor}.`);
       }
@@ -2904,10 +2914,12 @@ export default class MessageSyncService {
       if (isChatGone(error)) {
         // Not a member any more, or the chat is gone: asking again every hour changes nothing.
         update('status = ?, error = ?', REPAIR_STATUS.SKIPPED, error?.message ?? String(error));
+        this.stats?.count('repair.skipped');
         console.log(`[sync] Channel ${channelId}: repair skipped, Telegram refuses to read it: ${error?.message ?? error}`);
         return;
       }
       fail(error?.message ?? String(error));
+      this.stats?.count('repair.failed');
       console.error(`[sync] Channel ${channelId}: repair failed below message ${repair.cursor_message_id ?? 'newest'}: ${error?.message ?? error}`);
     }
   }
@@ -3507,6 +3519,7 @@ export default class MessageSyncService {
     }
 
     this._updateJobStatus(job.id, JOB_STATUS.IN_PROGRESS);
+    this.stats?.count('jobs.runs');
     // Claim ownership so shutdown() requeues this job (and only this one) if the
     // process exits before _processJob writes its terminal/pending status.
     this.ownedInProgressJobId = job.id;
@@ -3541,6 +3554,9 @@ export default class MessageSyncService {
         cursorMessageId: backfillResult.cursorMessageId,
         cursorMessageDate: backfillResult.cursorMessageDate,
       });
+      if (finalStatus === JOB_STATUS.IDLE) {
+        this.stats?.count('jobs.completed');
+      }
     } catch (error) {
       if (this.stopRequested) {
         this._updateJobStatus(job.id, JOB_STATUS.PENDING);
@@ -3556,6 +3572,7 @@ export default class MessageSyncService {
         await this._delayUnlessStopped(waitSeconds * 1000);
       } else {
         this._markJobError(job.id, error);
+        this.stats?.count('jobs.failed');
       }
     } finally {
       // _processJob always writes a non-in_progress status above before
@@ -4296,6 +4313,7 @@ export default class MessageSyncService {
     for (const messageId of messageIds) {
       queue.run(channelId, messageId, now);
     }
+    this.stats?.count('rechecks.queued', messageIds.length);
     console.log(`[sync] Channel ${channelId}: will read ${messageIds.join(', ')} again, in case Telegram is hiding them.`);
   }
 
@@ -4389,6 +4407,7 @@ export default class MessageSyncService {
       if (this.stopRequested) {
         return false;
       }
+      this.stats?.count('rechecks.checked');
       const row = this.db.prepare(`
         SELECT queued_at FROM messages_to_recheck WHERE channel_id = ? AND message_id = ?
       `).get(channelId, messageId);
@@ -4397,7 +4416,9 @@ export default class MessageSyncService {
         return true;
       }
       if (message) {
+        this.stats?.count('rechecks.found');
         if (this.archiveHistoryMessages(channelId, [message])) {
+          this.stats?.count('rechecks.restored');
           console.log(`[sync] Channel ${channelId}: message ${messageId} turned out not to be deleted, archived.`);
         }
         forget();
@@ -4407,6 +4428,7 @@ export default class MessageSyncService {
       if (this.stopRequested) {
         return false;
       }
+      this.stats?.count('rechecks.failed');
       if (parseRequiredWaitSeconds(error) !== null) {
         console.error(`[sync] Channel ${channelId}: rate limited checking message ${messageId}, will try again.`);
         return false;
@@ -4415,6 +4437,7 @@ export default class MessageSyncService {
         console.error(`[sync] Channel ${channelId}: could not check message ${messageId}: ${error?.message ?? error}`);
         if (Date.now() - Math.max(queuedAt, this.periodicChecksStartedAt) >= RECHECK_GIVE_UP_MS) {
           console.error(`[sync] Channel ${channelId}: no longer checking message ${messageId}.`);
+          this.stats?.count('rechecks.gaveUp');
           forget();
         }
         return true;
@@ -4426,6 +4449,7 @@ export default class MessageSyncService {
     const nextAttempt = RECHECK_AFTER_MS.findIndex((afterMs) => Date.now() - queuedAt < afterMs);
     if (nextAttempt === -1) {
       console.log(`[sync] Channel ${channelId}: message ${messageId} still not there, no longer checking.`);
+      this.stats?.count('rechecks.gaveUp');
       forget();
     } else {
       this.db.prepare(`
@@ -4502,6 +4526,8 @@ export default class MessageSyncService {
       // The start moves up with each page, so an interrupted fill loses nothing.
       if (fillingGap) {
         this._setChannelGapStart(normalizedId, newest.id);
+        this.stats?.count('gaps.pages');
+        this.stats?.count('gaps.added', addedCount);
         console.log(`[sync] Channel ${normalizedId}: gap filled up to message ${newest.id}, ${addedCount} new.`);
       }
 
@@ -4539,6 +4565,7 @@ export default class MessageSyncService {
       } else {
         this._queueRecheckUpToCursor(normalizedId, lastMessageId);
         this._closeChannelGap(normalizedId);
+        this.stats?.count('gaps.closed');
         console.log(`[sync] Channel ${normalizedId}: gap closed.`);
       }
     }

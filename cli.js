@@ -31,11 +31,13 @@ import {
 } from './core/send-utils.js';
 import { resolveStoreDir } from './core/store.js';
 import { parseDuration } from './core/duration.js';
+import { formatServerStats } from './core/server-stats.js';
 import {
   cancelBackfill,
   enqueueBackfill,
   enqueueRepair,
   ensureServer,
+  fetchServerStats,
   isManagedServer,
   pingServer,
   restartServer,
@@ -237,6 +239,8 @@ function buildProgram() {
     .description('Run background sync service (MCP optional)')
     .option('--idle-exit <duration>', 'Exit after this idle period with no jobs or watched channels')
     .addOption(new Option('--auto-started').hideHelp())
+    // `server stat` must not start a second server.
+    .allowExcessArguments(false)
     .action(withGlobalOptions((globalFlags, options) => runServer(globalFlags, options)));
   server
     .command('stop')
@@ -254,6 +258,10 @@ function buildProgram() {
     .option('-n, --lines <n>', `Number of lines to show (default ${DEFAULT_SERVER_LOG_LINES})`)
     .option('--follow', 'Keep printing lines as the server writes them')
     .action(withGlobalOptions((globalFlags, options) => runServerLogs(globalFlags, options)));
+  server
+    .command('stats')
+    .description('Show what the running server asked Telegram and did, since start and over the last hour')
+    .action(withGlobalOptions((globalFlags) => runServerStats(globalFlags)));
 
   const service = program.command('service').description('Manage background service');
   service
@@ -2010,6 +2018,15 @@ async function runSync(globalFlags, options = {}) {
   }
   // `--once` is a deprecated alias of `backfill wait`: drain quietly and exit.
   return runBackfillWait(globalFlags);
+}
+
+async function runServerStats(globalFlags) {
+  const stats = await fetchServerStats(resolveStoreDir());
+  if (globalFlags.json) {
+    writeJson(stats);
+    return;
+  }
+  console.log(formatServerStats(stats));
 }
 
 async function runServer(globalFlags, options = {}) {

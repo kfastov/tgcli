@@ -69,6 +69,14 @@ describe('core services helpers', () => {
     expect(result.sessionPath).toBe(path.join(storeDir, 'session.json'));
   });
 
+  it('hands the server stats to both the client and the sync service', () => {
+    const stats = { kind: 'stats' };
+    createServices({ storeDir, stats });
+
+    expect(telegramClientCtor.mock.calls[0][4]).toMatchObject({ stats });
+    expect(messageSyncServiceCtor.mock.calls[0][1]).toMatchObject({ stats });
+  });
+
   it('creates a message sync service on demand for an existing telegram client', () => {
     const fakeClient = { kind: 'telegram' };
     const result = createMessageSyncService(fakeClient, {
@@ -83,6 +91,7 @@ describe('core services helpers', () => {
       batchSize: 7,
       interJobDelayMs: 11,
       interBatchDelayMs: 13,
+      stats: null,
     });
     expect(result.dbPath).toBe(path.join(storeDir, 'messages.db'));
   });

@@ -97,6 +97,7 @@ export function isIdle({ jobCounts, watchedCount, lastActivityAt, now, idleExitM
  *                                     once the /control/shutdown reply is sent.
  * @param {Function} [deps.now]        Clock in ms, for tests.
  * @param {string} [deps.root]         Directory the server's code runs from.
+ * @param {object} [deps.stats]       ServerStats the server counts into.
  *
  * The handler's inFlight() counts the requests it is still answering, other
  * than pings and shutdowns, so a shutdown can let them finish.
@@ -113,6 +114,7 @@ export function createControlRequestHandler({
   onShutdown,
   now = Date.now,
   root = null,
+  stats,
 }) {
   // The CLI that started this server ran its version, so the clock starts now.
   let ownClientAt = now();
@@ -138,11 +140,23 @@ export function createControlRequestHandler({
       return;
     }
 
-    if (typeof onActivity === 'function') {
-      onActivity();
-    }
     if (req.headers[CONTROL_CLIENT_VERSION_HEADER] === version) {
       ownClientAt = now();
+    }
+
+    // Reading counters is no reason for an idle server to stay up, so this comes
+    // before the activity hook.
+    if (req.method === 'GET' && url.pathname === '/control/stats' && stats) {
+      try {
+        sendJson(res, 200, { pid, version, startedAt, ...stats.snapshot() });
+      } catch (error) {
+        sendJson(res, 500, { error: error?.message ?? 'Internal error' });
+      }
+      return;
+    }
+
+    if (typeof onActivity === 'function') {
+      onActivity();
     }
 
     if (req.method === 'GET' && url.pathname === '/control/ping') {

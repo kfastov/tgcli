@@ -1,5 +1,5 @@
 import { TelegramClient as MtCuteClient } from '@mtcute/node';
-import { InputMedia, Message, MtPeerNotFoundError, PeersIndex } from '@mtcute/core';
+import { InputMedia, Message, MtPeerNotFoundError, PeersIndex, networkMiddlewares } from '@mtcute/core';
 import { randomLong, toggleChannelIdMark } from '@mtcute/core/utils.js';
 import { html } from '@mtcute/html-parser';
 import { md } from '@mtcute/markdown-parser';
@@ -631,6 +631,9 @@ class TelegramClient {
       storageOptions: { peers: { updatesWriteInterval: 0 } },
       platform: createPlatform(),
     };
+    if (this.options.stats) {
+      clientOptions.network = { middlewares: this.options.stats.networkMiddlewares(networkMiddlewares.basic()) };
+    }
     if (this.options.disableUpdates) {
       clientOptions.disableUpdates = true;
     } else {
