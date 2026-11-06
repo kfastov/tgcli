@@ -29,6 +29,7 @@ import { compareVersions, isDevVersion, readVersion } from './version.js';
 
 // Path to this package's CLI, used to (re)spawn `tgcli server`.
 const CLI_ENTRYPOINT = fileURLToPath(new URL('../cli.js', import.meta.url));
+const PACKAGE_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 const PING_TIMEOUT_MS = 1500;
 const ENQUEUE_TIMEOUT_MS = 30000;
@@ -364,7 +365,9 @@ async function requestShutdown(control, pid) {
 
 // Whether a CLI on cliVersion replaces a server on serverVersion by itself:
 //   'same'       nothing to do;
-//   'take-over'  this CLI is newer, or the server is a dev build nobody uses now;
+//   'take-over'  this CLI is newer, the server is a dev build nobody uses now, or
+//                the server runs from this CLI's own directory (a clone after a
+//                commit, or a package updated in place), whose code is this one;
 //   'dev-in-use' the server is a dev build a CLI of its own version used within
 //                devLeaseMs, so it is being tested and every other version
 //                leaves it alone until it has been unused that long;
@@ -374,9 +377,12 @@ async function requestShutdown(control, pid) {
 // grew from) takes over from the installed one, and the installed CLI takes its
 // server back once the dev build has been left alone. `tgcli server restart`
 // switches to the caller's version in any direction.
-export function versionTakeover({ serverVersion, cliVersion, ownClientIdleMs, devLeaseMs = DEV_LEASE_MS }) {
+export function versionTakeover({ serverVersion, cliVersion, ownClientIdleMs, sameCheckout = false, devLeaseMs = DEV_LEASE_MS }) {
   if (!serverVersion || serverVersion === cliVersion) {
     return 'same';
+  }
+  if (sameCheckout) {
+    return 'take-over';
   }
   if (isDevVersion(serverVersion)) {
     return Number.isFinite(ownClientIdleMs) && ownClientIdleMs < devLeaseMs ? 'dev-in-use' : 'take-over';
@@ -388,9 +394,27 @@ export function versionTakeover({ serverVersion, cliVersion, ownClientIdleMs, de
 // (before it runs, then in invoke) warns once and pings once.
 const keptServers = new Set();
 
+function canonicalPath(dir) {
+  try {
+    return fs.realpathSync.native(dir);
+  } catch {
+    return path.resolve(dir);
+  }
+}
+
+function runsFromHere(ping) {
+  return typeof ping.root === 'string' && canonicalPath(ping.root) === canonicalPath(PACKAGE_ROOT);
+}
+
+// Queued backfill jobs, and requests other CLIs are waiting on, which a shutdown
+// would cut off.
+function isBusy(ping) {
+  return hasQueuedJobs(ping.jobs) || (ping.inFlight ?? 0) > 0;
+}
+
 function keepServerHint({ takeover, ours, busy, serverVersion }) {
   if (takeover === 'take-over' && ours && busy) {
-    return 'It will be replaced once its backfill queue is empty.';
+    return 'It will be replaced once its backfill queue is empty and no request is running.';
   }
   if (takeover === 'dev-in-use') {
     return `${serverVersion} is a dev build in use; it goes back to this version once unused for ${Math.round(DEV_LEASE_MS / 60000)} minutes, or now with \`tgcli server restart\`.`;
@@ -433,12 +457,13 @@ async function reconcileServerVersion(storeDir, { quiet = false } = {}) {
     serverVersion,
     cliVersion: CLI_VERSION,
     ownClientIdleMs: ping.ownClientIdleMs,
+    sameCheckout: runsFromHere(ping),
   });
   if (takeover === 'same') {
     return 'current';
   }
   const ours = isAutoStarted(control, pid);
-  const busy = hasQueuedJobs(ping.jobs);
+  const busy = isBusy(ping);
   if (takeover === 'take-over' && ours && !busy) {
     const method = await requestShutdown(control, pid);
     const stopped = method === null || await waitForExit(pid);
@@ -531,21 +556,20 @@ export function isManagedServer(server) {
 }
 
 // `tgcli server restart`: stops the running server, if any, and starts this CLI's
-// version in its place. A server run by a service manager comes back through it,
-// on the version the service is set up with. Resolves to { previous, current }:
-// previous is stopServer's result, current the new server's ping (null when the
-// old one did not stop).
+// version in its place. A server run by a service manager is left for that manager
+// to start again, on the version the service is set up with; starting one here as
+// well would race it for the control port. Resolves to { previous, current }:
+// previous is stopServer's result, current the new server's ping, null when the old
+// one did not stop or its manager did not bring it back.
 export async function restartServer(storeDir, { timeoutMs, force = false, quiet = false, onStopping } = {}) {
   const previous = await stopServer(storeDir, { timeoutMs, force, onStopping });
   if (previous.running && !previous.stopped) {
     return { previous, current: null };
   }
-  let current = null;
   if (isManagedServer(previous)) {
-    current = await waitForServer(storeDir, (ping) => ping.pid !== previous.pid);
+    return { previous, current: await waitForServer(storeDir, (ping) => ping.pid !== previous.pid) };
   }
-  current ??= await ensureServer(storeDir, { quiet });
-  return { previous, current };
+  return { previous, current: await ensureServer(storeDir, { quiet }) };
 }
 
 // Spawn `tgcli server --idle-exit 60s --auto-started` fully detached so it outlives
@@ -578,9 +602,10 @@ export async function ensureServer(storeDir, { quiet } = {}) {
     return existing;
   }
 
+  // As long as `tgcli server stop` gives it: the queue worker finishes its batch.
   const previousPid = readControlFile(storeDir)?.pid;
   if (previousPid && isServerProcess(previousPid)) {
-    await waitForExit(previousPid);
+    await waitForExit(previousPid, EXPLICIT_STOP_TIMEOUT_MS);
   }
 
   spawnDetachedServer();

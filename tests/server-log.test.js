@@ -82,6 +82,31 @@ describe('openServerLog', () => {
     expect(fs.readdirSync(storeDir).sort()).toEqual(['server.log', 'server.log.1']);
   });
 
+  it('stamps each source at its own line starts', () => {
+    const log = openServerLog(storeDir, { now: () => FIXED_TIME });
+    log.write('out ', 'stdout');
+    log.write('err line\n', 'stderr');
+    log.write('line\n', 'stdout');
+    log.close();
+    expect(readLog()).toBe('2026-11-06T12:00:00.000Z out 2026-11-06T12:00:00.000Z err line\nline\n');
+  });
+
+  it('shares the file with another writer without rotating over its lines', () => {
+    const first = openServerLog(storeDir, { maxBytes: 200, now: () => FIXED_TIME });
+    const second = openServerLog(storeDir, { maxBytes: 200, now: () => FIXED_TIME });
+    for (let index = 0; index < 30; index += 1) {
+      (index % 2 ? second : first).write(`line ${String(index).padStart(2, '0')}\n`);
+    }
+    first.close();
+    second.close();
+    const all = `${readLog('server.log.1')}${readLog()}`;
+    // Only server.log.1 and server.log remain, so the oldest lines may be gone,
+    // but nothing after them is lost or out of order.
+    const numbers = [...all.matchAll(/line (\d\d)/g)].map((match) => Number(match[1]));
+    expect(numbers.at(-1)).toBe(29);
+    expect(numbers).toEqual(numbers.map((_, index) => numbers[0] + index));
+  });
+
   it('keeps the file private to its owner', () => {
     openServerLog(storeDir).close();
     expect(fs.statSync(path.join(storeDir, 'server.log')).mode & 0o777).toBe(0o600);
@@ -98,6 +123,13 @@ describe('appendServerLog', () => {
 describe('readServerLogTail', () => {
   it('says there is no log yet', () => {
     expect(readServerLogTail(storeDir, 10)).toMatchObject({ exists: false, lines: [], position: null });
+  });
+
+  it('leaves out a line still being written', () => {
+    fs.writeFileSync(path.join(storeDir, 'server.log'), 'done\nhalf of a ');
+    const tail = readServerLogTail(storeDir, 10);
+    expect(tail.lines).toEqual(['done']);
+    expect(tail.position.offset).toBe(5);
   });
 
   it('returns the last lines, reaching into the rotated file', () => {
@@ -130,6 +162,27 @@ describe('followServerLog', () => {
     fs.writeFileSync(current, 'three\n');
     await expect.poll(() => seen).toEqual(['one', 'two', 'three']);
 
+    controller.abort();
+    await following;
+  });
+
+  it('prints what was written just before a rotation, and a line split across it', async () => {
+    const { current, rotated } = serverLogPaths(storeDir);
+    fs.writeFileSync(current, 'before\nhalf of a ');
+    const { position, lines } = readServerLogTail(storeDir, 10);
+    expect(lines).toEqual(['before']);
+    const seen = [];
+    const controller = new AbortController();
+    const following = followServerLog(storeDir, (batch) => seen.push(...batch), {
+      signal: controller.signal,
+      from: position,
+      intervalMs: 50,
+    });
+    // All within one poll: more lines, then the rotation, then the new file.
+    fs.appendFileSync(current, 'line\nA\nB\nsplit ');
+    fs.renameSync(current, rotated);
+    fs.writeFileSync(current, 'here\nC\n');
+    await expect.poll(() => seen).toEqual(['half of a line', 'A', 'B', 'split here', 'C']);
     controller.abort();
     await following;
   });

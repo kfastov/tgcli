@@ -12,11 +12,12 @@ connection and open database over the loopback control API, then renders the
 result. The server is the single writer; the auto-started server shuts itself
 down once the queue drains and nothing is watched.
 
-Commands that stay local (no server): `config`, `service`, `doctor`, and `auth`
+Commands that do not run on the server: `config`, `service`, `doctor`, and `auth`
 (interactive login bootstraps the session the server then uses).
 
-Before any command runs, the CLI checks the version of a running server and
-replaces an outdated one it started itself (see `server` below).
+Before any command other than `server` and `service` runs, the CLI checks the
+version of a running server and replaces an outdated one it started itself, also
+for the commands above (see `server` below).
 
 ## Global flags
 - --json
@@ -96,17 +97,21 @@ one-shot client.
 ## server
 - server [--idle-exit DURATION]
   - Start the background sync service (MCP HTTP server runs only when enabled in config).
-  - Every server writes `server.log` in the store, also when it runs in the background;
-    at 5 MB the file moves to `server.log.1` and a new one starts.
+  - Writes everything the server prints to `server.log` in the store, also when it
+    runs in the background and including a failure to start; at 5 MB the file moves
+    to `server.log.1` and a new one starts.
 - server stop [--force]
   - Ask the running server to shut down (over the control API; SIGTERM for an older
-    server) and wait until its process has exited. The job it was backfilling goes back
-    to the queue. `--force` kills a server that has not exited after a minute. Prints
+    server) and wait until its process has exited. Requests other CLIs are waiting on
+    get up to 10 seconds to finish, and the job it was backfilling goes back to the
+    queue. `--force` kills a server that has not exited after a minute. Prints
     `No tgcli server is running.` and exits 0 when there is none.
   - `--json`: `{ running, stopped, server: { pid, version, autoStarted, manager, method } }`.
 - server restart [--force]
   - Stop the running server, if any, and start this CLI's version in its place. A
-    server run by `tgcli service` comes back through its service manager instead.
+    server run by `tgcli service` is left for its service manager to start again;
+    if it has not within 10 seconds, the command fails and says to run
+    `tgcli service start`.
   - `--json`: `{ previous: { pid, version, ... } | null, current: { pid, version, startedAt } }`.
 - server logs [-n N] [--follow]
   - Print the last N lines of the server log (default 100). `--follow` keeps printing
@@ -114,9 +119,11 @@ one-shot client.
   - `--json`: `{ path, exists, lines }`; with `--follow`, one `{ "line": ... }` object
     per line.
 
-Every command checks the running server's version before it runs. A server that an
-older CLI started on its own is replaced by this version right away, unless it has
-backfill jobs queued; a newer server is left alone. A dev build run from a clone
+Every command except `server` and `service` checks the running server's version
+before it runs. A server that an older CLI started on its own is replaced by this
+version right away, unless it has backfill jobs queued or is answering another
+CLI's request; a newer server is left alone, and a server running from the CLI's
+own directory on another version is always replaced. A dev build run from a clone
 (`2.2.6-dev+<commit>`) counts as newer than the release it grew from, and while a CLI
 of that build has used its server in the last 10 minutes no other version replaces
 it. `server restart` switches to the caller's version in any direction. See

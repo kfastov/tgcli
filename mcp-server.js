@@ -2,6 +2,7 @@ import http from "http";
 import fs from "fs";
 import path from "path";
 import { randomUUID } from "crypto";
+import { fileURLToPath } from "url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
@@ -27,8 +28,16 @@ import { OPERATIONS } from "./core/operations.js";
 const SERVICE_STATE_FILE = "service-state.json";
 
 const storeDir = resolveStoreDir();
-// First, so even a startup failure lands in <store>/server.log.
-captureServerOutput(storeDir);
+// `tgcli server` pipes this process's output into <store>/server.log itself, so
+// that even a failure to load this module is logged. Run directly (`npm start`),
+// the server writes the log on its own, from here on.
+if (process.env.TGCLI_SERVER_LOG === "wrapper") {
+  // If the wrapper dies, its pipes close; losing output must not kill the server.
+  process.stdout.on("error", () => {});
+  process.stderr.on("error", () => {});
+} else {
+  captureServerOutput(storeDir);
+}
 const { config, path: configPath } = loadConfig(storeDir);
 const missingConfig = validateConfig(config ?? {});
 if (missingConfig.length > 0) {
@@ -58,6 +67,8 @@ const IDLE_EXIT_MS = resolveIdleExitMs(readIdleExitArg());
 // Any other server belongs to the user.
 const AUTO_STARTED = process.argv.includes("--auto-started");
 const IDLE_CHECK_INTERVAL_MS = 5000;
+// How long a shutdown lets control requests already being answered finish.
+const CONTROL_DRAIN_MS = 10000;
 console.log(`[startup] tgcli server ${readVersion()} (pid ${process.pid}, ${AUTO_STARTED ? "auto-started" : "started by hand"}${IDLE_EXIT_MS > 0 ? `, idle exit after ${IDLE_EXIT_MS}ms` : ""})`);
 
 const { telegramClient, messageSyncService } = createServices({ storeDir, config });
@@ -67,6 +78,7 @@ const ensureTelegramConnected = createTelegramConnector({ telegramClient, messag
 let serviceState = null;
 let controlToken = null;
 let controlServer = null;
+let controlHandler = null;
 let controlFileWritten = false;
 let idleTimer = null;
 let lastControlActivityAt = Date.now();
@@ -1752,7 +1764,9 @@ if (controlEnabled) {
     onShutdown: () => {
       void shutdown("stop requested over the control API").finally(() => process.exit(0));
     },
+    root: path.dirname(fileURLToPath(import.meta.url)),
   });
+  controlHandler = handleControlRequest;
 
   controlServer = http.createServer((req, res) => {
     if (req.method === "OPTIONS") {
@@ -1863,11 +1877,21 @@ async function runShutdown(reason) {
   }
 
   if (controlServer) {
-    controlServer.closeAllConnections?.();
-    controlServer.close(() => {
+    // Take no new connections, let the requests other CLIs are waiting on finish,
+    // then drop what is left.
+    const closingServer = controlServer;
+    controlServer = null;
+    closingServer.close(() => {
       console.log("[shutdown] control server closed");
     });
-    controlServer = null;
+    const drainDeadline = Date.now() + CONTROL_DRAIN_MS;
+    while ((controlHandler?.inFlight() ?? 0) > 0 && Date.now() < drainDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if ((controlHandler?.inFlight() ?? 0) > 0) {
+      console.log(`[shutdown] dropping ${controlHandler.inFlight()} control request(s) still running`);
+    }
+    closingServer.closeAllConnections?.();
   }
 
   try {
@@ -1885,7 +1909,7 @@ async function runShutdown(reason) {
   // Last, so a CLI that arrives mid-shutdown can see this process and wait for it.
   if (controlFileWritten) {
     try {
-      removeControlFile(storeDir);
+      removeControlFile(storeDir, { pid: process.pid, token: controlToken });
     } catch (error) {
       console.error(`[shutdown] failed to remove control.json: ${error?.message ?? error}`);
     }

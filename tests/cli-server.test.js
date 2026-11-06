@@ -152,6 +152,13 @@ describe('tgcli server restart', () => {
     expect(stdout()).toContain(`It runs 2.2.5, not this CLI's ${CLI_VERSION}: brew started it.`);
   });
 
+  it('fails when the service manager does not start its server again', async () => {
+    control.restartServer.mockResolvedValue({ previous: server({ autoStarted: false, manager: 'systemd' }), current: null });
+    await run(['server', 'restart']);
+    expect(process.exitCode).toBe(1);
+    expect(stderr()).toContain('Stopped tgcli server 2.2.5 (pid 4242), but systemd has not started it again; `tgcli service start` does.');
+  });
+
   it('fails when the old server does not exit', async () => {
     control.restartServer.mockResolvedValue({ previous: server({ stopped: false }), current: null });
     await run(['server', 'restart']);

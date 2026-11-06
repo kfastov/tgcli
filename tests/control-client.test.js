@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const spawnMock = vi.hoisted(() => vi.fn());
@@ -300,6 +301,7 @@ describe('server older or newer than this CLI', () => {
     args = '--idle-exit 60000',
     tty = '??',
     owner = {},
+    ping = {},
   } = {}) {
     pid += 1;
     writeControl({ pid, port: 8765, token: 'secret', startedAt: 's', version, ...owner });
@@ -308,7 +310,7 @@ describe('server older or newer than this CLI', () => {
       stdout: psArgs.includes('tty=') ? `${tty}\n` : `node /x/mcp-server.js ${args}\n`,
     }));
     global.fetch.mockImplementation((url) => Promise.resolve(url.endsWith('/control/ping')
-      ? jsonResponse(200, { ok: true, pid, version, startedAt: 's', jobs })
+      ? jsonResponse(200, { ok: true, pid, version, startedAt: 's', jobs, ...ping })
       : jsonResponse(200, { result: 'done' })));
     return pid;
   }
@@ -418,6 +420,20 @@ describe('server older or newer than this CLI', () => {
     await expect(invoke(storeDir, { op: 'listChannels', args: {} })).resolves.toBe('done');
     expect(killSpy).not.toHaveBeenCalledWith(serverPid, 'SIGTERM');
     expect(stderr()).toContain('once its backfill queue is empty');
+  });
+
+  it('defers the restart while the server answers another CLI', async () => {
+    const serverPid = runningServer({ ping: { inFlight: 1 } });
+    await expect(invoke(storeDir, { op: 'listChannels', args: {} })).resolves.toBe('done');
+    expect(killSpy).not.toHaveBeenCalledWith(serverPid, 'SIGTERM');
+    expect(stderr()).toContain('no request is running');
+  });
+
+  it('replaces a newer server that runs from its own directory', async () => {
+    const root = fileURLToPath(new URL('..', import.meta.url));
+    const serverPid = runningServer({ version: NEW_VERSION, ping: { root } });
+    await invoke(storeDir, { op: 'listChannels', args: {} }).catch(() => {});
+    expect(killSpy).toHaveBeenCalledWith(serverPid, 'SIGTERM');
   });
 
   it('warns instead of downgrading a server newer than this CLI', async () => {
@@ -555,6 +571,12 @@ describe('versionTakeover', () => {
     ['a dev build that cannot say', '2.2.6-dev+abc1234', '2.2.5', undefined, 'take-over'],
   ])('%s', (_label, serverVersion, cliVersion, ownClientIdleMs, expected) => {
     expect(versionTakeover({ serverVersion, cliVersion, ownClientIdleMs })).toBe(expected);
+  });
+
+  it('takes over a server running from its own directory, dev build in use or not', () => {
+    expect(versionTakeover({ serverVersion: '2.2.6-dev+abc1234', cliVersion: '2.2.6-dev+def5678', ownClientIdleMs: 0, sameCheckout: true })).toBe('take-over');
+    expect(versionTakeover({ serverVersion: '2.2.6', cliVersion: '2.2.5', sameCheckout: true })).toBe('take-over');
+    expect(versionTakeover({ serverVersion: '2.2.5', cliVersion: '2.2.5', sameCheckout: true })).toBe('same');
   });
 
   it('never lets two CLIs in use take the server from each other in turn', () => {
@@ -708,6 +730,23 @@ describe('restartServer', () => {
     expect(previous).toMatchObject({ pid: 100, manager: 'launchd' });
     expect(current).toMatchObject({ pid: 101 });
     expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it('starts no second server when the service manager does not bring its own back', async () => {
+    vi.useFakeTimers();
+    try {
+      alive.add(105);
+      writeControl({ pid: 105, port: 8765, token: 'secret', startedAt: 's', version: '2.2.5', autoStarted: false, manager: 'systemd' });
+      serveFromControlFile({ onShutdown: stopsCleanly });
+      const done = restartServer(storeDir);
+      await vi.advanceTimersByTimeAsync(15000);
+      const { previous, current } = await done;
+      expect(previous).toMatchObject({ stopped: true, manager: 'systemd' });
+      expect(current).toBeNull();
+      expect(spawnMock).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('starts nothing when the old server does not stop', async () => {

@@ -68,7 +68,7 @@ describe('readVersion', () => {
     expect(readVersion({ root })).toBe('2.2.6-dev');
   });
 
-  it('is the dev version of this very clone', () => {
+  it.skipIf(!fs.existsSync(new URL('../.git', import.meta.url)))('is the dev version of this very clone', () => {
     expect(isDevVersion(readVersion())).toBe(true);
   });
 });
