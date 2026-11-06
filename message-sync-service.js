@@ -3,7 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import { setTimeout as delay } from 'timers/promises';
 import { Message, MtPeerNotFoundError, PeersIndex, _messageMediaFromTl } from '@mtcute/core';
-import { normalizeChannelId, summarizeMedia } from './telegram-client.js';
+import { isChatGone, normalizeChannelId, summarizeMedia } from './telegram-client.js';
 import { resolveStoreDir, resolveStorePaths } from './core/store.js';
 import { parseRequiredWaitSeconds } from './core/send-utils.js';
 
@@ -32,6 +32,8 @@ const RECHECK_RECENT_MS = 10 * 60 * 1000;
 // A read that keeps failing for this long, on a running server, is not going to work.
 const RECHECK_GIVE_UP_MS = 24 * 60 * 60 * 1000;
 const PERIODIC_RECONCILE_MS = 60 * 60 * 1000;
+// A chat missing from the dialog list but still joined is asked about again this often.
+const MEMBERSHIP_RECHECK_MS = 24 * 60 * 60 * 1000;
 const CONNECTION_CHECK_TIMEOUT_MS = 20 * 1000;
 const RETRY_BASE_MS = 60 * 1000;
 // A repair walks history one page per queue step, so jobs and gap fills never wait
@@ -227,22 +229,6 @@ function hasSequentialIds(channelId) {
 
 // Telegram refusing this chat will not change soon, unlike a dropped connection, an
 // expired session (401) or a failure of its own (5xx), which say nothing about the message.
-// Errors about the chat itself, the ones a repair can give up on: the account has left it,
-// it is gone, or Telegram does not know it. Anything else, such as a broken session,
-// would stop every chat in a row and must stay a failure that is retried.
-const CHAT_GONE_ERRORS = new Set([
-  'CHANNEL_INVALID',
-  'CHANNEL_PRIVATE',
-  'CHAT_FORBIDDEN',
-  'CHAT_ID_INVALID',
-  'PEER_ID_INVALID',
-  'USER_BANNED_IN_CHANNEL',
-]);
-
-function isChatGone(error) {
-  return error instanceof MtPeerNotFoundError || CHAT_GONE_ERRORS.has(error?.text);
-}
-
 function isRefusedRead(error) {
   const code = error?.code;
   return (code >= 400 && code < 500 && code !== 401) || error instanceof MtPeerNotFoundError;
@@ -659,6 +645,9 @@ export default class MessageSyncService {
         gap_after_message_id INTEGER,
         newer_sync_pending INTEGER NOT NULL DEFAULT 0,
         in_dialogs INTEGER,
+        sync_off_reason TEXT,
+        membership TEXT,
+        membership_checked_at INTEGER,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
@@ -716,6 +705,12 @@ export default class MessageSyncService {
     this._ensureChannelColumn('gap_after_message_id', 'INTEGER');
     // 1 when the last full dialog list had the chat, 0 when it did not, NULL before any.
     this._ensureChannelColumn('in_dialogs', 'INTEGER');
+    // 'left' when the server turned sync off because Telegram said the account left.
+    this._ensureChannelColumn('sync_off_reason', 'TEXT');
+    // What Telegram last said about a chat missing from the dialog list ('member', 'left',
+    // 'gone' or 'unknown'), and when (ms).
+    this._ensureChannelColumn('membership', 'TEXT');
+    this._ensureChannelColumn('membership_checked_at', 'INTEGER');
     if (this._ensureChannelColumn('newer_sync_pending', 'INTEGER NOT NULL DEFAULT 0')) {
       // Jobs queued before this column existed still have their newer sync ahead of them.
       this.db.prepare(`
@@ -1390,8 +1385,72 @@ export default class MessageSyncService {
     const dialogs = await this.telegramClient.listDialogs(0, { includeArchived: true });
     this.upsertChannels(dialogs);
     this._markDialogMembership(dialogs);
+    this._restoreReturnedChats();
     this._markGapsBehindDialogs(dialogs);
     return dialogs.length;
+  }
+
+  // A chat whose sync the server turned off when the account left is back in the dialog
+  // list: the account rejoined. Sync comes back, and the gap behind the cursor is filled.
+  _restoreReturnedChats() {
+    const returned = this.db.prepare(`
+      UPDATE channels
+      SET sync_enabled = 1, sync_off_reason = NULL, membership = NULL, membership_checked_at = NULL,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE sync_off_reason = 'left' AND in_dialogs = 1
+      RETURNING channel_id
+    `).all().map((row) => row.channel_id);
+    if (returned.length) {
+      console.log(`[sync] ${returned.length} chat(s) the account had left are back in the dialog list, sync is on again: ${returned.join(', ')}.`);
+    }
+  }
+
+  // Telegram sends nothing from a channel or group the account has left, so the archive
+  // cannot keep up with it. Missing from the dialog list is only a reason to ask: sync goes
+  // off only when Telegram says the account left or was removed, or the chat is gone. One
+  // still joined keeps its sync and is asked about again a day later. Private chats are not
+  // asked about: their messages arrive without a dialog.
+  async checkChatsMissingFromDialogs() {
+    const dueBefore = Date.now() - MEMBERSHIP_RECHECK_MS;
+    const missing = this.db.prepare(`
+      SELECT channel_id FROM channels
+      WHERE sync_enabled = 1 AND in_dialogs = 0 AND channel_id GLOB '-[0-9]*'
+        AND (membership_checked_at IS NULL OR membership_checked_at < ?)
+      ORDER BY channel_id
+    `).all(dueBefore).map((row) => row.channel_id);
+    if (!missing.length) {
+      return null;
+    }
+    const membership = await this.telegramClient.getChatMembership(missing);
+    const counts = { off: 0, member: 0, unknown: 0 };
+    const now = Date.now();
+    const turnOff = this.db.prepare(`
+      UPDATE channels
+      SET sync_enabled = 0, sync_off_reason = 'left', membership = ?, membership_checked_at = ?,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE channel_id = ? AND sync_enabled = 1 AND in_dialogs = 0
+    `);
+    const checked = this.db.prepare('UPDATE channels SET membership = ?, membership_checked_at = ? WHERE channel_id = ?');
+    const stillJoined = [];
+    this.db.transaction(() => {
+      for (const channelId of missing) {
+        const state = membership.get(channelId) ?? 'unknown';
+        if (state === 'left' || state === 'gone') {
+          counts.off += turnOff.run(state, now, channelId).changes;
+        } else {
+          checked.run(state, now, channelId);
+          counts[state === 'member' ? 'member' : 'unknown'] += 1;
+          if (state === 'member') {
+            stillJoined.push(channelId);
+          }
+        }
+      }
+    })();
+    console.log(`[sync] ${missing.length} synced chat(s) are missing from the dialog list: sync off for ${counts.off} the account left, ${counts.member} still joined, ${counts.unknown} unknown.`);
+    if (stillJoined.length) {
+      console.warn(`[sync] Missing from the dialog list but still joined, sync stays on: ${stillJoined.join(', ')}.`);
+    }
+    return counts;
   }
 
   // A chat missing from the full dialog list is one the account left or lost: Telegram
@@ -1443,6 +1502,12 @@ export default class MessageSyncService {
       } while (this.reconcileAgain && !this.stopRequested);
       this.reconcileNeeded = false;
       this.lastReconcileAt = Date.now();
+      if (!this.stopRequested) {
+        // After the comparison, so its requests do not hold the cursors any longer.
+        void this.checkChatsMissingFromDialogs().catch((error) => {
+          console.error(`[sync] Could not ask Telegram about chats missing from the dialog list: ${error?.message ?? error}`);
+        });
+      }
       return this.stopRequested ? null : dialogCount;
     } finally {
       // In the same tick as the last look at reconcileAgain, so no request falls between.
@@ -1567,6 +1632,9 @@ export default class MessageSyncService {
       VALUES (?, ?, CURRENT_TIMESTAMP)
       ON CONFLICT(channel_id) DO UPDATE SET
         sync_enabled = excluded.sync_enabled,
+        sync_off_reason = NULL,
+        membership = NULL,
+        membership_checked_at = NULL,
         updated_at = CURRENT_TIMESTAMP
       RETURNING channel_id, sync_enabled;
     `);
@@ -2683,6 +2751,16 @@ export default class MessageSyncService {
   // Archives written before 2.2.5 can hold holes nothing fills by itself. Finding them
   // costs as much as filling them, so this only says whether `--all` has run, or the
   // archive was started by a version with the fixes.
+  // What the server did about synced chats missing from the dialog list.
+  getLeftChatCounts() {
+    return this.db.prepare(`
+      SELECT
+        COALESCE(SUM(sync_off_reason = 'left' AND sync_enabled = 0), 0) AS syncOff,
+        COALESCE(SUM(sync_enabled = 1 AND in_dialogs = 0 AND membership = 'member'), 0) AS stillJoined
+      FROM channels
+    `).get();
+  }
+
   isRepairSuggested() {
     if (this.db.prepare("SELECT 1 FROM search_meta WHERE key = 'archive_repair'").get()) {
       return false;

@@ -2726,6 +2726,7 @@ async function runDoctor(globalFlags, options = {}) {
     const search = messageSyncService.getSearchStatus();
     const queue = messageSyncService.getQueueStats();
     const repairSuggested = messageSyncService.isRepairSuggested();
+    const leftChats = messageSyncService.getLeftChatCounts();
     const update = getUpdateStatus({
       storeDir,
       version: readVersion(),
@@ -2742,6 +2743,7 @@ async function runDoctor(globalFlags, options = {}) {
       ftsVersion: search.version,
       queue,
       repairSuggested,
+      leftChats,
       update,
     };
 
@@ -2756,6 +2758,12 @@ async function runDoctor(globalFlags, options = {}) {
     console.log(`CONNECTED: ${payload.connected}`);
     console.log(`FTS: ${payload.ftsEnabled}${payload.ftsVersion ? ` (v${payload.ftsVersion})` : ''}`);
     console.log(`QUEUE: pending=${queue.pending} in_progress=${queue.in_progress} idle=${queue.idle} error=${queue.error} gaps=${queue.gaps}`);
+    if (leftChats.syncOff) {
+      console.log(`LEFT: sync is off for ${leftChats.syncOff} chat(s) you left; it comes back on by itself if you rejoin.`);
+    }
+    if (leftChats.stillJoined) {
+      console.log(`DIALOGS: ${leftChats.stillJoined} synced chat(s) are missing from your dialog list, though Telegram says you are still in them; sync stays on.`);
+    }
     if (repairSuggested) {
       console.log(`REPAIR: versions before 2.2.5 could lose messages; fill the holes with \`tgcli backfill repair --all\` (the last ${DEFAULT_REPAIR_SINCE} of every synced chat).`);
     }

@@ -147,6 +147,9 @@ it. `server restart` switches to the caller's version in any direction. See
     and the command that installs it, `up to date` with the time that version was
     last confirmed, `not checked yet`, or why there is no check, plus the error of a
     failed last check. With `--json` the same facts are under `update`.
+  - `LEFT:` counts chats whose sync the server turned off because you left them (see
+    `channels unwatch`), and `DIALOGS:` the synced chats missing from your dialog list
+    that Telegram says you are still in. With `--json`: `leftChats`.
 
 ## Update notice
 Once a day tgcli asks the npm registry for the latest `@kfastov/tgcli` and keeps the
@@ -189,6 +192,12 @@ Update available: tgcli 2.2.5 -> 2.3.0. Run `brew update && brew upgrade tgcli` 
   - Subscribe a chat for archiving: enables sync and queues a backfill job; run `tgcli backfill --once` or `tgcli backfill --follow` to process it.
 - channels unwatch --chat <id|username>
   - Unsubscribe a chat from archiving (disables sync).
+  - The server does this by itself for a channel or group you left: Telegram sends
+    nothing from it, so the archive could not keep up. A synced chat missing from the
+    dialog list is only a reason to ask Telegram, once a day; sync goes off when Telegram
+    says you left or were removed, or the chat is gone, and comes back on, with what it
+    missed, when the chat returns to your dialog list. Chats you turned off yourself stay
+    off, and private chats are never asked about.
   - `channels sync --chat <id|username> --enable|--disable` remains as a hidden alias of watch/unwatch.
 
 ## topics (forum supergroups)
