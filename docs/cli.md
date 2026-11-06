@@ -105,6 +105,44 @@ one-shot client.
 - doctor [--connect]
   - Checks auth, lock, FTS, last sync, queue state. For an archive started before 2.2.5,
     suggests `backfill repair --all` until it has run.
+  - The `UPDATE:` line reports what the last update check found: a newer version
+    and the command that installs it, `up to date` with the time that version was
+    last confirmed, `not checked yet`, or why there is no check, plus the error of a
+    failed last check. With `--json` the same facts are under `update`.
+
+## Update notice
+Once a day tgcli asks the npm registry for the latest `@kfastov/tgcli` and keeps the
+answer in `update-check.json` in the store. The request runs in a detached background
+process, so no command waits for it; the notice is decided from the cache alone, which
+means a new release shows up on the first command after the check that found it.
+
+When the cache knows a newer version, one line goes to stderr after a command
+succeeds, with the command for how this copy was installed:
+
+```
+Update available: tgcli 2.2.5 -> 2.3.0. Run `brew update && brew upgrade tgcli` (TGCLI_NO_UPDATE_CHECK=1 turns this notice off).
+```
+
+- Install method comes from where the package sits: under Homebrew's `Cellar/tgcli`
+  the command is `brew update && brew upgrade tgcli` (Homebrew refreshes taps only
+  once a day on its own, so a bare `brew upgrade` can miss a release made today);
+  under a global npm `lib/node_modules` (or `%AppData%\npm\node_modules` on
+  Windows) it is `npm i -g @kfastov/tgcli`. Anything else (a git clone, an npx
+  cache, a project dependency, pnpm, the Nix store) gets no check and no notice.
+  So does a version with a prerelease suffix such as `2.3.0-dev`.
+- Never on stdout. Never with `--json` or `--quiet`, never after a failed command,
+  and only when stderr is a terminal: pipes, redirects, cron and agents that capture
+  output see nothing. An agent that drives a real terminal sees the line like a
+  person would, at most once a day; `--json` or the switch below keeps it out.
+  The background check still runs without a terminal, so the notice is ready when a
+  person next runs tgcli.
+- Shown at most once a day for the same version; a newer release shows at once.
+- Not in `tgcli server`, which neither checks nor prints. `doctor` checks but prints
+  its `UPDATE:` line instead of the notice.
+- Off entirely, check included, when `TGCLI_NO_UPDATE_CHECK`, `NO_UPDATE_NOTIFIER` or
+  `CI` is set to a value other than empty, `0`, `false`, `no` or `off`.
+- The release workflow updates the Homebrew formula right after npm. If that step
+  fails, Homebrew users see the notice before `brew upgrade` can install the release.
 
 ## channels
 - channels list [--limit] [--query]
