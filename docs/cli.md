@@ -43,6 +43,10 @@ MCP: disabled by default (set `mcp.enabled` in config.json to true to serve MCP)
 - auth logout
 
 ## backfill
+A chat given by username is archived under its Telegram id, which the server asks
+Telegram for; a username Telegram does not know is an error and queues nothing. The
+same goes for `channels watch`, `tags set` and `topics`.
+
 Backfill work is executed by the always-on control server, not in the CLI
 process. Commands that need the server (`backfill --chat`, `backfill wait`)
 auto-start `tgcli server --idle-exit 60s` in the background if one isn't already
@@ -175,6 +179,17 @@ it. `server restart` switches to the caller's version in any direction. See
 - doctor [--connect]
   - Checks auth, lock, FTS, last sync, queue state. For an archive started before 2.2.5,
     suggests `backfill repair --all` until it has run.
+  - `USERNAME KEYS:` counts chats an older version stored under a username (a chat
+    given as `--chat @name`) instead of its Telegram id, next to the rows updates write
+    by id. The server moves each to its id after it logs in to Telegram, with nothing
+    to run: messages already under the id stay, duplicates are dropped, jobs and
+    repairs carry over. When Telegram no longer knows the username, the messages under
+    it decide: if they all come from one chat (each archived message records its chat),
+    they move there; with no message under it at all, its rows are dropped along with
+    its jobs and repairs, which could never run. A chat whose messages come from several
+    chats, or from another one than Telegram gives for the username, stays as it is.
+    One line per chat says what becomes of it, naming the reason for a chat that stays.
+    With `--json` the list is under `usernameKeys`.
   - The `UPDATE:` line reports what the last update check found: a newer version
     and the command that installs it, `up to date` with the time that version was
     last confirmed, `not checked yet`, or why there is no check, plus the error of a

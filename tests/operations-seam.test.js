@@ -54,6 +54,7 @@ beforeEach(() => {
     markChannelRead: vi.fn().mockResolvedValue({ channelId: '1', messageId: 9 }),
   };
   hooks.messageSyncService = {
+    resolveChatKey: vi.fn(async (chat) => (chat === '@g' ? '1' : String(chat))),
     setChannelSync: vi.fn(() => ({ channel_id: '1', sync_enabled: 1 })),
     queueResyncJob: vi.fn(() => ({ job: { id: 7, status: 'pending' }, queued: true })),
     processQueue: vi.fn(),
@@ -92,8 +93,8 @@ describe('OPERATIONS registry', () => {
 
   it('channelSetSync enables sync and queues a backfill job when none exists', async () => {
     const result = await OPERATIONS.channelSetSync(ctx(), { chat: '@g', enable: true });
-    expect(hooks.messageSyncService.setChannelSync).toHaveBeenCalledWith('@g', true);
-    expect(hooks.messageSyncService.queueResyncJob).toHaveBeenCalledWith('@g');
+    expect(hooks.messageSyncService.setChannelSync).toHaveBeenCalledWith('1', true);
+    expect(hooks.messageSyncService.queueResyncJob).toHaveBeenCalledWith('1');
     expect(result).toMatchObject({ channelId: '1', syncEnabled: true, jobId: 7, jobQueued: true });
   });
 
