@@ -1,17 +1,67 @@
 name: Release
 
+# Every push to main updates a release PR (version bump and CHANGELOG from the
+# Conventional Commits since the last release). Merging that PR tags the release,
+# publishes the package to npm and points the Homebrew formula at it, with no
+# manual step. Run it by hand with a tag to finish a release that stopped halfway;
+# whatever already went out is left as it is.
+
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish again, such as v2.2.5
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
-  publish-npm:
+  release-please:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  publish-npm:
+    needs: release-please
+    if: >-
+      always() && (
+        needs.release-please.outputs.release_created == 'true' ||
+        github.event_name == 'workflow_dispatch'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       id-token: write
+    env:
+      TAG: ${{ needs.release-please.outputs.tag_name || inputs.tag }}
+    outputs:
+      version: ${{ steps.pack.outputs.version }}
+      sha256: ${{ steps.pack.outputs.sha256 }}
+      published: ${{ steps.publish.outputs.published }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TAG }}
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -19,34 +69,66 @@ jobs:
           package-manager-cache: false
       - run: npm ci
       - run: npm test
-      - name: Verify tag matches package version
-        run: node -e "const fs=require('fs');const pkg=JSON.parse(fs.readFileSync('package.json','utf8'));const tag=(process.env.GITHUB_REF_NAME||'').replace(/^v/,'');if(!tag){throw new Error('Missing release tag');}if(pkg.version!==tag){throw new Error(`Tag ${tag} does not match package.json ${pkg.version}`);}"
-      - run: npm publish --access public --provenance
+      - name: Pack
+        id: pack
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          if [ "v$VERSION" != "$TAG" ]; then
+            echo "::error::Tag $TAG does not match package.json $VERSION"
+            exit 1
+          fi
+          FILE="$(npm pack --json | node -e "process.stdout.write(JSON.parse(require('fs').readFileSync(0, 'utf8'))[0].filename)")"
+          {
+            echo "version=$VERSION"
+            echo "file=$FILE"
+            echo "sha256=$(sha256sum "$FILE" | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+      - name: Publish
+        id: publish
+        env:
+          VERSION: ${{ steps.pack.outputs.version }}
+          FILE: ${{ steps.pack.outputs.file }}
+        run: |
+          if npm view "@kfastov/tgcli@$VERSION" version >/dev/null 2>&1; then
+            echo "$VERSION is on npm already."
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          else
+            # Trusted publishing: npm takes the workflow's OIDC token, no secret.
+            npm publish "$FILE" --access public --provenance
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          fi
 
   update-brew:
     needs: publish-npm
+    if: always() && needs.publish-npm.result == 'success'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     env:
       HOMEBREW_TAP_SSH_KEY: ${{ secrets.HOMEBREW_TAP_SSH_KEY }}
+      VERSION: ${{ needs.publish-npm.outputs.version }}
     steps:
       - name: Skip if no Homebrew deploy key
         if: env.HOMEBREW_TAP_SSH_KEY == ''
         run: echo "HOMEBREW_TAP_SSH_KEY not set; skipping brew update."
-      - name: Resolve version
+      - name: Resolve tarball and checksum
         if: env.HOMEBREW_TAP_SSH_KEY != ''
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-      - name: Download npm tarball
-        if: env.HOMEBREW_TAP_SSH_KEY != ''
+        env:
+          PUBLISHED: ${{ needs.publish-npm.outputs.published }}
+          PACKED_SHA256: ${{ needs.publish-npm.outputs.sha256 }}
         run: |
           TARBALL_URL="https://registry.npmjs.org/@kfastov/tgcli/-/tgcli-${VERSION}.tgz"
-          curl -fsSL "$TARBALL_URL" -o tgcli.tgz
+          if [ "$PUBLISHED" = "true" ]; then
+            # The bytes just published. npm can take minutes to serve them, and
+            # the formula only needs their checksum.
+            SHA256="$PACKED_SHA256"
+          else
+            curl -fsSL --retry 10 --retry-delay 15 --retry-all-errors "$TARBALL_URL" -o tgcli.tgz
+            SHA256="$(sha256sum tgcli.tgz | cut -d' ' -f1)"
+          fi
           echo "TARBALL_URL=$TARBALL_URL" >> "$GITHUB_ENV"
-          echo "SHA256=$(sha256sum tgcli.tgz | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "SHA256=$SHA256" >> "$GITHUB_ENV"
       - uses: actions/checkout@v6
         if: env.HOMEBREW_TAP_SSH_KEY != ''
         with:
@@ -67,7 +149,6 @@ jobs:
           text = path.read_text()
           url = os.environ["TARBALL_URL"]
           sha = os.environ["SHA256"]
-
           text = re.sub(r'^(\s*url\s+\").*(\")', r'\g<1>%s\g<2>' % url, text, flags=re.M)
           text = re.sub(r'^(\s*sha256\s+\").*(\")', r'\g<1>%s\g<2>' % sha, text, flags=re.M)
           path.write_text(text)

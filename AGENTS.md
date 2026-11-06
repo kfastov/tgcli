@@ -32,6 +32,7 @@
 - Keep commits atomic; include body details when altering session management or cache persistence.
 - PR descriptions should summarize intent, list manual verification (commands run, Telegram scenarios exercised), link related issues, and attach console excerpts when tool output changes.
 - Confirm no sensitive credentials or runtime artifacts from the tgcli store are committed before requesting review.
+- Releases are automated: merging the release PR that the Release workflow keeps open publishes to npm and Homebrew. Never bump the version, tag or publish by hand; see `docs/releasing.md`.
 
 ## Workflow
 - On startup, read `backlog.md` and pull tasks from it.
