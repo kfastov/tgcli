@@ -35,3 +35,5 @@ only if it points elsewhere.
 - The `HOMEBREW_TAP_SSH_KEY` secret: a deploy key with write access to the tap.
 - Settings → Actions → General → "Allow GitHub Actions to create and approve pull
   requests", so the workflow can open the release PR.
+- Settings → General → Pull Requests: squash merging only, with the pull request title
+  as the commit title, so every pull request reaches `main` as one changelog line.
