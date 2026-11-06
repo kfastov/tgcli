@@ -524,9 +524,9 @@ export function isChatGone(error) {
   return error instanceof MtPeerNotFoundError || CHAT_GONE_ERRORS.has(error?.text);
 }
 
-// What Telegram says about the account in a channel or group: 'member', 'left' (left on
-// its own), 'gone' (removed, banned, the chat deleted or migrated) or 'unknown' (not in
-// the local peer cache, so there is nothing to ask with).
+// What Telegram says about the account in a channel or group: 'member', 'left' (left, or
+// never joined), 'gone' (removed, banned, the chat deleted or migrated) or 'unknown'.
+// Only a chat Telegram returns decides: an error may mean a bad access hash, not a left chat.
 function membershipOf(chat) {
   switch (chat?._) {
     case 'channel':
@@ -904,10 +904,8 @@ class TelegramClient {
       let peer;
       try {
         peer = await this.client.resolvePeer(Number(id));
-      } catch (error) {
-        if (!(error instanceof MtPeerNotFoundError)) {
-          throw error;
-        }
+      } catch {
+        // Not in the peer cache, or not an id mtcute can parse: nothing to ask with.
         result.set(String(id), 'unknown');
         continue;
       }
@@ -929,7 +927,8 @@ class TelegramClient {
             throw error;
           }
           if (batch.length === 1) {
-            result.set(batch[0].id, 'gone');
+            // A stale or min access hash is refused the same way: no answer about the chat.
+            result.set(batch[0].id, 'unknown');
             continue;
           }
           // One refused chat fails the whole batch, so ask about each on its own.

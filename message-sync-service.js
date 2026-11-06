@@ -648,6 +648,7 @@ export default class MessageSyncService {
         sync_off_reason TEXT,
         membership TEXT,
         membership_checked_at INTEGER,
+        sync_by_user INTEGER,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
@@ -711,6 +712,9 @@ export default class MessageSyncService {
     // 'gone' or 'unknown'), and when (ms).
     this._ensureChannelColumn('membership', 'TEXT');
     this._ensureChannelColumn('membership_checked_at', 'INTEGER');
+    // 1 when the user asked for the chat (channels watch, backfill --chat): a public
+    // channel can be archived without joining it, and Telegram calls that left.
+    this._ensureChannelColumn('sync_by_user', 'INTEGER');
     if (this._ensureChannelColumn('newer_sync_pending', 'INTEGER NOT NULL DEFAULT 0')) {
       // Jobs queued before this column existed still have their newer sync ahead of them.
       this.db.prepare(`
@@ -1409,12 +1413,23 @@ export default class MessageSyncService {
   // cannot keep up with it. Missing from the dialog list is only a reason to ask: sync goes
   // off only when Telegram says the account left or was removed, or the chat is gone. One
   // still joined keeps its sync and is asked about again a day later. Private chats are not
-  // asked about: their messages arrive without a dialog.
-  async checkChatsMissingFromDialogs() {
+  // asked about: their messages arrive without a dialog. Nor are chats the user asked for.
+  checkChatsMissingFromDialogs() {
+    // Two comparisons close together share one round of questions.
+    if (!this.membershipCheckPromise) {
+      this.membershipCheckPromise = this._checkChatsMissingFromDialogs().finally(() => {
+        this.membershipCheckPromise = null;
+      });
+    }
+    return this.membershipCheckPromise;
+  }
+
+  async _checkChatsMissingFromDialogs() {
     const dueBefore = Date.now() - MEMBERSHIP_RECHECK_MS;
     const missing = this.db.prepare(`
       SELECT channel_id FROM channels
-      WHERE sync_enabled = 1 AND in_dialogs = 0 AND channel_id GLOB '-[0-9]*'
+      WHERE sync_enabled = 1 AND in_dialogs = 0 AND COALESCE(sync_by_user, 0) = 0
+        AND channel_id GLOB '-[0-9]*' AND channel_id NOT GLOB '-*[^0-9]*'
         AND (membership_checked_at IS NULL OR membership_checked_at < ?)
       ORDER BY channel_id
     `).all(dueBefore).map((row) => row.channel_id);
@@ -1428,7 +1443,7 @@ export default class MessageSyncService {
       UPDATE channels
       SET sync_enabled = 0, sync_off_reason = 'left', membership = ?, membership_checked_at = ?,
         updated_at = CURRENT_TIMESTAMP
-      WHERE channel_id = ? AND sync_enabled = 1 AND in_dialogs = 0
+      WHERE channel_id = ? AND sync_enabled = 1 AND in_dialogs = 0 AND COALESCE(sync_by_user, 0) = 0
     `);
     const checked = this.db.prepare('UPDATE channels SET membership = ?, membership_checked_at = ? WHERE channel_id = ?');
     const stillJoined = [];
@@ -1460,9 +1475,14 @@ export default class MessageSyncService {
     if (!dialogs.length) {
       return;
     }
+    // A chat back in the list says nothing more about whether the account is still in it
+    // later, so what Telegram said while it was missing goes.
     this.db.prepare(`
+      WITH listed AS (SELECT value AS channel_id FROM json_each(?))
       UPDATE channels
-      SET in_dialogs = channel_id IN (SELECT value FROM json_each(?))
+      SET in_dialogs = channel_id IN (SELECT channel_id FROM listed),
+          membership = CASE WHEN channel_id IN (SELECT channel_id FROM listed) THEN NULL ELSE membership END,
+          membership_checked_at = CASE WHEN channel_id IN (SELECT channel_id FROM listed) THEN NULL ELSE membership_checked_at END
     `).run(JSON.stringify(dialogs.map((dialog) => String(dialog.id))));
   }
 
@@ -1628,10 +1648,11 @@ export default class MessageSyncService {
     const normalizedId = normalizeChannelKey(channelId);
     const value = enabled ? 1 : 0;
     const stmt = this.db.prepare(`
-      INSERT INTO channels (channel_id, sync_enabled, updated_at)
-      VALUES (?, ?, CURRENT_TIMESTAMP)
+      INSERT INTO channels (channel_id, sync_enabled, sync_by_user, updated_at)
+      VALUES (?, ?, ?, CURRENT_TIMESTAMP)
       ON CONFLICT(channel_id) DO UPDATE SET
         sync_enabled = excluded.sync_enabled,
+        sync_by_user = excluded.sync_by_user,
         sync_off_reason = NULL,
         membership = NULL,
         membership_checked_at = NULL,
@@ -1639,7 +1660,7 @@ export default class MessageSyncService {
       RETURNING channel_id, sync_enabled;
     `);
 
-    return stmt.get(normalizedId, value);
+    return stmt.get(normalizedId, value, value);
   }
 
   setChannelTags(channelId, tags, options = {}) {
@@ -2138,12 +2159,16 @@ export default class MessageSyncService {
     const minDateIso = minDate ? new Date(minDate * 1000).toISOString() : null;
 
     // Stays set until a newer sync reaches the newest message, even if this job is canceled
-    // with a cursor in place: what lies above that cursor is still to be fetched.
+    // with a cursor in place: what lies above that cursor is still to be fetched. Asking for
+    // the chat is the user's word on it, over the server turning its sync off.
     this.db.prepare(`
-      INSERT INTO channels (channel_id, newer_sync_pending, updated_at)
-      VALUES (?, 1, CURRENT_TIMESTAMP)
+      INSERT INTO channels (channel_id, newer_sync_pending, sync_by_user, updated_at)
+      VALUES (?, 1, 1, CURRENT_TIMESTAMP)
       ON CONFLICT(channel_id) DO UPDATE SET
         newer_sync_pending = 1,
+        sync_by_user = 1,
+        sync_enabled = CASE WHEN sync_off_reason = 'left' THEN 1 ELSE sync_enabled END,
+        sync_off_reason = NULL,
         updated_at = CURRENT_TIMESTAMP
     `).run(normalizedId);
 
@@ -2748,9 +2773,6 @@ export default class MessageSyncService {
     return channelIds;
   }
 
-  // Archives written before 2.2.5 can hold holes nothing fills by itself. Finding them
-  // costs as much as filling them, so this only says whether `--all` has run, or the
-  // archive was started by a version with the fixes.
   // What the server did about synced chats missing from the dialog list.
   getLeftChatCounts() {
     return this.db.prepare(`
@@ -2761,6 +2783,9 @@ export default class MessageSyncService {
     `).get();
   }
 
+  // Archives written before 2.2.5 can hold holes nothing fills by itself. Finding them
+  // costs as much as filling them, so this only says whether `--all` has run, or the
+  // archive was started by a version with the fixes.
   isRepairSuggested() {
     if (this.db.prepare("SELECT 1 FROM search_meta WHERE key = 'archive_repair'").get()) {
       return false;

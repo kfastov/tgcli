@@ -2759,7 +2759,7 @@ async function runDoctor(globalFlags, options = {}) {
     console.log(`FTS: ${payload.ftsEnabled}${payload.ftsVersion ? ` (v${payload.ftsVersion})` : ''}`);
     console.log(`QUEUE: pending=${queue.pending} in_progress=${queue.in_progress} idle=${queue.idle} error=${queue.error} gaps=${queue.gaps}`);
     if (leftChats.syncOff) {
-      console.log(`LEFT: sync is off for ${leftChats.syncOff} chat(s) you left; it comes back on by itself if you rejoin.`);
+      console.log(`LEFT: sync is off for ${leftChats.syncOff} chat(s) you are not in (left, removed or never joined); it comes back on if you rejoin, or for good with \`tgcli channels watch --chat <id>\`.`);
     }
     if (leftChats.stillJoined) {
       console.log(`DIALOGS: ${leftChats.stillJoined} synced chat(s) are missing from your dialog list, though Telegram says you are still in them; sync stays on.`);

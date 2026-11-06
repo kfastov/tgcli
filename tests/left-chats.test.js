@@ -97,7 +97,23 @@ describe('membership check in the Telegram client', () => {
 
     const membership = await client.getChatMembership(['-1000000000001', '-1000000000002']);
 
-    expect(Object.fromEntries(membership)).toEqual({ '-1000000000001': 'member', '-1000000000002': 'gone' });
+    // A refusal of one chat may be a stale access hash, not a left chat: no answer.
+    expect(Object.fromEntries(membership)).toEqual({ '-1000000000001': 'member', '-1000000000002': 'unknown' });
+  });
+
+  it('takes an id mtcute cannot resolve as unknown, and asks about the rest', async () => {
+    const resolvePeer = client.client.resolvePeer;
+    client.client.resolvePeer = async (id) => {
+      if (Number.isNaN(id)) {
+        throw new Error('Invalid marked peer id');
+      }
+      return resolvePeer(id);
+    };
+    answer = () => ({ chats: [{ _: 'channel', id: 1, left: false }] });
+
+    const membership = await client.getChatMembership(['-100123abc', '-1000000000001']);
+
+    expect(Object.fromEntries(membership)).toEqual({ '-100123abc': 'unknown', '-1000000000001': 'member' });
   });
 
   it('fails on an error that is not about a chat, so nothing is decided on it', async () => {
@@ -215,6 +231,67 @@ describe('sync of chats missing from the dialog list', () => {
     service.setChannelSync(LEFT, true);
 
     expect(channel(LEFT)).toMatchObject({ sync_enabled: 1, sync_off_reason: null, membership: null });
+  });
+
+  // Telegram calls a public channel archived without joining left, and the user asked for it.
+  it('never turns off a chat the user asked for, by watch or by backfill', async () => {
+    service.setChannelSync(LEFT, true);
+    service.addJob(GONE);
+    dialogs({ id: IN_DIALOGS });
+
+    await service.refreshChannelsFromDialogs();
+    await service.checkChatsMissingFromDialogs();
+
+    expect(telegramClient.getChatMembership).toHaveBeenCalledWith([JOINED, UNKNOWN]);
+    expect(channel(LEFT)).toMatchObject({ sync_enabled: 1, sync_off_reason: null });
+    expect(channel(GONE)).toMatchObject({ sync_enabled: 1, sync_off_reason: null });
+  });
+
+  it('turns sync back on when the user asks to backfill a chat the server turned off', async () => {
+    dialogs({ id: IN_DIALOGS });
+    await service.refreshChannelsFromDialogs();
+    await service.checkChatsMissingFromDialogs();
+
+    service.addJob(LEFT);
+
+    const row = service.db.prepare('SELECT sync_enabled, sync_off_reason, sync_by_user FROM channels WHERE channel_id = ?').get(LEFT);
+    expect(row).toEqual({ sync_enabled: 1, sync_off_reason: null, sync_by_user: 1 });
+  });
+
+  it('forgets that a chat was still joined once it is back in the dialog list', async () => {
+    dialogs({ id: IN_DIALOGS });
+    await service.refreshChannelsFromDialogs();
+    await service.checkChatsMissingFromDialogs();
+    expect(channel(JOINED).membership).toBe('member');
+
+    dialogs({ id: IN_DIALOGS }, { id: JOINED });
+    await service.refreshChannelsFromDialogs();
+    expect(channel(JOINED).membership).toBeNull();
+
+    membership.set(JOINED, 'left');
+    dialogs({ id: IN_DIALOGS });
+    await service.refreshChannelsFromDialogs();
+    await service.checkChatsMissingFromDialogs();
+    expect(channel(JOINED)).toMatchObject({ sync_enabled: 0, sync_off_reason: 'left' });
+  });
+
+  it('asks once when two comparisons come close together', async () => {
+    dialogs({ id: IN_DIALOGS });
+    await service.refreshChannelsFromDialogs();
+
+    await Promise.all([service.checkChatsMissingFromDialogs(), service.checkChatsMissingFromDialogs()]);
+
+    expect(telegramClient.getChatMembership).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not ask about ids that are not a chat id', async () => {
+    service.db.prepare('INSERT INTO channels (channel_id, sync_enabled) VALUES (?, 1)').run('-100123abc');
+    dialogs({ id: IN_DIALOGS });
+    await service.refreshChannelsFromDialogs();
+
+    await service.checkChatsMissingFromDialogs();
+
+    expect(telegramClient.getChatMembership.mock.calls[0][0]).not.toContain('-100123abc');
   });
 
   it('asks after the comparison with the dialog list, and a failed answer changes nothing', async () => {
