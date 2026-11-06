@@ -207,7 +207,7 @@ async function archiveKey(ctx, chat) {
     return chat;
   }
   try {
-    return await ctx.messageSyncService.resolveChatKey(chat);
+    return await ctx.messageSyncService.resolveChatKeyForRead(chat);
   } catch (error) {
     if (error?.code === 'CHAT_NOT_FOUND') {
       return String(chat).trim();

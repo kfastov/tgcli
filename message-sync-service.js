@@ -2517,6 +2517,52 @@ export default class MessageSyncService {
     return id;
   }
 
+  // Reads by username find the chat without Telegram, as the archive did before: by the
+  // username the archive keeps for its chats, then by mtcute's peer cache. Only a username
+  // neither knows goes to Telegram. Writes go through resolveChatKey, which asks Telegram,
+  // since a username changes hands and a stored one can be stale.
+  async resolveChatKeyForRead(chat) {
+    return (await this.findChatKeyLocally(chat)) ?? this.resolveChatKey(chat);
+  }
+
+  // The chat id a username or 'me' names here, or null when nothing local knows it or two
+  // chats here have it and nothing local tells them apart.
+  async findChatKeyLocally(chat) {
+    const key = normalizeChannelKey(chat);
+    if (isChatId(key)) {
+      return key;
+    }
+    const name = key.replace(/^@/, '').trim();
+    const lower = name.toLowerCase();
+    if (!name) {
+      return null;
+    }
+    const storage = this.telegramClient?.client?.storage;
+    if (lower === 'me' || lower === 'self') {
+      const self = await Promise.resolve(storage?.self?.fetch?.()).catch(() => null);
+      return self?.userId ? String(self.userId) : null;
+    }
+    const archived = this.db.prepare(`
+      SELECT channel_id, in_dialogs FROM channels
+      WHERE username IS NOT NULL AND LOWER(username) = ? AND ${chatIdSql()}
+    `).all(lower);
+    if (archived.length === 1) {
+      return archived[0].channel_id;
+    }
+    let cached = null;
+    try {
+      const peer = await storage?.peers?.getByUsername?.(name);
+      cached = peer ? String(getMarkedPeerId(peer)) : null;
+    } catch {
+      cached = null;
+    }
+    if (cached && (!archived.length || archived.some((row) => row.channel_id === cached))) {
+      return cached;
+    }
+    const inDialogs = archived.filter((row) => row.in_dialogs === 1);
+    return inDialogs.length === 1 ? inDialogs[0].channel_id : null;
+  }
+
   _describeResolvedChat(channelId) {
     const peer = this.resolvedPeers.get(channelId);
     if (peer) {

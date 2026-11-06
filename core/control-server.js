@@ -122,11 +122,16 @@ export function createControlRequestHandler({
   let inFlight = 0;
 
   // A chat given by username finds the jobs and chats under its id. These requests
-  // were answered from the archive alone before, so when Telegram does not know the
-  // username, or does not answer, the username itself is looked up as it is.
+  // were answered from the archive alone before, so the archive and the peer cache are
+  // asked first, and when Telegram does not know the username, or does not answer, the
+  // username itself is looked up as it is.
   async function chatKeyForLookup(chat) {
     if (chat === undefined || chat === null || isChatId(chat)) {
       return chat;
+    }
+    const local = await service.findChatKeyLocally(chat);
+    if (local) {
+      return local;
     }
     try {
       if (typeof ensureLogin === 'function') {
