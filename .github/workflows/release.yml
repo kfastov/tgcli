@@ -59,7 +59,7 @@ jobs:
       sha256: ${{ steps.pack.outputs.sha256 }}
       published: ${{ steps.publish.outputs.published }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.TAG }}
       - uses: actions/setup-node@v6
@@ -132,7 +132,7 @@ jobs:
           fi
           echo "TARBALL_URL=$TARBALL_URL" >> "$GITHUB_ENV"
           echo "SHA256=$SHA256" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         if: env.HOMEBREW_TAP_SSH_KEY != ''
         with:
           repository: kfastov/homebrew-tap
