@@ -23,3 +23,15 @@ export function parseDuration(value) {
   if (unit === 'd') return amount * 24 * 60 * 60 * 1000;
   return amount * 1000;
 }
+
+// Unix seconds of an ISO-8601 date (or a Date), or null for none. Throws naming the
+// option the value came in, as `label`.
+export function parseIsoDate(value, label = 'date') {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  const ts = date.getTime();
+  if (Number.isNaN(ts)) {
+    throw new Error(`${label} must be a valid ISO-8601 string`);
+  }
+  return Math.floor(ts / 1000);
+}

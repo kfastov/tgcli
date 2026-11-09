@@ -126,6 +126,15 @@ describe('message archive', () => {
     }
   });
 
+  it('names the chat by its id in a live read of a chat given by username', async () => {
+    const ctx = liveContext();
+    const shown = await OPERATIONS.messagesGet(ctx, { channelId: '@group_chat', messageId: 1, source: 'live' });
+    expect(shown.message.channelId).toBe(CHANNEL_ID);
+    const context = await OPERATIONS.messagesContext(ctx, { channelId: '@group_chat', messageId: 2, source: 'live' });
+    expect([context.target, ...context.before, ...context.after].map((view) => view.channelId))
+      .toEqual([CHANNEL_ID, CHANNEL_ID, CHANNEL_ID, CHANNEL_ID]);
+  });
+
   it('gives a message its reply, album, edit, links and action', () => {
     archive.write(CHANNEL_ID, stored);
     expect(archive.get(CHANNEL_ID, 2)).toMatchObject({

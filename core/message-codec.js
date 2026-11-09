@@ -483,14 +483,30 @@ function decodeFromId(raw) {
   return peerKey(raw.peerId);
 }
 
-function decodeSender(stored) {
+// What a stored message tells of its sender: { id, username, displayName, peerType,
+// isBot }, or null when it tells nothing but, at most, the id.
+export function storedSender(stored) {
+  const id = stored?.from_id;
+  if (!id || id === 'unknown') {
+    return null;
+  }
   const sender = {
-    username: stored?.from_username ?? null,
-    displayName: stored?.from_display_name ?? null,
-    peerType: stored?.from_peer_type ?? null,
-    isBot: typeof stored?.from_is_bot === 'boolean' ? stored.from_is_bot : null,
+    id: String(id),
+    username: stored.from_username ?? null,
+    displayName: stored.from_display_name ?? null,
+    peerType: stored.from_peer_type ?? null,
+    isBot: typeof stored.from_is_bot === 'boolean' ? stored.from_is_bot : null,
   };
-  return Object.values(sender).some((value) => value !== null) ? sender : null;
+  return sender.username || sender.displayName || sender.peerType || sender.isBot !== null ? sender : null;
+}
+
+function decodeSender(stored) {
+  const sender = storedSender(stored);
+  if (!sender) {
+    return null;
+  }
+  const { id, ...rest } = sender;
+  return rest;
 }
 
 function storedFromId(stored) {
@@ -498,30 +514,47 @@ function storedFromId(stored) {
   return fromId && fromId !== 'unknown' ? String(fromId) : null;
 }
 
+// What only a message, not a service message, can hold.
+const NO_CONTENT = {
+  editDate: null,
+  urls: null,
+  forward: null,
+  todo: null,
+  poll: null,
+  groupedId: null,
+  viaBotId: null,
+  postAuthor: null,
+};
+
+function decodeContent(raw, text) {
+  return {
+    editDate: raw.editDate ?? null,
+    urls: extractUrls(text, raw.entities),
+    forward: decodeForward(raw),
+    todo: decodeTodo(raw),
+    poll: decodePoll(raw),
+    groupedId: idString(raw.groupedId),
+    viaBotId: idString(raw.viaBotId),
+    postAuthor: raw.postAuthor ?? null,
+  };
+}
+
 function decodeTl(raw, stored) {
-  const text = raw._ === 'message' ? textOf(raw.message) : '';
+  const isMessage = raw._ === 'message';
+  const text = isMessage ? textOf(raw.message) : '';
   return {
     id: raw.id,
     chatId: peerKey(raw.peerId),
     date: raw.date ?? null,
-    editDate: raw._ === 'message' ? raw.editDate ?? null : null,
     out: Boolean(raw.out),
-    pinned: Boolean(raw.pinned),
-    post: Boolean(raw.post),
     fromId: storedFromId(stored) ?? decodeFromId(raw),
     sender: decodeSender(stored),
     text,
-    urls: raw._ === 'message' ? extractUrls(text, raw.entities) : null,
     topicId: decodeTopicId(raw),
     replyTo: decodeReplyTo(raw),
-    forward: raw._ === 'message' ? decodeForward(raw) : null,
     action: decodeAction(raw),
     media: decodeMedia(raw, stored),
-    todo: raw._ === 'message' ? decodeTodo(raw) : null,
-    poll: raw._ === 'message' ? decodePoll(raw) : null,
-    groupedId: raw._ === 'message' ? idString(raw.groupedId) : null,
-    viaBotId: raw._ === 'message' ? idString(raw.viaBotId) : null,
-    postAuthor: raw._ === 'message' ? raw.postAuthor ?? null : null,
+    ...(isMessage ? decodeContent(raw, text) : NO_CONTENT),
   };
 }
 
@@ -532,24 +565,16 @@ function decodeLegacy(stored) {
     id: Number.isFinite(stored.id) ? stored.id : Number(stored.id ?? 0),
     chatId: stored.peer_id && stored.peer_id !== 'unknown' ? String(stored.peer_id) : null,
     date: Number.isFinite(stored.date) ? stored.date : null,
-    editDate: null,
     out: false,
-    pinned: false,
-    post: false,
     fromId: storedFromId(stored),
     sender: decodeSender(stored),
     text,
-    urls: Array.isArray(stored.urls) && stored.urls.length ? stored.urls : null,
     topicId: stored.topic_id ?? null,
     replyTo: null,
-    forward: null,
     action: null,
     media: stored.media ?? null,
-    todo: null,
-    poll: null,
-    groupedId: null,
-    viaBotId: null,
-    postAuthor: null,
+    ...NO_CONTENT,
+    urls: Array.isArray(stored.urls) && stored.urls.length ? stored.urls : null,
   };
 }
 
@@ -577,18 +602,17 @@ function messageText(message) {
   return '';
 }
 
-// mtcute getters for the sender or the chat throw when a peer is missing from the update.
-function readPeer(message, key) {
+// mtcute getters throw for what an update lacks, such as a peer missing from it.
+function readGetter(object, key) {
   try {
-    return message[key] ?? null;
+    return object[key] ?? null;
   } catch {
     return null;
   }
 }
 
-// describePeer of a message's sender, for writes that have mtcute's peers at hand.
-export function describeSender(message) {
-  return describePeer(readPeer(message, 'sender') ?? readPeer(message, 'from') ?? readPeer(message, 'author'));
+function senderPeer(message) {
+  return readGetter(message, 'sender') ?? readGetter(message, 'from') ?? readGetter(message, 'author');
 }
 
 function fallbackFromId(message) {
@@ -599,32 +623,39 @@ function fallbackFromId(message) {
   return rawFrom ? rawFrom.toString() : 'unknown';
 }
 
-// The stored message of an mtcute Message: what the archive keeps of it and what a live
-// read returns. The sender and the chat come from mtcute's peers, which TL alone lacks.
-export function encodeMessage(message) {
+// An mtcute Message as the archive takes it: the stored message, and describePeer of its
+// sender, which knows more than the stored snapshot (a phone number, a contact flag).
+// The sender and the chat come from mtcute's peers, which TL alone lacks.
+export function encodeForArchive(message) {
   const raw = isTlMessage(message?.raw) ? message.raw : null;
   const decoded = raw ? decodeTl(raw, null) : null;
-  const sender = readPeer(message, 'sender') ?? readPeer(message, 'from') ?? readPeer(message, 'author');
-  const chat = readPeer(message, 'chat');
-  const describedSender = describeSender(message);
+  const peer = senderPeer(message);
+  const sender = describePeer(peer);
+  const chat = readGetter(message, 'chat');
   const text = messageText(message);
-  const id = typeof message.id === 'number' ? message.id : Number(message.id || 0);
 
-  return {
-    id,
+  const stored = {
+    id: typeof message.id === 'number' ? message.id : Number(message.id || 0),
     date: messageDateSeconds(message),
     message: text,
     text,
     urls: decoded?.urls ?? null,
-    from_id: describedSender?.id ?? decoded?.fromId ?? fallbackFromId(message),
-    from_username: describedSender?.username ?? null,
-    from_display_name: describedSender?.displayName ?? null,
-    from_peer_type: sender ? normalizePeerType(sender) : null,
-    from_is_bot: describedSender?.isBot ?? null,
+    from_id: sender?.id ?? decoded?.fromId ?? fallbackFromId(message),
+    from_username: sender?.username ?? null,
+    from_display_name: sender?.displayName ?? null,
+    from_peer_type: peer ? normalizePeerType(peer) : null,
+    from_is_bot: sender?.isBot ?? null,
     peer_type: normalizePeerType(chat),
     peer_id: chat?.id?.toString?.() ?? decoded?.chatId ?? 'unknown',
     topic_id: decoded?.topicId ?? null,
-    media: summarizeMedia(readPeer(message, 'media')),
+    media: summarizeMedia(readGetter(message, 'media')),
     raw: message.raw ?? null,
   };
+  return { stored, sender };
+}
+
+// The stored message of an mtcute Message: what the archive keeps of it and what a live
+// read returns.
+export function encodeMessage(message) {
+  return encodeForArchive(message).stored;
 }

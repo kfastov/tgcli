@@ -6,9 +6,11 @@ import { Message, MtArgumentError, MtPeerNotFoundError, PeersIndex, getMarkedPee
 import { isChatGone, normalizeChannelId } from './telegram-client.js';
 import { resolveStoreDir, resolveStorePaths } from './core/store.js';
 import { parseRequiredWaitSeconds } from './core/send-utils.js';
-import { chatIdForWrite, chatIdSql, chatKey, isChatId } from './core/chat-key.js';
-import MessageArchive, { parseIsoDate } from './core/message-archive.js';
-import { describePeer, describeSender, encodeMessage, normalizePeerType } from './core/message-codec.js';
+import { MAX_MARKED_CHANNEL_ID, chatIdForWrite, chatIdSql, chatKey, isChatId, normalizeTag } from './core/chat-key.js';
+import MessageArchive from './core/message-archive.js';
+import { parseIsoDate } from './core/duration.js';
+import { describePeer, encodeForArchive, normalizePeerType } from './core/message-codec.js';
+import { isoDate } from './core/message-view.js';
 
 const DEFAULT_DB_PATH = resolveStorePaths(resolveStoreDir()).dbPath;
 const DEFAULT_TARGET_MESSAGES = 1000;
@@ -49,7 +51,6 @@ const RETRY_MAX_MS = 60 * 60 * 1000;
 // A username Telegram did not find is asked about again after this long.
 const USERNAME_RECHECK_MS = 24 * 60 * 60 * 1000;
 // Marked channel ids are below this. A text prefix would also match some basic groups.
-const MAX_MARKED_CHANNEL_ID = -1000000000000;
 
 const TAG_RULES = [
   {
@@ -205,10 +206,6 @@ const TAG_RULES = [
   },
 ];
 
-function normalizeChannelKey(channelId) {
-  return chatKey(channelId);
-}
-
 const USERNAME_NOT_FOUND_ERRORS = new Set(['USERNAME_INVALID', 'USERNAME_NOT_OCCUPIED']);
 
 function isChatNotFound(error) {
@@ -255,11 +252,6 @@ function mayLackFullContent(message) {
   return message.raw?.peerId?._ !== 'peerChannel' && !message.raw?.media;
 }
 
-function toIsoString(dateSeconds) {
-  if (!dateSeconds) return null;
-  return new Date(dateSeconds * 1000).toISOString();
-}
-
 function normalizeTagsList(raw) {
   if (!raw) {
     return [];
@@ -295,12 +287,6 @@ function formatContactRow(row) {
     notes: row.notes ?? null,
     tags,
   };
-}
-
-function normalizeTag(tag) {
-  if (!tag) return null;
-  const normalized = String(tag).trim().toLowerCase();
-  return normalized.replace(/\s+/g, ' ');
 }
 
 function buildTagText({ peerTitle, username, about }) {
@@ -1071,7 +1057,7 @@ export default class MessageSyncService {
   }
 
   listChannelTags(channelId, options = {}) {
-    const normalizedId = normalizeChannelKey(channelId);
+    const normalizedId = chatKey(channelId);
     const source = options.source ? String(options.source) : null;
     const rows = this.db.prepare(`
       SELECT tag, source, confidence, created_at, updated_at
@@ -1279,7 +1265,7 @@ export default class MessageSyncService {
   }
 
   getChannelMetadata(channelId) {
-    const normalizedId = normalizeChannelKey(channelId);
+    const normalizedId = chatKey(channelId);
     const row = this.db.prepare(`
       SELECT
         channels.channel_id,
@@ -1312,7 +1298,7 @@ export default class MessageSyncService {
   }
 
   getChannel(channelId) {
-    const normalizedId = normalizeChannelKey(channelId);
+    const normalizedId = chatKey(channelId);
     const row = this.db.prepare(`
       SELECT
         channels.channel_id,
@@ -1370,7 +1356,7 @@ export default class MessageSyncService {
     // writes back under the username after it moved the rest.
     let rows;
     if (channelIds && channelIds.length) {
-      rows = channelIds.map((id) => this._getChannelWithMetadata(normalizeChannelKey(id)))
+      rows = channelIds.map((id) => this._getChannelWithMetadata(chatKey(id)))
         .filter((row) => row && isChatId(row.channel_id));
     } else {
       rows = this.db.prepare(`
@@ -1449,7 +1435,7 @@ export default class MessageSyncService {
 
     let rows;
     if (channelIds && channelIds.length) {
-      rows = channelIds.map((id) => this._getChannelWithMetadata(normalizeChannelKey(id)))
+      rows = channelIds.map((id) => this._getChannelWithMetadata(chatKey(id)))
         .filter((row) => row && isChatId(row.channel_id));
     } else {
       rows = this.db.prepare(`
@@ -1536,7 +1522,7 @@ export default class MessageSyncService {
   addJob(channelId, options = {}) {
     const normalizedId = chatIdForWrite(channelId);
     const target = options.depth && options.depth > 0 ? Number(options.depth) : DEFAULT_TARGET_MESSAGES;
-    const minDate = options.minDate ? parseIsoDate(options.minDate) : null;
+    const minDate = options.minDate ? parseIsoDate(options.minDate, 'minDate') : null;
     const minDateIso = minDate ? new Date(minDate * 1000).toISOString() : null;
 
     // Stays set until a newer sync reaches the newest message, even if this job is canceled
@@ -1595,7 +1581,7 @@ export default class MessageSyncService {
 
   listJobs(options = {}) {
     const status = options.status ? String(options.status) : null;
-    const channelId = options.channelId ? normalizeChannelKey(options.channelId) : null;
+    const channelId = options.channelId ? chatKey(options.channelId) : null;
     const limit = options.limit && options.limit > 0 ? Number(options.limit) : null;
     const clauses = [];
     const params = [];
@@ -1646,7 +1632,7 @@ export default class MessageSyncService {
 
   retryJobs(options = {}) {
     const allErrors = Boolean(options.allErrors);
-    const channelId = options.channelId ? normalizeChannelKey(options.channelId) : null;
+    const channelId = options.channelId ? chatKey(options.channelId) : null;
     const jobId = options.jobId !== undefined && options.jobId !== null ? Number(options.jobId) : null;
 
     if (!allErrors && jobId === null && !channelId) {
@@ -1700,7 +1686,7 @@ export default class MessageSyncService {
   }
 
   cancelJobs(options = {}) {
-    const channelId = options.channelId ? normalizeChannelKey(options.channelId) : null;
+    const channelId = options.channelId ? chatKey(options.channelId) : null;
     const jobId = options.jobId !== undefined && options.jobId !== null ? Number(options.jobId) : null;
 
     if (jobId === null && !channelId) {
@@ -1793,7 +1779,7 @@ export default class MessageSyncService {
   // The one place a chat given by username (or 'me') becomes the key the archive keeps
   // it under, its Telegram id. An id comes back as it is, without asking Telegram.
   async resolveChatKey(chat) {
-    const key = normalizeChannelKey(chat);
+    const key = chatKey(chat);
     if (isChatId(key)) {
       return key;
     }
@@ -1823,7 +1809,7 @@ export default class MessageSyncService {
   // The chat id a username or 'me' names here, or null when nothing local knows it or two
   // chats here have it and nothing local tells them apart.
   async findChatKeyLocally(chat) {
-    const key = normalizeChannelKey(chat);
+    const key = chatKey(chat);
     if (isChatId(key)) {
       return key;
     }
@@ -1901,7 +1887,6 @@ export default class MessageSyncService {
       }
     }
     const checks = new Map(this.db.prepare('SELECT * FROM username_key_checks').all().map((row) => [row.chat_key, row]));
-    const countMessages = this.db.prepare('SELECT COUNT(*) AS n FROM messages WHERE channel_id = ?');
     const findById = this.db.prepare(`
       SELECT channel_id FROM channels
       WHERE username IS NOT NULL AND LOWER(username) = LOWER(?) AND ${chatIdSql()}
@@ -1912,7 +1897,7 @@ export default class MessageSyncService {
       const check = checks.get(key);
       return {
         key,
-        messages: countMessages.get(key).n,
+        messages: this.archive.count(key),
         archivedAs: findById.get(key.replace(/^@/, ''))?.channel_id ?? null,
         lastCheck: check
           ? { outcome: check.outcome, detail: check.detail, checkedAt: new Date(check.checked_at).toISOString() }
@@ -2050,7 +2035,7 @@ export default class MessageSyncService {
   mergeChatKey(key, channelId, peer = null, { peerType = null } = {}) {
     const target = chatIdForWrite(channelId);
     return this.db.transaction(() => {
-      const total = this.db.prepare('SELECT COUNT(*) AS n FROM messages WHERE channel_id = ?').get(key).n;
+      const total = this.archive.count(key);
       const isNewChat = !this._getChannel(target);
       for (const table of ['message_links', 'message_media']) {
         this._copyChatRows(table, key, target, 'AND message_id NOT IN (SELECT message_id FROM messages WHERE channel_id = ?)', [target]);
@@ -2644,8 +2629,8 @@ export default class MessageSyncService {
     const channel = this.db.prepare(`
       SELECT channel_id, sync_enabled FROM channels
       WHERE (channel_id = ? OR (username IS NOT NULL AND LOWER(username) = LOWER(?))) AND ${chatIdSql()}
-    `).get(normalizeChannelKey(key), key.replace(/^@/, ''));
-    if (!channel && this._getChannel(normalizeChannelKey(key))) {
+    `).get(chatKey(key), key.replace(/^@/, ''));
+    if (!channel && this._getChannel(chatKey(key))) {
       throw new Error(`Chat ${key} is still stored under its username, not its Telegram id; \`tgcli doctor\` says why.`);
     }
     if (!channel) {
@@ -2787,7 +2772,7 @@ export default class MessageSyncService {
     this.ownedInProgressJobId = job.id;
 
     try {
-      const channelId = normalizeChannelKey(job.channel_id);
+      const channelId = chatKey(job.channel_id);
       const syncResult = await this._syncNewerMessages(channelId);
       if (this.stopRequested || syncResult.stoppedEarly) {
         this._updateJobStatus(job.id, JOB_STATUS.PENDING);
@@ -3028,7 +3013,7 @@ export default class MessageSyncService {
     }
 
     const idsJumped = this._markGapIfIdsJumped(record.channel_id, message);
-    const messageDate = toIsoString(record.date);
+    const messageDate = isoDate(record.date);
     this._updateChannelCursorsFromUpdate(record.channel_id, {
       lastMessageId: record.message_id,
       lastMessageDate: messageDate,
@@ -3063,7 +3048,8 @@ export default class MessageSyncService {
     return this._markChannelGap(channelId);
   }
 
-  // Returns the written record, or null if the message does not belong in the archive.
+  // Returns where the message went and its date, written or already archived, or null if
+  // the message does not belong in the archive.
   _writeMessage(message, { isEdit }) {
     if (!message?.chat?.id) {
       return null;
@@ -3081,8 +3067,8 @@ export default class MessageSyncService {
       return null;
     }
 
-    const stored = encodeMessage(message);
-    this.archive.write(channelId, [stored], { replace: isEdit, senders: [describeSender(message)] });
+    const { stored, sender } = encodeForArchive(message);
+    this.archive.write(channelId, [stored], { replace: isEdit, senders: [sender] });
     return { channel_id: channelId, message_id: stored.id, date: stored.date };
   }
 
@@ -3159,7 +3145,7 @@ export default class MessageSyncService {
     const ids = update.messageIds;
 
     if (update.channelId) {
-      const channelId = normalizeChannelKey(update.channelId);
+      const channelId = chatKey(update.channelId);
       this.archive.deleteChannelMessages(channelId, ids);
       // Telegram pushes a delete with a real ptsCount, and no message named that way has stayed.
       // Only differences, always with ptsCount 0, have named messages that turned out real.
@@ -3196,7 +3182,7 @@ export default class MessageSyncService {
         continue;
       }
       const message = new Message(rawMessage, peers);
-      const channelKey = String(message.chat?.id ?? normalizeChannelKey(channelId));
+      const channelKey = String(message.chat?.id ?? chatKey(channelId));
       batchChannelId = batchChannelId ?? channelKey;
 
       const channelRow = this._ensureChannelFromPeer(channelKey, message.chat);
@@ -3205,11 +3191,11 @@ export default class MessageSyncService {
         continue;
       }
 
-      const serialized = encodeMessage(message);
+      const { stored: serialized, sender } = encodeForArchive(message);
       stored.push(serialized);
-      senders.push(describeSender(message));
+      senders.push(sender);
 
-      const messageDateIso = toIsoString(serialized.date);
+      const messageDateIso = isoDate(serialized.date);
       if (Number.isFinite(serialized.id)) {
         if (!latestMessageId || serialized.id > latestMessageId) {
           latestMessageId = serialized.id;
@@ -3410,7 +3396,7 @@ export default class MessageSyncService {
   }
 
   async _syncNewerMessages(channelId) {
-    const normalizedId = normalizeChannelKey(channelId);
+    const normalizedId = chatKey(channelId);
     const channel = this._getChannel(normalizedId);
     if (!channel || channel.sync_enabled !== 1) {
       return { hasMoreNewer: false, stoppedEarly: false };
@@ -3467,9 +3453,9 @@ export default class MessageSyncService {
 
       this._updateChannelCursors(normalizedId, {
         lastMessageId: newest.id,
-        lastMessageDate: toIsoString(newest.date),
+        lastMessageDate: isoDate(newest.date),
         oldestMessageId: oldest.id,
-        oldestMessageDate: toIsoString(oldest.date),
+        oldestMessageDate: isoDate(oldest.date),
       });
 
       hasMoreNewer = newMessages.length >= this.batchSize;
@@ -3541,10 +3527,10 @@ export default class MessageSyncService {
       };
     }
 
-    const channelId = normalizeChannelKey(job.channel_id);
+    const channelId = chatKey(job.channel_id);
     const channel = this._getChannel(channelId);
     const peer = await this.telegramClient.client.resolvePeer(normalizeChannelId(channelId));
-    const minDateSeconds = job.backfill_min_date ? parseIsoDate(job.backfill_min_date) : null;
+    const minDateSeconds = job.backfill_min_date ? parseIsoDate(job.backfill_min_date, 'minDate') : null;
 
     let total = currentCount;
     let currentOldestId = channel?.oldest_message_id ?? null;
@@ -3591,19 +3577,19 @@ export default class MessageSyncService {
           stoppedEarly = true;
           break;
         }
-        const serialized = encodeMessage(message);
+        const { stored: serialized, sender } = encodeForArchive(message);
         if (minDateSeconds && serialized.date && serialized.date < minDateSeconds) {
           stopDueToDate = true;
           break;
         }
 
         stored.push(serialized);
-        senders.push(describeSender(message));
+        senders.push(sender);
 
         if (!lowestIdInChunk || serialized.id < lowestIdInChunk) {
           lowestIdInChunk = serialized.id;
           lowestDateSecondsInChunk = serialized.date ?? null;
-          lowestDateInChunk = toIsoString(serialized.date);
+          lowestDateInChunk = isoDate(serialized.date);
         }
       }
 
@@ -3639,7 +3625,7 @@ export default class MessageSyncService {
         messageCount: this.archive.count(channelId),
         cursorMessageId: nextOffsetId ?? null,
         cursorMessageDate: Number.isFinite(nextOffsetDate) && nextOffsetDate > 0
-          ? toIsoString(nextOffsetDate)
+          ? isoDate(nextOffsetDate)
           : null,
       });
 
@@ -3672,7 +3658,7 @@ export default class MessageSyncService {
       insertedCount,
       cursorMessageId: nextOffsetId ?? job.cursor_message_id ?? null,
       cursorMessageDate: Number.isFinite(nextOffsetDate) && nextOffsetDate > 0
-        ? toIsoString(nextOffsetDate)
+        ? isoDate(nextOffsetDate)
         : job.cursor_message_date ?? null,
       stoppedEarly,
     };

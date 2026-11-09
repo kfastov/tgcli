@@ -130,9 +130,14 @@ function filterMessagesById(messages, beforeId, afterId) {
 }
 
 // The message view of a stored message a live read returned, the same projection the
-// archive gives its rows. chat: { channelId, peerTitle, username }.
+// archive gives its rows. chat: { channelId, peerTitle, username }; the message's own
+// chat id wins over channelId, which is what the caller typed and may be a username.
 function liveMessageView(stored, chat) {
-  return { ...toMessageView(decodeMessage(stored), { chat }), source: 'live' };
+  const message = decodeMessage(stored);
+  return {
+    ...toMessageView(message, { chat: { ...chat, channelId: message.chatId ?? chat.channelId } }),
+    source: 'live',
+  };
 }
 
 function messageDateMs(message) {

@@ -2,7 +2,7 @@
 // for live and archive reads alike. It is the one projection of the canonical message
 // (core/message-codec.js), so a message reads the same whichever source it came from.
 
-function isoDate(seconds) {
+export function isoDate(seconds) {
   return Number.isFinite(seconds) && seconds > 0 ? new Date(seconds * 1000).toISOString() : null;
 }
 

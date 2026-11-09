@@ -16,6 +16,9 @@ import { nodeReadableToFuman } from '@fuman/node';
 import { resolveStoreDir, resolveStorePaths } from './core/store.js';
 import { encodeMessage, normalizeMediaText, normalizePeerType, summarizeMedia } from './core/message-codec.js';
 
+// Part of what this module exported before the codec took it over.
+export { summarizeMedia };
+
 // How long a session Telegram confirmed is taken as logged in without asking again.
 const AUTH_CHECK_TTL_MS = 5 * 60 * 1000;
 

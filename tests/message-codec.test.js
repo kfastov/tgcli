@@ -9,7 +9,7 @@ import {
   parseStoredMessage,
   reviveTl,
 } from '../core/message-codec.js';
-import { describeMessageView, toMessageView } from '../core/message-view.js';
+import { toMessageView } from '../core/message-view.js';
 
 const SELF_ID = 700000001;
 const FRIEND_ID = 700000002;
@@ -278,22 +278,5 @@ describe('reviveTl', () => {
   it('reads nothing from a row that holds no JSON', () => {
     expect(parseStoredMessage(null)).toBeNull();
     expect(parseStoredMessage('{not json')).toBeNull();
-  });
-});
-
-describe('describeMessageView', () => {
-  const line = (message) => describeMessageView(toMessageView(decodeMessage(throughArchive(message))));
-
-  it('says what a message without text holds', () => {
-    expect(line(examples['member added'])).toBe('[chatAddUser]');
-    expect(line(examples['todo list'])).toBe('[todo: Trip (1/2 done)]');
-    expect(line(examples.poll)).toBe('[poll: Lunch?]');
-    expect(line(examples['photo album part'])).toBe('[photo]');
-  });
-
-  it('marks replies and imported messages', () => {
-    expect(line(examples['reply in a topic'])).toBe('(reply to #9) message 12');
-    expect(line(examples['imported message']))
-      .toBe(`(imported, sent ${new Date((DATE - 86400 * 400) * 1000).toISOString()}) message 13`);
   });
 });

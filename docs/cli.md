@@ -275,11 +275,12 @@ Telegram or from the archive alike (only `source` tells them apart):
 - `fromId`, `fromUsername`, `fromDisplayName`, `fromPeerType`, `fromIsBot` — the sender.
 - `text`, `urls` (from the message's links), `media` (type, file id, name, size…).
 - `topicId` — the forum topic, or the thread of a channel post a comment belongs to.
-- `replyTo` — `{ messageId, topId, chatId, quote }` of the message this one answers, or null.
-  In a forum a message that only sits in a topic answers nothing.
+- `replyTo` — `{ messageId, topId, chatId, storyId, quote }` of the message (or story) this
+  one answers, or null. In a forum a message that only sits in a topic answers nothing.
+  `chatId` is set when the answered message is in another chat.
 - `forward` — `{ date, fromId, fromName, messageId, postAuthor, imported }`. For a message
   imported from another app, `imported` is true and `date` is when it was first sent;
-  the message's own `date` is the day of the import.
+  the message's own `date` is the day of the import, and `--after`/`--before` go by it.
 - `action` — what a service message did, named after Telegram's action without its
   `messageAction` prefix: `{ type: "chatAddUser", users: ["…"] }`, `{ type: "pinMessage" }`…
 - `todo` — `{ title, othersCanAppend, othersCanComplete, items: [{ id, text, completedBy, completedAt }] }`.

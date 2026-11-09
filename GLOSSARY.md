@@ -43,4 +43,5 @@ the day of the import; `forward.date` is when it was first sent.
 **Message archive** — the tables that hold messages (`messages`, `message_links`,
 `message_media`, the FTS index `message_search`) with one write path and one read
 projection (`core/message-archive.js`). The sync service decides what to write and when;
-the archive decides how it is kept and read back.
+the archive decides how it is kept and read back. Moving a chat from a username key to
+its id moves these rows along with every other chat-keyed table.

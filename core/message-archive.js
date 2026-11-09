@@ -7,9 +7,10 @@
 // reader sees is whatever the codec makes of the stored TL today, the same message view
 // a live read of the message returns.
 
-import { chatIdForWrite, chatKey } from './chat-key.js';
-import { decodeMessage, parseStoredMessage } from './message-codec.js';
-import { toMessageView } from './message-view.js';
+import { MAX_MARKED_CHANNEL_ID, chatIdForWrite, chatKey, normalizeTag } from './chat-key.js';
+import { parseIsoDate } from './duration.js';
+import { decodeMessage, parseStoredMessage, storedSender } from './message-codec.js';
+import { isoDate, toMessageView } from './message-view.js';
 
 const SEARCH_INDEX_VERSION = 2;
 const MEDIA_INDEX_VERSION = 1;
@@ -17,8 +18,6 @@ const URL_PATTERN = /https?:\/\/[^\s<>"')]+/giu;
 const FILE_NAME_PATTERN = /\b[\w.\-]+\.[a-z0-9]{2,7}\b/iu;
 const MAX_FILENAME_SCAN_DEPTH = 5;
 const BACKFILL_BATCH_SIZE = 500;
-// Marked ids of channels and supergroups lie at and below this one.
-const MAX_MARKED_CHANNEL_ID = -1000000000000;
 // What SQLite says of a MATCH it cannot parse as FTS5 query syntax.
 const FTS_SYNTAX_ERROR = /fts5|syntax error|no such column|unterminated string|unknown special query/i;
 
@@ -41,16 +40,6 @@ const VIEW_JOINS = `
   LEFT JOIN channels ON channels.channel_id = messages.channel_id
   LEFT JOIN users ON users.user_id = messages.from_id
 `;
-
-export function parseIsoDate(value) {
-  if (!value) return null;
-  const date = value instanceof Date ? value : new Date(value);
-  const ts = date.getTime();
-  if (Number.isNaN(ts)) {
-    throw new Error('minDate must be a valid ISO-8601 string');
-  }
-  return Math.floor(ts / 1000);
-}
 
 // --- search fields ---
 
@@ -186,22 +175,6 @@ function userRow(peer) {
   };
 }
 
-// What a stored message tells of its sender, or null when it tells nothing.
-function senderOfStored(stored) {
-  const id = stored?.from_id;
-  if (!id || id === 'unknown') {
-    return null;
-  }
-  const peer = {
-    id: String(id),
-    peerType: stored.from_peer_type ?? null,
-    username: stored.from_username ?? null,
-    displayName: stored.from_display_name ?? null,
-    isBot: typeof stored.from_is_bot === 'boolean' ? stored.from_is_bot : null,
-  };
-  return peer.peerType || peer.username || peer.displayName || peer.isBot !== null ? peer : null;
-}
-
 // --- reads ---
 
 function quoteFtsQuery(query) {
@@ -260,11 +233,11 @@ function filterClauses(filters) {
   }
   if (filters.fromDate) {
     clauses.push('messages.date >= ?');
-    params.push(parseIsoDate(filters.fromDate));
+    params.push(parseIsoDate(filters.fromDate, 'fromDate'));
   }
   if (filters.toDate) {
     clauses.push('messages.date <= ?');
-    params.push(parseIsoDate(filters.toDate));
+    params.push(parseIsoDate(filters.toDate, 'toDate'));
   }
   if (Number.isFinite(filters.beforeId) && filters.beforeId > 0) {
     clauses.push('messages.message_id < ?');
@@ -573,7 +546,7 @@ export default class MessageArchive {
     const key = chatIdForWrite(chatId);
     const users = new Map();
     for (const stored of messages) {
-      const sender = senderOfStored(stored);
+      const sender = storedSender(stored);
       if (sender) {
         users.set(sender.id, sender);
       }
@@ -711,9 +684,7 @@ export default class MessageArchive {
   search(options = {}) {
     const query = typeof options.query === 'string' ? options.query.trim() : '';
     const regexText = typeof options.regex === 'string' ? options.regex.trim() : '';
-    const tags = asList(options.tags ?? options.tag)
-      .map((tag) => String(tag).trim().toLowerCase().replace(/\s+/g, ' '))
-      .filter(Boolean);
+    const tags = asList(options.tags ?? options.tag).map(normalizeTag).filter(Boolean);
     const limit = options.limit && options.limit > 0 ? Number(options.limit) : 100;
     const caseInsensitive = options.caseInsensitive !== false;
 
@@ -793,13 +764,12 @@ export default class MessageArchive {
              MIN(date) AS oldestDate, MAX(date) AS newestDate
       FROM messages WHERE channel_id = ?
     `).get(chatKey(chatId));
-    const iso = (seconds) => (seconds ? new Date(seconds * 1000).toISOString() : null);
     return {
       total: summary.total || 0,
       oldestMessageId: summary.oldestMessageId || null,
       newestMessageId: summary.newestMessageId || null,
-      oldestDate: iso(summary.oldestDate),
-      newestDate: iso(summary.newestDate),
+      oldestDate: isoDate(summary.oldestDate),
+      newestDate: isoDate(summary.newestDate),
     };
   }
 
