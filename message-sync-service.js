@@ -9,7 +9,13 @@ import { parseRequiredWaitSeconds } from './core/send-utils.js';
 import { MAX_MARKED_CHANNEL_ID, chatIdForWrite, chatIdSql, chatKey, isChatId, normalizeTag } from './core/chat-key.js';
 import MessageArchive from './core/message-archive.js';
 import { parseIsoDate } from './core/duration.js';
-import { describePeer, encodeForArchive, normalizePeerType } from './core/message-codec.js';
+import {
+  describePeer,
+  encodeForArchive,
+  isChannelMessage,
+  mayLackFullContent,
+  normalizePeerType,
+} from './core/message-codec.js';
 import { isoDate } from './core/message-view.js';
 
 const DEFAULT_DB_PATH = resolveStorePaths(resolveStoreDir()).dbPath;
@@ -50,8 +56,6 @@ const REPAIR_PAGE_DELAY_MS = 1000;
 const RETRY_MAX_MS = 60 * 60 * 1000;
 // A username Telegram did not find is asked about again after this long.
 const USERNAME_RECHECK_MS = 24 * 60 * 60 * 1000;
-// Marked channel ids are below this. A text prefix would also match some basic groups.
-
 const TAG_RULES = [
   {
     tag: 'ai',
@@ -245,12 +249,6 @@ function isRefusedRead(error) {
   return (code >= 400 && code < 500 && code !== 401) || error instanceof MtPeerNotFoundError;
 }
 
-// mtcute builds the message of an updateShortSentMessage from the response alone,
-// which has no reply header and no link preview. Telegram answers that way only to
-// text sent outside channels, so any such send may need a full copy afterwards.
-function mayLackFullContent(message) {
-  return message.raw?.peerId?._ !== 'peerChannel' && !message.raw?.media;
-}
 
 function normalizeTagsList(raw) {
   if (!raw) {
@@ -2150,20 +2148,7 @@ export default class MessageSyncService {
   // The chats the messages under a key came from, by id with their peer type, and how
   // many of the messages say at all.
   _chatsOfMessages(key) {
-    const rows = this.db.prepare(`
-      SELECT type, id, COUNT(*) AS n FROM (
-        SELECT
-          CASE WHEN json_valid(raw_json) THEN json_extract(raw_json, '$.raw.peerId._') END AS type,
-          CASE WHEN json_valid(raw_json) THEN COALESCE(
-            json_extract(raw_json, '$.raw.peerId.userId'),
-            json_extract(raw_json, '$.raw.peerId.chatId'),
-            json_extract(raw_json, '$.raw.peerId.channelId')
-          ) END AS id
-        FROM messages
-        WHERE channel_id = ?
-      )
-      GROUP BY type, id
-    `).all(key);
+    const rows = this.archive.countByPeer(key);
     const types = { peerUser: 'user', peerChat: 'chat', peerChannel: 'channel' };
     const result = { total: 0, withPeer: 0, chats: new Map() };
     for (const row of rows) {
@@ -3031,7 +3016,7 @@ export default class MessageSyncService {
   // they have no channel difference to fail. A held cursor stays below the message, so
   // whatever holds it will find the same messages.
   _markGapIfIdsJumped(channelId, message) {
-    if (message.raw?.peerId?._ !== 'peerChannel') {
+    if (!isChannelMessage(message)) {
       return false;
     }
     const channel = this._getChannel(channelId);

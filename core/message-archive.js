@@ -177,11 +177,26 @@ function userRow(peer) {
 
 // --- reads ---
 
-function quoteFtsQuery(query) {
-  return query
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((term) => `"${term.replace(/"/g, '""')}"`)
+const FTS_OPERATORS = new Set(['AND', 'OR', 'NOT']);
+
+function quoteFtsTerm(term) {
+  const prefix = term.length > 1 && term.endsWith('*');
+  const word = prefix ? term.slice(0, -1) : term;
+  return `"${word.replace(/"/g, '""')}"${prefix ? '*' : ''}`;
+}
+
+// Each word quoted as a phrase, so punctuation inside it is no syntax. With keepOperators,
+// AND, OR and NOT between two words and a trailing * stay what they mean in FTS5.
+function quoteFtsQuery(query, { keepOperators = false } = {}) {
+  const terms = query.split(/\s+/).filter(Boolean);
+  return terms
+    .map((term, index) => {
+      const between = index > 0 && index < terms.length - 1;
+      if (keepOperators && between && FTS_OPERATORS.has(term)) {
+        return term;
+      }
+      return keepOperators ? quoteFtsTerm(term) : `"${term.replace(/"/g, '""')}"`;
+    })
     .join(' ');
 }
 
@@ -263,7 +278,8 @@ export default class MessageArchive {
   }
 
   // Creates the message tables, brings the FTS index up to date and prepares the
-  // statements. The users and channels tables, which reads join, are the caller's.
+  // statements. The users and channels tables, which reads join, are the caller's to
+  // create; the archive keeps the senders of what it writes in users.
   init() {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS messages (
@@ -473,9 +489,7 @@ export default class MessageArchive {
     this.updateTopicTextStmt = this.db.prepare('UPDATE messages SET topic = ? WHERE channel_id = ? AND topic_id = ?');
 
     this.writeTx = this.db.transaction((records, users, replace) => {
-      for (const user of users) {
-        this.upsertUserStmt.run(userRow(user));
-      }
+      this.upsertUsersTx(users);
       const statement = replace ? this.upsertMessageStmt : this.insertMessageStmt;
       let written = 0;
       for (const { row, linkEntries, media } of records) {
@@ -514,7 +528,7 @@ export default class MessageArchive {
         raw_json: JSON.stringify(stored),
       },
       linkEntries: fields.linkEntries,
-      media: buildMediaRow(stored.media),
+      media: buildMediaRow(stored.media ?? (stored.raw?.media ? decodeMessage(stored)?.media : null)),
     };
   }
 
@@ -679,8 +693,9 @@ export default class MessageArchive {
     };
   }
 
-  // Full-text search, by FTS5 query syntax when the query parses as one and by its words
-  // as plain text when it does not, as "UTF-8" or "C++" would not.
+  // Full-text search, by FTS5 query syntax when the query parses as one. One that does
+  // not, as "UTF-8 OR utf8" or "C++" would not, is searched by its words as phrases,
+  // keeping AND, OR, NOT and a trailing * if that parses, and without them if not.
   search(options = {}) {
     const query = typeof options.query === 'string' ? options.query.trim() : '';
     const regexText = typeof options.regex === 'string' ? options.regex.trim() : '';
@@ -722,14 +737,20 @@ export default class MessageArchive {
       `).all(...(match ? [match] : []), ...params, preLimit);
     };
 
+    // Each try falls to the next only on a query FTS5 cannot parse.
+    const tries = query
+      ? [query, quoteFtsQuery(query, { keepOperators: true }), quoteFtsQuery(query)]
+      : [null];
     let rows;
-    try {
-      rows = run(query || null);
-    } catch (error) {
-      if (!query || !FTS_SYNTAX_ERROR.test(error?.message ?? '')) {
-        throw error;
+    for (const [index, match] of tries.entries()) {
+      try {
+        rows = run(match);
+        break;
+      } catch (error) {
+        if (index === tries.length - 1 || !FTS_SYNTAX_ERROR.test(error?.message ?? '')) {
+          throw error;
+        }
       }
-      rows = run(quoteFtsQuery(query));
     }
 
     let results = rows.map(viewOfRow);
@@ -741,6 +762,26 @@ export default class MessageArchive {
 
   count(chatId) {
     return this.db.prepare('SELECT COUNT(*) AS n FROM messages WHERE channel_id = ?').get(chatKey(chatId)).n;
+  }
+
+  // How many messages under a key name each chat in their TL: rows of { type, id, n },
+  // type and id null for a row whose raw_json says nothing. Moving a chat off a username
+  // key goes by it.
+  countByPeer(key) {
+    return this.db.prepare(`
+      SELECT type, id, COUNT(*) AS n FROM (
+        SELECT
+          CASE WHEN json_valid(raw_json) THEN json_extract(raw_json, '$.raw.peerId._') END AS type,
+          CASE WHEN json_valid(raw_json) THEN COALESCE(
+            json_extract(raw_json, '$.raw.peerId.userId'),
+            json_extract(raw_json, '$.raw.peerId.chatId'),
+            json_extract(raw_json, '$.raw.peerId.channelId')
+          ) END AS id
+        FROM messages
+        WHERE channel_id = ?
+      )
+      GROUP BY type, id
+    `).all(key);
   }
 
   // How many of these ids the archive holds for the chat.

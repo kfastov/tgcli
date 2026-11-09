@@ -98,6 +98,10 @@ describe('message archive', () => {
           after: stored.filter((entry) => entry.id > id),
         })),
         getPeerMetadata: vi.fn(async () => ({ peerTitle: 'Group', username: 'group_chat' })),
+        searchChannelMessages: vi.fn(async (_chat, { query }) => ({
+          peerTitle: 'Group',
+          messages: [...stored].reverse().filter((entry) => entry.text.includes(query)),
+        })),
       },
     };
   }
@@ -118,6 +122,11 @@ describe('message archive', () => {
       const fromArchive = await OPERATIONS.messagesGet(ctx, { channelId: CHANNEL_ID, messageId: id, source: 'archive' });
       expect(withoutSource(fromArchive.message)).toEqual(withoutSource(fromTelegram.message));
     }
+
+    const liveSearch = await OPERATIONS.messagesSearch(ctx, { channelIds: [CHANNEL_ID], query: 'photo', source: 'live' });
+    const archiveSearch = await OPERATIONS.messagesSearch(ctx, { channelIds: [CHANNEL_ID], query: 'photo', source: 'archive' });
+    expect(archiveSearch.messages.map(withoutSource)).toEqual(liveSearch.messages.map(withoutSource));
+    expect(archiveSearch.messages).toHaveLength(1);
 
     const liveContextResult = await OPERATIONS.messagesContext(ctx, { channelId: CHANNEL_ID, messageId: 2, source: 'live' });
     const archiveContextResult = await OPERATIONS.messagesContext(ctx, { channelId: CHANNEL_ID, messageId: 2, source: 'archive' });
@@ -194,6 +203,14 @@ describe('message archive', () => {
     archive.write(CHANNEL_ID, stored);
     expect(archive.search({ query: 'UTF-8' }).map((view) => view.messageId)).toEqual([1]);
     expect(archive.search({ query: 'example.org' }).map((view) => view.messageId)).toEqual([2]);
+  });
+
+  it('keeps AND, OR, NOT and a trailing * around words that are not FTS5 syntax', () => {
+    archive.write(CHANNEL_ID, stored);
+    expect(archive.search({ query: 'UTF-8 OR example.org' }).map((view) => view.messageId).sort()).toEqual([1, 2]);
+    expect(archive.search({ query: 'UTF-8 NOT encoding' })).toEqual([]);
+    expect(archive.search({ query: 'example.or*' }).map((view) => view.messageId)).toEqual([2]);
+    expect(archive.search({ query: 'OR (' })).toEqual([]);
   });
 
   it('still takes FTS5 syntax that parses', () => {

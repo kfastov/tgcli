@@ -20,7 +20,7 @@ every case but nine polls, which need peers and are decoded by the codec itself.
 
 ## Decision
 
-- `core/message-codec.js` is the only module that reads TL messages. `encodeMessage` turns
+- `core/message-codec.js` is the only module that decodes TL messages. `encodeMessage` turns
   an mtcute message into the **stored message** the archive keeps (the same keys as
   before, so older and newer versions read each other's rows). `decodeMessage` turns a
   stored message, live or parsed back from `raw_json`, into the **canonical message**.
@@ -31,7 +31,9 @@ every case but nine polls, which need peers and are decoded by the codec itself.
   (one transaction with its senders) and the one read projection. Moving a chat from a
   username key to its id (`mergeChatKey`, `dropChatKey` in the sync service) still copies
   and deletes rows of these tables itself, as it does for every chat-keyed table; it moves
-  rows as they are and never builds or reads a message.
+  rows as they are. The chat each row's TL names, which that move goes by, is read in SQL
+  by the archive (`countByPeer`), the one place outside the codec that knows where TL sits
+  in `raw_json`.
 - Archive reads decode `raw_json` on every read instead of storing derived columns. A new
   field is a codec change, and every archived message has it at once, without a migration
   or a refetch. Columns stay only for what SQL filters or indexes: `date`, `topic_id`,
@@ -41,7 +43,9 @@ every case but nine polls, which need peers and are decoded by the codec itself.
 ## Consequences
 
 - Live and archive reads of a message return the same JSON, apart from `source`; a test
-  holds them to it.
+  holds them to it. The one known gap is the sender's name and username: archive reads
+  take them from the users table, which keeps the latest tgcli has seen (and a username
+  the user has since dropped), live reads from the message's own snapshot.
 - Archive reads parse `raw_json` for the rows they return: a read of one message took
   0.060 ms against 0.039 ms before, measured over 34260 messages copied from
   a real archive.

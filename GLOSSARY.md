@@ -10,7 +10,7 @@ for private chats). A username is resolved to the id before anything is written
 ## Messages
 
 A message lives in three forms; `core/message-codec.js` is the only module that turns
-one into another, and the only one that reads Telegram's TL.
+one into another, and the only one that decodes Telegram's TL.
 
 **Stored message** — what the archive keeps of a message in `messages.raw_json`, and what
 the live reads of `telegram-client.js` return: the whole TL message under `raw`, a
@@ -32,8 +32,8 @@ from `source`.
 topic points at the topic's first message; only one that also names the topic answers a
 message of its own.
 
-**Topic** — the forum topic a message is in, or the thread of a channel post that a
-comment in the discussion group belongs to (`topicId`).
+**Topic** — the forum topic a message is in, or the thread of a channel post that an
+answer to a comment in the discussion group belongs to (`topicId`).
 
 **Imported message** — a message imported into Telegram from another app. Its `date` is
 the day of the import; `forward.date` is when it was first sent.

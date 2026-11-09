@@ -15,8 +15,10 @@
 import { Long, _messageMediaFromTl, getMarkedPeerId } from '@mtcute/core';
 
 const PEER_CONSTRUCTORS = new Set(['peerUser', 'peerChat', 'peerChannel']);
-// Keys of a service action that hold user ids, which tgcli writes as strings everywhere.
+// Keys of a service action that hold user ids, which tgcli writes as strings everywhere,
+// and keys that hold bare ids of a channel or a basic group, written as archive keys.
 const USER_ID_KEYS = new Set(['users', 'userId', 'inviterId']);
+const CHAT_ID_KEYS = { channelId: 'peerChannel', chatId: 'peerChat' };
 // Keys of a service action that are noise or secrets in JSON.
 const DROPPED_ACTION_KEYS = new Set(['accessHash', 'fileReference', 'bytes', 'sizes', 'videoSizes', 'stripped']);
 const MAX_ACTION_DEPTH = 3;
@@ -173,18 +175,6 @@ function normalizeMediaNumber(value) {
   return null;
 }
 
-// mtcute media getters throw for what a file lacks, such as the file id of a poll.
-function readMediaProperty(media, prop) {
-  if (!media) {
-    return null;
-  }
-  try {
-    return media[prop];
-  } catch {
-    return null;
-  }
-}
-
 function buildWebpageExtras(media) {
   if (!media || media.type !== 'webpage' || !media.preview) {
     return null;
@@ -225,14 +215,14 @@ export function summarizeMedia(media) {
 
   const summary = {
     type,
-    fileId: normalizeMediaText(readMediaProperty(media, 'fileId') ?? media.file_id),
-    uniqueFileId: normalizeMediaText(readMediaProperty(media, 'uniqueFileId') ?? media.unique_file_id),
-    fileName: normalizeMediaText(readMediaProperty(media, 'fileName') ?? media.file_name),
-    mimeType: normalizeMediaText(readMediaProperty(media, 'mimeType') ?? media.mime_type),
-    fileSize: normalizeMediaNumber(readMediaProperty(media, 'fileSize') ?? media.file_size),
-    width: normalizeMediaNumber(readMediaProperty(media, 'width') ?? media.width),
-    height: normalizeMediaNumber(readMediaProperty(media, 'height') ?? media.height),
-    duration: normalizeMediaNumber(readMediaProperty(media, 'duration') ?? media.duration),
+    fileId: normalizeMediaText(readGetter(media, 'fileId') ?? media.file_id),
+    uniqueFileId: normalizeMediaText(readGetter(media, 'uniqueFileId') ?? media.unique_file_id),
+    fileName: normalizeMediaText(readGetter(media, 'fileName') ?? media.file_name),
+    mimeType: normalizeMediaText(readGetter(media, 'mimeType') ?? media.mime_type),
+    fileSize: normalizeMediaNumber(readGetter(media, 'fileSize') ?? media.file_size),
+    width: normalizeMediaNumber(readGetter(media, 'width') ?? media.width),
+    height: normalizeMediaNumber(readGetter(media, 'height') ?? media.height),
+    duration: normalizeMediaNumber(readGetter(media, 'duration') ?? media.duration),
     extras: null,
   };
 
@@ -386,7 +376,13 @@ function actionValue(key, value, depth) {
   if (typeof value === 'object') {
     return undefined;
   }
-  return USER_ID_KEYS.has(key) && typeof value === 'number' ? String(value) : value;
+  if (typeof value === 'number' && USER_ID_KEYS.has(key)) {
+    return String(value);
+  }
+  if (typeof value === 'number' && CHAT_ID_KEYS[key]) {
+    return peerKey({ _: CHAT_ID_KEYS[key], [key]: value }) ?? value;
+  }
+  return value;
 }
 
 function actionObject(tl, depth) {
@@ -486,12 +482,12 @@ function decodeFromId(raw) {
 // What a stored message tells of its sender: { id, username, displayName, peerType,
 // isBot }, or null when it tells nothing but, at most, the id.
 export function storedSender(stored) {
-  const id = stored?.from_id;
-  if (!id || id === 'unknown') {
+  const id = storedFromId(stored);
+  if (!id) {
     return null;
   }
   const sender = {
-    id: String(id),
+    id,
     username: stored.from_username ?? null,
     displayName: stored.from_display_name ?? null,
     peerType: stored.from_peer_type ?? null,
@@ -565,7 +561,7 @@ function decodeLegacy(stored) {
     id: Number.isFinite(stored.id) ? stored.id : Number(stored.id ?? 0),
     chatId: stored.peer_id && stored.peer_id !== 'unknown' ? String(stored.peer_id) : null,
     date: Number.isFinite(stored.date) ? stored.date : null,
-    out: false,
+    out: null,
     fromId: storedFromId(stored),
     sender: decodeSender(stored),
     text,
@@ -586,6 +582,20 @@ export function decodeMessage(stored) {
   return isTlMessage(stored.raw) ? decodeTl(stored.raw, stored) : decodeLegacy(stored);
 }
 
+// --- routing ---
+
+// Whether an mtcute message is in a channel or supergroup, whose ids run in sequence.
+export function isChannelMessage(message) {
+  return message?.raw?.peerId?._ === 'peerChannel';
+}
+
+// mtcute builds the message of an updateShortSentMessage from the response alone,
+// which has no reply header and no link preview. Telegram answers that way only to
+// text sent outside channels, so any such send may need a full copy afterwards.
+export function mayLackFullContent(message) {
+  return !isChannelMessage(message) && !message?.raw?.media;
+}
+
 // --- encoding ---
 
 function messageDateSeconds(message) {
@@ -602,7 +612,8 @@ function messageText(message) {
   return '';
 }
 
-// mtcute getters throw for what an update lacks, such as a peer missing from it.
+// mtcute getters throw for what an object lacks: a peer missing from an update, the file
+// id of a poll.
 function readGetter(object, key) {
   try {
     return object[key] ?? null;
@@ -628,7 +639,6 @@ function fallbackFromId(message) {
 // The sender and the chat come from mtcute's peers, which TL alone lacks.
 export function encodeForArchive(message) {
   const raw = isTlMessage(message?.raw) ? message.raw : null;
-  const decoded = raw ? decodeTl(raw, null) : null;
   const peer = senderPeer(message);
   const sender = describePeer(peer);
   const chat = readGetter(message, 'chat');
@@ -639,15 +649,15 @@ export function encodeForArchive(message) {
     date: messageDateSeconds(message),
     message: text,
     text,
-    urls: decoded?.urls ?? null,
-    from_id: sender?.id ?? decoded?.fromId ?? fallbackFromId(message),
+    urls: raw?._ === 'message' ? extractUrls(textOf(raw.message), raw.entities) : null,
+    from_id: sender?.id ?? (raw ? decodeFromId(raw) : null) ?? fallbackFromId(message),
     from_username: sender?.username ?? null,
     from_display_name: sender?.displayName ?? null,
     from_peer_type: peer ? normalizePeerType(peer) : null,
     from_is_bot: sender?.isBot ?? null,
     peer_type: normalizePeerType(chat),
-    peer_id: chat?.id?.toString?.() ?? decoded?.chatId ?? 'unknown',
-    topic_id: decoded?.topicId ?? null,
+    peer_id: chat?.id?.toString?.() ?? (raw ? peerKey(raw.peerId) : null) ?? 'unknown',
+    topic_id: raw ? decodeTopicId(raw) : null,
     media: summarizeMedia(readGetter(message, 'media')),
     raw: message.raw ?? null,
   };

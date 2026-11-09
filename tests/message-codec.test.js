@@ -205,6 +205,13 @@ describe('message codec', () => {
     expect(decoded).toMatchObject({ text: '', action: { type: 'chatAddUser', users: [String(SELF_ID)] } });
   });
 
+  it('names a chat in a service action by its archive key', () => {
+    const decoded = decodeMessage(throughArchive(serviceMessage(41, {
+      _: 'messageActionChatMigrateTo', channelId: 700000700,
+    })));
+    expect(decoded.action).toEqual({ type: 'chatMigrateTo', channelId: '-1000700000700' });
+  });
+
   it('puts the message that opens a forum topic in that topic', () => {
     const decoded = decodeMessage(throughArchive(serviceMessage(40, {
       _: 'messageActionTopicCreate', title: 'Plans', iconColor: 7322096,

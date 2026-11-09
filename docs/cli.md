@@ -274,7 +274,8 @@ Telegram or from the archive alike (only `source` tells them apart):
 - `messageId`, `date`, `editDate` (ISO, null when never edited), `out` (sent by you).
 - `fromId`, `fromUsername`, `fromDisplayName`, `fromPeerType`, `fromIsBot` — the sender.
 - `text`, `urls` (from the message's links), `media` (type, file id, name, size…).
-- `topicId` — the forum topic, or the thread of a channel post a comment belongs to.
+- `topicId` — the forum topic, or, for an answer to a comment on a channel post, the
+  post's thread (a comment on the post itself has the post in `replyTo` and no `topicId`).
 - `replyTo` — `{ messageId, topId, chatId, storyId, quote }` of the message (or story) this
   one answers, or null. In a forum a message that only sits in a topic answers nothing.
   `chatId` is set when the answered message is in another chat.
@@ -288,10 +289,12 @@ Telegram or from the archive alike (only `source` tells them apart):
 - `groupedId` (the album a photo or file belongs to), `viaBotId`, `postAuthor`.
 
 Archived messages get these fields from the Telegram message the archive keeps, so
-messages archived by older versions have them too.
+messages archived by older versions have them too. The sender's name and username in
+archive reads are the latest tgcli has seen for that user.
 
 `search` takes FTS5 query syntax (`a OR b`, `pre*`); a query that is not valid syntax,
-such as `UTF-8` or `example.org`, is searched as plain words.
+such as `UTF-8` or `example.org`, is searched as plain words, keeping `AND`, `OR`, `NOT`
+and a trailing `*` (`UTF-8 OR utf8`).
 
 ### Pagination
 
