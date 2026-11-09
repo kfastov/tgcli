@@ -160,7 +160,7 @@ describe('messagesGet source resolution', () => {
         getPeerMetadata: vi.fn().mockResolvedValue({ peerTitle: 'Live Title', username: 'liveuser' }),
       },
       messageSyncService: {
-        getArchivedMessage: vi.fn().mockReturnValue(archived),
+        archive: { get: vi.fn().mockReturnValue(archived) },
         getChannelMetadata: vi.fn().mockReturnValue(null),
       },
     };
@@ -172,7 +172,7 @@ describe('messagesGet source resolution', () => {
     expect(result.source).toBe('live');
     expect(result.message.source).toBe('live');
     expect(result.usedLiveFallback).toBe(false);
-    expect(ctx.messageSyncService.getArchivedMessage).not.toHaveBeenCalled();
+    expect(ctx.messageSyncService.archive.get).not.toHaveBeenCalled();
   });
 
   it('source archive returns only the archived message (no live call)', async () => {
@@ -200,7 +200,7 @@ describe('messagesGet source resolution', () => {
     const result = await OPERATIONS.messagesGet(ctx, { channelId: '-100', messageId: 5, source: 'both' });
     expect(result.source).toBe('live');
     expect(result.message.source).toBe('live');
-    expect(ctx.messageSyncService.getArchivedMessage).not.toHaveBeenCalled();
+    expect(ctx.messageSyncService.archive.get).not.toHaveBeenCalled();
   });
 
   it('throws when the message is absent everywhere', async () => {

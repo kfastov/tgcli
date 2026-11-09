@@ -115,7 +115,7 @@ describe('chats given by username, for reads', () => {
   });
 
   it('lists archived messages by username without Telegram', async () => {
-    service.insertMessagesTx([service._buildMessageRecord(CHANNEL, { id: 1, date: 1700000001, text: 'one' })]);
+    service.archive.write(CHANNEL, [{ id: 1, date: 1700000001, text: 'one' }]);
 
     const payload = await OPERATIONS.messagesList({ messageSyncService: service, telegramClient: {} }, {
       channelId: '@news_room',

@@ -32,6 +32,7 @@ import {
 import { resolveStoreDir } from './core/store.js';
 import { parseDuration } from './core/duration.js';
 import { formatServerStats } from './core/server-stats.js';
+import { describeMessageView } from './core/message-view.js';
 import {
   cancelBackfill,
   enqueueBackfill,
@@ -1390,7 +1391,7 @@ async function runAuthStatus(globalFlags) {
     try {
       const me = await telegramClient.getCurrentUser();
       const authenticated = Boolean(me);
-      const search = messageSyncService.getSearchStatus();
+      const search = messageSyncService.archive.searchStatus();
       const username = me?.username ? `@${me.username}` : null;
       const payload = {
         authenticated,
@@ -2763,7 +2764,7 @@ async function runDoctor(globalFlags, options = {}) {
       authenticated = false;
     }
 
-    const search = messageSyncService.getSearchStatus();
+    const search = messageSyncService.archive.searchStatus();
     const queue = messageSyncService.getQueueStats();
     const repairSuggested = messageSyncService.isRepairSuggested();
     const leftChats = messageSyncService.getLeftChatCounts();
@@ -2938,9 +2939,8 @@ function renderMessageGroups(messages, outputSource) {
     console.log(`Showing ${count} message${count === 1 ? '' : 's'} for ${label}:`);
     for (const message of group.messages) {
       const sender = getMessageSenderLabel(message) || 'unknown';
-      const text = (message.text || '').replace(/\s+/g, ' ').trim();
       const prefix = outputSource === 'both' ? `[${message.source}] ` : '';
-      console.log(`${prefix}${message.date ?? ''} ${sender} #${message.messageId}: ${text}`);
+      console.log(`${prefix}${message.date ?? ''} ${sender} #${message.messageId}: ${describeMessageView(message)}`);
     }
     if (groups.length > 1) {
       console.log('');

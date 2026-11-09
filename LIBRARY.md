@@ -69,7 +69,7 @@ const client = new TelegramClient(apiId, apiHash, phoneNumber, sessionPath);
 - `listDialogs(limit?)`: Returns the first `limit` dialogs as simple metadata objects.
 - `searchDialogs(keyword, limit?)`: Searches dialogs by title or username.
 - `ensureLogin()`: Throws if the client is not currently authorized.
-- `getMessagesByChannelId(channelId, limit)`: Returns `{ peerTitle, peerId, peerType, messages }` for the requested chat/channel (messages include `topic_id` when applicable).
+- `getMessagesByChannelId(channelId, limit)`: Returns `{ peerTitle, peerId, peerType, messages }` for the requested chat/channel (stored messages: see "Stored message" in GLOSSARY.md; `core/message-codec.js` decodes them).
 - `listForumTopics(channelId, options?)`: Returns forum topics for a supergroup (uses Telegram forum APIs).
 - `getTopicMessages(channelId, topicId, limit?)`: Returns `{ total, next, messages }` for a forum topic.
 - `filterMessagesByPattern(messages, pattern)`: Filters an array of message _strings_ by a regex pattern.

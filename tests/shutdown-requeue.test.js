@@ -169,7 +169,7 @@ describe('worker job ownership lifecycle (#42)', () => {
       ownedDuringSync = service.ownedInProgressJobId;
       return { stoppedEarly: false };
     };
-    service._countMessages = () => 0;
+    service.archive.count = () => 0;
     service._backfillHistory = async () => ({
       stoppedEarly: false,
       hasMoreOlder: false,
