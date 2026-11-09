@@ -4,7 +4,10 @@ import path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { buildSendPhotoSuccessPayload, normalizeSendCommandError, parseNonNegativeInt, shouldRunMain, writeError } from '../cli.js';
+import { shouldRunMain } from '../cli.js';
+import { writeError } from '../core/cli-io.js';
+import { buildSendPhotoSuccessPayload, messagesSendPhoto, normalizeSendCommandError } from '../core/ops/send.js';
+import { parseOperationArgs } from '../core/ops/operation.js';
 import { SendCommandError, buildSendErrorPayload } from '../core/send-utils.js';
 
 describe('tgcli send photo CLI validation', () => {
@@ -18,8 +21,11 @@ describe('tgcli send photo CLI validation', () => {
   });
 
   it('parses integer --retries values', () => {
-    expect(parseNonNegativeInt('3', '--retries')).toBe(3);
-    expect(parseNonNegativeInt('0', '--retries')).toBe(0);
+    const base = { channelId: '@chat', photo: '/tmp/photo.jpg' };
+    expect(parseOperationArgs(messagesSendPhoto, { ...base, retries: 3 }, 'cli').retries).toBe(3);
+    expect(parseOperationArgs(messagesSendPhoto, { ...base, retries: 0 }, 'cli').retries).toBe(0);
+    expect(() => parseOperationArgs(messagesSendPhoto, { ...base, retries: -1 }, 'cli'))
+      .toThrow('--retries must be a non-negative integer');
   });
 
   it('treats symlinked bin paths as the CLI entrypoint', async () => {

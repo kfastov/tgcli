@@ -59,7 +59,8 @@
     "@mtcute/node": "^0.27.8",
     "better-sqlite3": "^12.6.0",
     "commander": "^12.1.0",
-    "qrcode": "^1.5.4"
+    "qrcode": "^1.5.4",
+    "zod": "^4.3.5"
   },
   "devDependencies": {
     "vitest": "^4.1.2"

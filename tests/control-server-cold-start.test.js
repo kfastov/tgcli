@@ -103,7 +103,7 @@ describe('control server reachable before Telegram connect resolves', () => {
     // pending.
     const control = readControlFile(storeDir);
     let opSettled = false;
-    const opPromise = fetch(`http://127.0.0.1:${control.port}/control/invoke`, {
+    const opPromise = fetch(`http://127.0.0.1:${control.port}/control/run`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', [CONTROL_TOKEN_HEADER]: token },
       body: JSON.stringify({ op: 'listChannels', args: { limit: 1 } }),

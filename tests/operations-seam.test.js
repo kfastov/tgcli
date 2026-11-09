@@ -42,7 +42,13 @@ vi.mock('../core/store.js', () => ({
   resolveStoreDir: vi.fn(() => '/tmp/tgcli-seam-store'),
 }));
 
-const { OPERATIONS } = await import('../core/operations.js');
+const { OPERATIONS } = await import('../core/ops/index.js');
+const { executeOperation } = await import('../core/ops/execute.js');
+
+// Runs an operation the way the server does: args validated, defaults applied.
+function run(name, services, args) {
+  return executeOperation(OPERATIONS[name], args, { services });
+}
 const { runOperation } = await import('../core/command-context.js');
 
 beforeEach(() => {
@@ -74,59 +80,61 @@ describe('OPERATIONS registry', () => {
   });
 
   it('listChannels lists dialogs and applies the default limit', async () => {
-    const result = await OPERATIONS.listChannels(ctx(), {});
+    const result = await run('listChannels', ctx(), {});
     expect(hooks.telegramClient.listDialogs).toHaveBeenCalledWith(50);
     expect(result).toEqual([{ id: '1', title: 'Warm' }]);
   });
 
   it('listChannels searches when a query is given', async () => {
-    const result = await OPERATIONS.listChannels(ctx(), { query: 'foo', limit: 7 });
+    const result = await run('listChannels', ctx(), { query: 'foo', limit: 7 });
     expect(hooks.telegramClient.searchDialogs).toHaveBeenCalledWith('foo', 7);
     expect(result).toEqual([{ id: '2', title: 'WarmSearch' }]);
   });
 
-  it('getGroupInviteLink returns the link descriptor', async () => {
-    const result = await OPERATIONS.getGroupInviteLink(ctx(), { chat: '@g' });
+  it('groupsInviteLinkGet returns the formatted link descriptor', async () => {
+    const result = await run('groupsInviteLinkGet', ctx(), { channelId: '@g' });
     expect(hooks.telegramClient.getGroupInviteLink).toHaveBeenCalledWith('@g');
-    expect(result).toEqual({ link: 'https://t.me/+warm' });
+    expect(result).toMatchObject({ link: 'https://t.me/+warm', isRevoked: null, usage: null });
   });
 
-  it('channelSetSync enables sync and queues a backfill job when none exists', async () => {
-    const result = await OPERATIONS.channelSetSync(ctx(), { chat: '@g', enable: true });
+  it('channelsWatch enables sync and queues a backfill job when none exists', async () => {
+    const result = await run('channelsWatch', ctx(), { channelId: '@g' });
     expect(hooks.messageSyncService.setChannelSync).toHaveBeenCalledWith('1', true);
     expect(hooks.messageSyncService.queueResyncJob).toHaveBeenCalledWith('1');
     expect(result).toMatchObject({ channelId: '1', syncEnabled: true, jobId: 7, jobQueued: true });
   });
 
-  it('channelMarkRead marks the channel read via the warm client', async () => {
-    const result = await OPERATIONS.channelMarkRead(ctx(), { chat: '@g', messageId: 9 });
+  it('markChannelRead marks the channel read via the warm client', async () => {
+    const result = await run('markChannelRead', ctx(), { channelId: '@g', messageId: 9 });
     expect(hooks.telegramClient.markChannelRead).toHaveBeenCalledWith('@g', 9);
     expect(result).toEqual({ channelId: '1', messageId: 9 });
   });
 
   it('exposes a fixed allowlist covering the migrated surface', () => {
     for (const op of [
-      'listChannels', 'channelShow', 'channelSetSync', 'channelMarkRead',
+      'listChannels', 'channelsShow', 'channelsWatch', 'channelsUnwatch', 'markChannelRead',
       'messagesList', 'messagesSearch', 'messagesGet', 'messagesContext',
-      'sendText', 'sendPhoto', 'sendFile', 'mediaDownload',
-      'topicsList', 'tagsSet', 'tagsList', 'tagsSearch', 'tagsAuto',
-      'metadataGet', 'metadataRefresh',
-      'contactsSearch', 'contactsShow', 'contactsAliasSet', 'contactsAliasRemove',
+      'messagesSend', 'messagesSendPhoto', 'messagesSendFile', 'mediaDownload',
+      'topicsList', 'topicsSearch', 'setChannelTags', 'listChannelTags', 'listTaggedChannels', 'autoTagChannels',
+      'getChannelMetadata', 'refreshChannelMetadata',
+      'contactsSearch', 'contactsGet', 'contactsAliasSet', 'contactsAliasRemove',
       'contactsTagsAdd', 'contactsTagsRemove', 'contactsNotesSet',
-      'groupsList', 'groupsInfo', 'groupsRename', 'groupMembersAdd', 'groupMembersRemove',
-      'getGroupInviteLink', 'revokeGroupInviteLink', 'groupsJoin', 'groupsLeave',
+      'groupsList', 'groupsInfo', 'groupsRename', 'groupsMembersAdd', 'groupsMembersRemove',
+      'groupsInviteLinkGet', 'groupsInviteLinkRevoke', 'groupsJoin', 'groupsLeave',
       'foldersList', 'foldersShow', 'foldersCreate', 'foldersEdit', 'foldersDelete',
       'foldersReorder', 'foldersChatsAdd', 'foldersChatsRemove', 'foldersJoin',
     ]) {
-      expect(typeof OPERATIONS[op]).toBe('function');
+      expect(OPERATIONS[op]?.name).toBe(op);
+      expect(typeof OPERATIONS[op].run).toBe('function');
     }
   });
 });
 
-describe('generic passthrough ops', () => {
+describe('operations that forward to one service method', () => {
   it('foldersShow forwards args to the warm client method and returns the result', async () => {
     const showFolder = vi.fn().mockResolvedValue({ id: 4, title: 'Work' });
-    const result = await OPERATIONS.foldersShow(
+    const result = await run(
+      'foldersShow',
       { telegramClient: { showFolder } },
       { folder: 'Work', resolve: true },
     );
@@ -134,9 +142,10 @@ describe('generic passthrough ops', () => {
     expect(result).toEqual({ id: 4, title: 'Work' });
   });
 
-  it('tagsSearch forwards to the archive service with the default limit', async () => {
+  it('listTaggedChannels forwards to the archive service with the default limit', async () => {
     const listTaggedChannels = vi.fn().mockReturnValue([{ channelId: '1' }]);
-    const result = await OPERATIONS.tagsSearch(
+    const result = await run(
+      'listTaggedChannels',
       { messageSyncService: { listTaggedChannels } },
       { tag: 'news', source: 'user' },
     );
@@ -146,7 +155,7 @@ describe('generic passthrough ops', () => {
 
   it('groupsInfo forwards the chat through unchanged', async () => {
     const getGroupInfo = vi.fn().mockResolvedValue({ id: '-100', title: 'G' });
-    const result = await OPERATIONS.groupsInfo({ telegramClient: { getGroupInfo } }, { chat: '@g' });
+    const result = await run('groupsInfo', { telegramClient: { getGroupInfo } }, { channelId: '@g' });
     expect(getGroupInfo).toHaveBeenCalledWith('@g');
     expect(result).toEqual({ id: '-100', title: 'G' });
   });
@@ -168,7 +177,7 @@ describe('messagesGet source resolution', () => {
 
   it('source live returns only the live message', async () => {
     const ctx = buildCtx({ live: { id: 5, message: 'live text', date: 1 } });
-    const result = await OPERATIONS.messagesGet(ctx, { channelId: '-100', messageId: 5, source: 'live' });
+    const result = await run('messagesGet', ctx, { channelId: '-100', messageId: 5, source: 'live' });
     expect(result.source).toBe('live');
     expect(result.message.source).toBe('live');
     expect(result.usedLiveFallback).toBe(false);
@@ -177,7 +186,7 @@ describe('messagesGet source resolution', () => {
 
   it('source archive returns only the archived message (no live call)', async () => {
     const ctx = buildCtx({ archived: { messageId: 5, text: 'archived', date: '2026-01-01' } });
-    const result = await OPERATIONS.messagesGet(ctx, { channelId: '-100', messageId: 5, source: 'archive' });
+    const result = await run('messagesGet', ctx, { channelId: '-100', messageId: 5, source: 'archive' });
     expect(result.source).toBe('archive');
     expect(result.message.source).toBe('archive');
     expect(result.usedLiveFallback).toBe(false);
@@ -186,7 +195,7 @@ describe('messagesGet source resolution', () => {
 
   it('source archive falls back to live and flags usedLiveFallback when absent in archive', async () => {
     const ctx = buildCtx({ archived: null, live: { id: 5, message: 'live text', date: 1 } });
-    const result = await OPERATIONS.messagesGet(ctx, { channelId: '-100', messageId: 5, source: 'archive' });
+    const result = await run('messagesGet', ctx, { channelId: '-100', messageId: 5, source: 'archive' });
     expect(result.source).toBe('live');
     expect(result.message.source).toBe('live');
     expect(result.usedLiveFallback).toBe(true);
@@ -197,7 +206,7 @@ describe('messagesGet source resolution', () => {
       archived: { messageId: 5, text: 'archived', date: '2026-01-01' },
       live: { id: 5, message: 'live text', date: 1 },
     });
-    const result = await OPERATIONS.messagesGet(ctx, { channelId: '-100', messageId: 5, source: 'both' });
+    const result = await run('messagesGet', ctx, { channelId: '-100', messageId: 5, source: 'both' });
     expect(result.source).toBe('live');
     expect(result.message.source).toBe('live');
     expect(ctx.messageSyncService.getArchivedMessage).not.toHaveBeenCalled();
@@ -206,7 +215,7 @@ describe('messagesGet source resolution', () => {
   it('throws when the message is absent everywhere', async () => {
     const ctx = buildCtx({ archived: null, live: null });
     await expect(
-      OPERATIONS.messagesGet(ctx, { channelId: '-100', messageId: 5, source: 'archive' }),
+      run('messagesGet', ctx, { channelId: '-100', messageId: 5, source: 'archive' }),
     ).rejects.toThrow('Message not found.');
   });
 });
@@ -255,11 +264,11 @@ describe('runOperation seam', () => {
   it('forwards invokeTimeoutMs as the invoke wait budget', async () => {
     hooks.invoke.mockResolvedValue({ ok: true });
 
-    await runOperation({}, { op: 'sendText', args: { chat: '@g' }, invokeTimeoutMs: 30000 });
+    await runOperation({}, { op: 'messagesSend', args: { channelId: '@g' }, invokeTimeoutMs: 30000 });
 
     expect(hooks.invoke).toHaveBeenCalledWith('/tmp/tgcli-seam-store', {
-      op: 'sendText',
-      args: { chat: '@g' },
+      op: 'messagesSend',
+      args: { channelId: '@g' },
       timeoutMs: 30000,
     });
   });

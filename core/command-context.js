@@ -2,7 +2,7 @@ import { resolveStoreDir } from './store.js';
 import { acquireReadLock, acquireStoreLock } from '../store-lock.js';
 import { createMessageSyncService, createTelegramClient, resolveValidatedConfig } from './services.js';
 import { ensureServer, invoke, ServerUnavailableError } from './control-client.js';
-import { OPERATIONS } from './operations.js';
+import { OPERATIONS } from './ops/index.js';
 
 // Runs fn(ctx) with exactly the services a command needs, owning the surrounding
 // lifecycle: timeout, store dir, store lock, scoped service creation, and teardown.
@@ -33,8 +33,7 @@ export async function withCommand(globalFlags, opts, fn) {
     throw new Error(`withCommand: unknown need "${need}"`);
   }
 
-  // Most commands use the global --timeout; send commands pass an explicit
-  // timeoutMs (resolveSendTimeoutMs) so the seam honors their default.
+  // The global --timeout, unless the caller passes its own.
   const timeoutMs = opts.timeoutMs ?? globalFlags?.timeoutMs;
   return runWithTimeout(async () => {
     const storeDir = storeDirOverride ?? resolveStoreDir();
@@ -91,12 +90,12 @@ export async function withCommand(globalFlags, opts, fn) {
 // retry the invoke once. An operation that runs
 // and fails (a 4xx/5xx, including a send error) never triggers a server start.
 //
-// invokeTimeoutMs bounds the client's wait on each request (e.g. the 30s send
-// default); it is independent of the global --timeout. A request timeout means
+// invokeTimeoutMs bounds the client's wait on each request (the CLI passes
+// --timeout, or the operation's own default). A request timeout means
 // the server was reached but did not reply in time, so it surfaces to the caller
 // rather than starting a second server.
 export async function runOperation(globalFlags, { op, args, invokeTimeoutMs } = {}) {
-  if (!OPERATIONS[op]) {
+  if (!Object.hasOwn(OPERATIONS, op)) {
     throw new Error(`runOperation: unknown operation "${op}"`);
   }
   const storeDir = resolveStoreDir();

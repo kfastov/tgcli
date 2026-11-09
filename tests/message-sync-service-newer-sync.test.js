@@ -10,7 +10,8 @@ import { Long, Message, PeersIndex } from '@mtcute/core';
 import { iterHistory, resolvePeer } from '@mtcute/core/methods.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { OPERATIONS } from '../core/operations.js';
+import { OPERATIONS } from '../core/ops/index.js';
+import { executeOperation } from '../core/ops/execute.js';
 import MessageSyncService from '../message-sync-service.js';
 import TelegramClient from '../telegram-client.js';
 
@@ -342,9 +343,10 @@ describe('catching up on messages newer than the cursor', () => {
       expect(jobStatus()).toBe('idle');
 
       historyIds = range(1, 16);
-      const result = await OPERATIONS.channelSetSync(
-        { messageSyncService: service },
-        { chat: CHANNEL_ID, enable: true },
+      const result = await executeOperation(
+        OPERATIONS.channelsWatch,
+        { channelId: CHANNEL_ID },
+        { services: { messageSyncService: service } },
       );
       expect(result.jobQueued).toBe(true);
       service._handleIncomingMessage(parsed(16), { isEdit: false });
@@ -364,9 +366,10 @@ describe('catching up on messages newer than the cursor', () => {
 
       service.setChannelSync(CHANNEL_ID, false);
       historyIds = range(1, 18);
-      await OPERATIONS.channelSetSync(
-        { messageSyncService: service },
-        { chat: CHANNEL_ID, enable: true },
+      await executeOperation(
+        OPERATIONS.channelsWatch,
+        { channelId: CHANNEL_ID },
+        { services: { messageSyncService: service } },
       );
 
       await vi.waitFor(() => expect(jobStatus()).toBe('idle'));

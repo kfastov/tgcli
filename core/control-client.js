@@ -259,7 +259,7 @@ export async function retryBackfill(storeDir, { jobId, channelId, allErrors } = 
   return json;
 }
 
-// POST /control/invoke { op, args } → the operation's result. Runs the shared
+// POST /control/run { op, args } → the operation's result. Runs the shared
 // operation handler against the server's warm services and returns `result`.
 // timeoutMs bounds the request wait (defaults to the enqueue budget); a value of
 // 0 disables it. A send op that fails reports structured details under
@@ -275,7 +275,7 @@ export async function invoke(storeDir, { op, args, timeoutMs, quiet } = {}) {
   const effectiveTimeoutMs = timeoutMs === undefined ? ENQUEUE_TIMEOUT_MS : timeoutMs;
   let response;
   try {
-    response = await controlFetch(control, '/control/invoke', {
+    response = await controlFetch(control, '/control/run', {
       method: 'POST',
       body: { op, args },
       timeoutMs: effectiveTimeoutMs > 0 ? effectiveTimeoutMs : undefined,
@@ -293,6 +293,11 @@ export async function invoke(storeDir, { op, args, timeoutMs, quiet } = {}) {
     throw error;
   }
   const { status, json } = response;
+  // A server without /control/run reads operation names and args differently
+  // (its /control/invoke), so the operation is not retried there.
+  if (status === 404) {
+    throw new Error(`The running tgcli server (${control.version ?? 'unknown version'}, pid ${control.pid ?? '?'}) predates this tgcli; run \`tgcli server restart\` and try again.`);
+  }
   if (status !== 200) {
     if (json?.sendError) {
       throw new SendCommandError(json.sendError);

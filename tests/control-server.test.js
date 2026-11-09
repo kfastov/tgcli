@@ -11,7 +11,6 @@ import {
   removeControlFile,
   writeControlFile,
 } from '../core/control-server.js';
-import { OPERATIONS } from '../core/operations.js';
 
 const TOKEN = 'test-token-abc123';
 
@@ -407,7 +406,7 @@ describe('control API request handler', () => {
   });
 });
 
-describe('POST /control/invoke', () => {
+describe('POST /control/run', () => {
   let warmServices;
   let ensureLogin;
   let server;
@@ -445,22 +444,50 @@ describe('POST /control/invoke', () => {
   });
 
   it('runs a known op against the warm services and returns its result', async () => {
-    const spy = vi.spyOn(OPERATIONS, 'listChannels');
-    const { status, json } = await request(port, 'POST', '/control/invoke', {
+    const { status, json } = await request(port, 'POST', '/control/run', {
       token: TOKEN,
       body: { op: 'listChannels', args: { limit: 10 } },
     });
     expect(status).toBe(200);
-    expect(spy).toHaveBeenCalledWith(warmServices, { limit: 10 });
     expect(warmServices.telegramClient.listDialogs).toHaveBeenCalledWith(10);
     expect(json).toEqual({ result: [{ id: '1', title: 'Warm' }] });
     expect(ensureLogin).toHaveBeenCalledTimes(1);
   });
 
-  it('dispatches a write op (channelSetSync) against the warm services', async () => {
+  it('refuses the operations of a CLI older than this server, running nothing', async () => {
     const { status, json } = await request(port, 'POST', '/control/invoke', {
       token: TOKEN,
-      body: { op: 'channelSetSync', args: { chat: '@g', enable: true } },
+      body: { op: 'foldersEdit', args: { folder: '1', modification: { title: 'X' } } },
+    });
+    expect(status).toBe(400);
+    expect(json.error).toMatch(/newer than this CLI; update tgcli, or run `tgcli server restart`/);
+    expect(ensureLogin).not.toHaveBeenCalled();
+  });
+
+  it('applies the operation defaults to the args the caller left out', async () => {
+    const { status } = await request(port, 'POST', '/control/run', {
+      token: TOKEN,
+      body: { op: 'listChannels', args: {} },
+    });
+    expect(status).toBe(200);
+    expect(warmServices.telegramClient.listDialogs).toHaveBeenCalledWith(50);
+  });
+
+  it('returns 400 naming the arg when the args do not fit the operation (no handler invoked)', async () => {
+    const { status, json } = await request(port, 'POST', '/control/run', {
+      token: TOKEN,
+      body: { op: 'listChannels', args: { limit: 'ten' } },
+    });
+    expect(status).toBe(400);
+    expect(json.error).toBe('limit must be a positive integer');
+    expect(warmServices.telegramClient.listDialogs).not.toHaveBeenCalled();
+    expect(ensureLogin).not.toHaveBeenCalled();
+  });
+
+  it('dispatches a write op (channelsWatch) against the warm services', async () => {
+    const { status, json } = await request(port, 'POST', '/control/run', {
+      token: TOKEN,
+      body: { op: 'channelsWatch', args: { channelId: '@g' } },
     });
     expect(status).toBe(200);
     expect(warmServices.messageSyncService.resolveChatKey).toHaveBeenCalledWith('@g');
@@ -472,16 +499,16 @@ describe('POST /control/invoke', () => {
 
   it('returns 500 with a sendError payload when a send op fails', async () => {
     warmServices.telegramClient.sendTextMessage = vi.fn(() => Promise.reject(new Error('FLOOD_WAIT_120')));
-    const { status, json } = await request(port, 'POST', '/control/invoke', {
+    const { status, json } = await request(port, 'POST', '/control/run', {
       token: TOKEN,
-      body: { op: 'sendText', args: { chat: '@g', text: 'hi', retries: 0, timeoutMs: 30000 } },
+      body: { op: 'messagesSend', args: { channelId: '@g', text: 'hi', retries: 0, timeoutMs: 30000 } },
     });
     expect(status).toBe(500);
     expect(json.sendError).toMatchObject({ type: 'rate_limit', method: 'sendText', waitSeconds: 120 });
   });
 
   it('returns 400 for an unknown op (no handler invoked)', async () => {
-    const { status, json } = await request(port, 'POST', '/control/invoke', {
+    const { status, json } = await request(port, 'POST', '/control/run', {
       token: TOKEN,
       body: { op: 'doesNotExist', args: {} },
     });
@@ -491,7 +518,7 @@ describe('POST /control/invoke', () => {
   });
 
   it('rejects an invoke without a token', async () => {
-    const { status } = await request(port, 'POST', '/control/invoke', {
+    const { status } = await request(port, 'POST', '/control/run', {
       body: { op: 'listChannels', args: {} },
     });
     expect(status).toBe(401);
@@ -596,7 +623,7 @@ describe('control API requests in flight', () => {
     });
     const { server, port } = await startServer(handler);
     try {
-      const slow = request(port, 'POST', '/control/invoke', { token: TOKEN, body: { op: 'listChannels', args: {} } });
+      const slow = request(port, 'POST', '/control/run', { token: TOKEN, body: { op: 'listChannels', args: {} } });
       await vi.waitFor(() => expect(handler.inFlight()).toBe(1));
       const { json } = await request(port, 'GET', '/control/ping', { token: TOKEN });
       expect(json).toMatchObject({ inFlight: 1, root: '/opt/tgcli' });

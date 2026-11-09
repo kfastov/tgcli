@@ -22,14 +22,25 @@ for the commands above (see `server` below).
 ## Global flags
 - --json
 - --timeout DURATION
-  - No default for most commands (long-running ones like `backfill`, `--follow`, and `server` stay unbounded).
-  - `send` commands default to `30s` so agents/scripts never hang on a stuck connection. Override with `--timeout 5m`, or `--timeout 0` to disable.
+  - Long-running commands (`backfill`, `--follow`, `server`) have no default.
+  - A command that runs on the server (channels, messages, send, media, topics, tags,
+    metadata, contacts, groups, folders) waits up to `30s` for it by default;
+    `--timeout` sets that wait (`--timeout 5m`), and `--timeout 0` waits as long as the
+    server takes.
+  - `send` commands also give the server that budget for its retries, so agents/scripts never hang on a stuck connection.
 - --quiet
   - Suppress informational progress/status output on stderr (e.g. backfill progress lines). Errors and primary stdout/`--json` output are unaffected.
 - --version
 
 Store location: OS app data dir (override with TGCLI_STORE).
 MCP: disabled by default (set `mcp.enabled` in config.json to true to serve MCP).
+Each command that runs on the server is also an MCP tool with the same params and the
+same JSON; see [mcp-tools.md](mcp-tools.md).
+
+Options are checked before anything reaches the server, and the server checks them
+again: a bad value fails with the option's name (`--limit must be a positive integer`).
+Relative paths (`media download --output`, `send photo --photo`, `send file --file`)
+are taken from the directory you run the command in.
 
 ## auth
 - auth [--qr] [--qr-file <path>] [--force-sms]
@@ -322,7 +333,7 @@ Legacy `--offset-id` is accepted as a hidden alias for `--before-id`.
 - tags set --chat <id|username> --tags ai,news [--source]
 - tags list --chat <id|username> [--source]
 - tags search --tag ai [--source] [--limit]
-- tags auto [--chat ...] [--limit] [--refresh-metadata]
+- tags auto [--chat ...] [--limit] [--source] [--no-refresh-metadata]
 
 ## metadata
 - metadata get --chat <id|username>

@@ -12,12 +12,19 @@ import { InputMedia, Long, Message, PeersIndex, UpdatesManager } from '@mtcute/c
 import { resolvePeer, sendMedia, sendText } from '@mtcute/core/methods.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { printSendOutcome } from '../cli.js';
-import { OPERATIONS } from '../core/operations.js';
+import { executeOperation } from '../core/ops/execute.js';
+import { OPERATIONS } from '../core/ops/index.js';
+import { printSendOutcome } from '../core/ops/send.js';
 import MessageSyncService from '../message-sync-service.js';
 import TelegramClient from '../telegram-client.js';
 
 const EXISTING_FILE = fileURLToPath(new URL('../package.json', import.meta.url));
+
+// Runs a send operation the way the server does and returns its payload.
+const SEND_OPERATIONS = { text: 'messagesSend', file: 'messagesSendFile', photo: 'messagesSendPhoto' };
+function send(kind, services, args) {
+  return executeOperation(OPERATIONS[SEND_OPERATIONS[kind]], args, { services });
+}
 
 const SELF_ID = 1;
 const FRIEND_ID = 2;
@@ -273,8 +280,8 @@ describe('archiving messages sent by tgcli', () => {
     const { services, telegramClient, messageSyncService } = await start(() => sentToChannel(ownChannelMessage(11, { message: 'mine' })));
     seedChat(CHANNEL_ID);
 
-    const { result } = await OPERATIONS.sendText(services, { chat: CHANNEL_ID, text: 'mine' });
-    expect(result).toEqual({ messageId: 11 });
+    const result = await send('text', services, { channelId: CHANNEL_ID, text: 'mine' });
+    expect(result).toEqual({ channelId: CHANNEL_ID, messageId: 11 });
     expect(telegramClient.client.getMessages).not.toHaveBeenCalled();
 
     messageSyncService._handleIncomingMessage(parsed(rawChannelMessage(12)), { isEdit: false });
@@ -287,9 +294,9 @@ describe('archiving messages sent by tgcli', () => {
   });
 
   describe.each([
-    ['text', (services) => OPERATIONS.sendText(services, { chat: FRIEND_CHAT_ID, text: 'mine' })],
-    ['file', (services) => OPERATIONS.sendFile(services, { chat: FRIEND_CHAT_ID, file: EXISTING_FILE })],
-    ['photo', (services) => OPERATIONS.sendPhoto(services, { chat: FRIEND_CHAT_ID, photo: EXISTING_FILE })],
+    ['text', (services) => send('text', services, { channelId: FRIEND_CHAT_ID, text: 'mine' })],
+    ['file', (services) => send('file', services, { channelId: FRIEND_CHAT_ID, filePath: EXISTING_FILE })],
+    ['photo', (services) => send('photo', services, { channelId: FRIEND_CHAT_ID, photo: EXISTING_FILE })],
   ])('a sent %s', (kind, send) => {
     it('is kept out of onNewMessage by noDispatch, while a later incoming message still arrives', async () => {
       const media = kind === 'text' ? undefined : PHOTO_MEDIA;
@@ -328,7 +335,7 @@ describe('archiving messages sent by tgcli', () => {
     }));
     seedChat(String(SELF_ID));
 
-    await OPERATIONS.sendText(services, { chat: 'me', text: 'note to self' });
+    await send('text', services, { channelId: 'me', text: 'note to self' });
 
     expect(archived(String(SELF_ID))).toEqual([expect.objectContaining({ message_id: 25, text: 'note to self' })]);
   });
@@ -354,13 +361,13 @@ describe('archiving messages sent by tgcli', () => {
       seedChat(FRIEND_CHAT_ID);
       telegramClient.client.getMessages = vi.fn().mockResolvedValue([fullCopy()]);
 
-      const { result } = await OPERATIONS.sendText(services, {
-        chat: FRIEND_CHAT_ID,
+      const result = await send('text', services, {
+        channelId: FRIEND_CHAT_ID,
         text: 'see https://example.com',
         replyToMessageId: 20,
       });
 
-      expect(result).toEqual({ messageId: 21 });
+      expect(result).toEqual({ channelId: FRIEND_CHAT_ID, messageId: 21 });
       await vi.waitFor(() => expect(refetchQueueSize()).toBe(0));
       expect(telegramClient.client.getMessages).toHaveBeenCalledWith(FRIEND_ID, 21);
       expect(archivedIds(FRIEND_CHAT_ID)).toEqual([21]);
@@ -375,9 +382,9 @@ describe('archiving messages sent by tgcli', () => {
       const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
       telegramClient.client.getMessages = vi.fn().mockRejectedValueOnce(new Error('network down'));
 
-      const { result } = await OPERATIONS.sendText(services, { chat: FRIEND_CHAT_ID, text: 'hello' });
+      const result = await send('text', services, { channelId: FRIEND_CHAT_ID, text: 'hello' });
 
-      expect(result).toEqual({ messageId: 21 });
+      expect(result).toEqual({ channelId: FRIEND_CHAT_ID, messageId: 21 });
       await vi.waitFor(() => expect(errorLog).toHaveBeenCalledWith(expect.stringContaining('network down')));
       expect(archived(FRIEND_CHAT_ID)).toEqual([expect.objectContaining({ message_id: 21, text: 'hello' })]);
       expect(archivedRaw(FRIEND_CHAT_ID, 21).replyTo).toBeUndefined();
@@ -397,9 +404,9 @@ describe('archiving messages sent by tgcli', () => {
       vi.spyOn(console, 'error').mockImplementation(() => {});
       telegramClient.client.getMessages = vi.fn().mockRejectedValue(new Error('network down'));
 
-      await OPERATIONS.sendText(services, { chat: FRIEND_CHAT_ID, text: 'first' });
+      await send('text', services, { channelId: FRIEND_CHAT_ID, text: 'first' });
       await vi.waitFor(() => expect(telegramClient.client.getMessages).toHaveBeenCalledTimes(1));
-      await OPERATIONS.sendText(services, { chat: FRIEND_CHAT_ID, text: 'second' });
+      await send('text', services, { channelId: FRIEND_CHAT_ID, text: 'second' });
       await vi.waitFor(() => expect(telegramClient.client.getMessages).toHaveBeenCalledTimes(2));
 
       expect(telegramClient.client.getMessages.mock.calls).toEqual([[FRIEND_ID, 21], [FRIEND_ID, 22]]);
@@ -421,7 +428,7 @@ describe('archiving messages sent by tgcli', () => {
       seedChat(FRIEND_CHAT_ID);
       telegramClient.client.getMessages = vi.fn().mockResolvedValue([null]);
 
-      await OPERATIONS.sendText(services, { chat: FRIEND_CHAT_ID, text: 'hello' });
+      await send('text', services, { channelId: FRIEND_CHAT_ID, text: 'hello' });
 
       await vi.waitFor(() => expect(refetchQueueSize()).toBe(0));
       expect(archivedIds(FRIEND_CHAT_ID)).toEqual([21]);
@@ -434,7 +441,7 @@ describe('archiving messages sent by tgcli', () => {
     const { services, telegramClient } = await start(() => sentToFriend(ownFriendMessage(26, { media: PHOTO_MEDIA })));
     seedChat(FRIEND_CHAT_ID);
 
-    await OPERATIONS.sendFile(services, { chat: FRIEND_CHAT_ID, file: EXISTING_FILE });
+    await send('file', services, { channelId: FRIEND_CHAT_ID, filePath: EXISTING_FILE });
 
     expect(telegramClient.client.getMessages).not.toHaveBeenCalled();
     expect(refetchQueueSize()).toBe(0);
@@ -448,7 +455,7 @@ describe('archiving messages sent by tgcli', () => {
     })));
     seedChat(CHANNEL_ID);
 
-    await OPERATIONS.sendFile(services, { chat: CHANNEL_ID, file: EXISTING_FILE, caption: 'see https://example.com' });
+    await send('file', services, { channelId: CHANNEL_ID, filePath: EXISTING_FILE, caption: 'see https://example.com' });
 
     expect(archived(CHANNEL_ID)).toEqual([expect.objectContaining({ message_id: 31, text: 'see https://example.com' })]);
     expect(mediaType(CHANNEL_ID, 31)).toBe('photo');
@@ -464,7 +471,7 @@ describe('archiving messages sent by tgcli', () => {
     seedChat(CHANNEL_ID);
     vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    const { result } = await OPERATIONS.sendPhoto(services, { chat: CHANNEL_ID, photo: EXISTING_FILE, caption: 'photo caption' });
+    const result = await send('photo', services, { channelId: CHANNEL_ID, photo: EXISTING_FILE, caption: 'photo caption' });
 
     expect(sendRequests()).toHaveLength(1);
     expect(result.warning).toMatch(/enrichment failed/i);
@@ -479,7 +486,7 @@ describe('archiving messages sent by tgcli', () => {
     })));
     seedChat(CHANNEL_ID);
 
-    await OPERATIONS.sendText(services, { chat: CHANNEL_ID, text: 'in topic', topicId: 77 });
+    await send('text', services, { channelId: CHANNEL_ID, text: 'in topic', topicId: 77 });
 
     expect(sendRequests()[0].replyTo.replyToMsgId).toBe(77);
     expect(archived(CHANNEL_ID)).toEqual([expect.objectContaining({ message_id: 51, topic_id: 77 })]);
@@ -489,9 +496,9 @@ describe('archiving messages sent by tgcli', () => {
     const { services } = await start(() => sentToChannel(ownChannelMessage(61)));
     seedChat(CHANNEL_ID, { syncEnabled: 0 });
 
-    const { result } = await OPERATIONS.sendText(services, { chat: CHANNEL_ID, text: 'hi' });
+    const result = await send('text', services, { channelId: CHANNEL_ID, text: 'hi' });
 
-    expect(result).toEqual({ messageId: 61 });
+    expect(result).toEqual({ channelId: CHANNEL_ID, messageId: 61 });
     expect(archivedIds(CHANNEL_ID)).toEqual([]);
     expect(syncEnabled(CHANNEL_ID)).toBe(0);
   });
@@ -500,7 +507,7 @@ describe('archiving messages sent by tgcli', () => {
     const { services, messageSyncService } = await start(() => sentToChannel(ownChannelMessage(71)));
     seedChat(CHANNEL_ID);
 
-    await OPERATIONS.sendText(services, { chat: CHANNEL_ID, text: 'once' });
+    await send('text', services, { channelId: CHANNEL_ID, text: 'once' });
 
     const sameMessage = parsed(ownChannelMessage(71));
     messageSyncService._handleIncomingMessage(sameMessage, { isEdit: false });
@@ -514,7 +521,7 @@ describe('archiving messages sent by tgcli', () => {
     const { services, messageSyncService } = await start(() => sentToChannel(ownChannelMessage(82)));
     seedChat(CHANNEL_ID, { lastMessageId: 80 });
 
-    await OPERATIONS.sendText(services, { chat: CHANNEL_ID, text: 'mine' });
+    await send('text', services, { channelId: CHANNEL_ID, text: 'mine' });
     expect(cursor(CHANNEL_ID)).toBe(80);
 
     liveHistory(parsed(rawChannelMessage(81)), parsed(ownChannelMessage(82)));
@@ -529,9 +536,9 @@ describe('archiving messages sent by tgcli', () => {
     const inOneHour = () => Math.floor(Date.now() / 1000) + 3600;
 
     const sends = {
-      text: (services, scheduleDate) => OPERATIONS.sendText(services, { chat: CHANNEL_ID, text: 'later', scheduleDate }),
-      file: (services, scheduleDate) => OPERATIONS.sendFile(services, { chat: CHANNEL_ID, file: EXISTING_FILE, scheduleDate }),
-      photo: (services, scheduleDate) => OPERATIONS.sendPhoto(services, { chat: CHANNEL_ID, photo: EXISTING_FILE, scheduleDate }),
+      text: (services, schedule) => send('text', services, { channelId: CHANNEL_ID, text: 'later', schedule }),
+      file: (services, schedule) => send('file', services, { channelId: CHANNEL_ID, filePath: EXISTING_FILE, schedule }),
+      photo: (services, schedule) => send('photo', services, { channelId: CHANNEL_ID, photo: EXISTING_FILE, schedule }),
     };
 
     // Telegram schedules only what the request asks to schedule, so a send that lost
@@ -546,7 +553,7 @@ describe('archiving messages sent by tgcli', () => {
       telegramClient.client.getScheduledMessages = vi.fn().mockResolvedValue([parsed(ownChannelMessage(SCHEDULED_ID))]);
       const scheduleDate = inOneHour();
 
-      const { result } = await sends[kind](services, scheduleDate);
+      const result = await sends[kind](services, new Date(scheduleDate * 1000).toISOString());
 
       expect(sendRequests()[0].scheduleDate).toBe(scheduleDate);
       expect(result.scheduled).toBe(true);
@@ -568,11 +575,12 @@ describe('archiving messages sent by tgcli', () => {
       const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
       messageSyncService.db.close();
 
-      const { result, attempts } = await OPERATIONS.sendText(services, { chat: CHANNEL_ID, text: 'delivered', retries: 3 });
+      const result = await send('text', services, { channelId: CHANNEL_ID, text: 'delivered', retries: 3 });
 
       expect(result.messageId).toBe(91);
       expect(result.warning).toMatch(/not archived/i);
-      expect(attempts).toBe(1);
+      // A send that went through on the first attempt reports no attempts.
+      expect(result.attempts).toBeUndefined();
       expect(sendRequests()).toHaveLength(1);
       expect(errorLog).toHaveBeenCalledWith(expect.stringContaining('91'));
     });
@@ -585,11 +593,11 @@ describe('archiving messages sent by tgcli', () => {
       }));
       vi.spyOn(console, 'error').mockImplementation(() => {});
 
-      const { result, attempts } = await OPERATIONS.sendText(services, { chat: CHANNEL_ID, text: 'delivered', retries: 3 });
+      const result = await send('text', services, { channelId: CHANNEL_ID, text: 'delivered', retries: 3 });
 
       expect(result.messageId).toBe(92);
       expect(result.warning).toMatch(/not archived/i);
-      expect(attempts).toBe(1);
+      expect(result.attempts).toBeUndefined();
       expect(sendRequests()).toHaveLength(1);
     });
 
@@ -603,11 +611,11 @@ describe('archiving messages sent by tgcli', () => {
       vi.spyOn(console, 'error').mockImplementation(() => {});
       telegramClient.client.getMessages = vi.fn().mockResolvedValue([parsed(ownChannelMessage(93, { media: PHOTO_MEDIA }))]);
 
-      const { result, attempts } = await OPERATIONS.sendPhoto(services, { chat: CHANNEL_ID, photo: EXISTING_FILE, retries: 3 });
+      const result = await send('photo', services, { channelId: CHANNEL_ID, photo: EXISTING_FILE, retries: 3 });
 
-      expect(result.messageId).toBe(93);
+      expect(result.message_id).toBe(93);
       expect(result.warning).toMatch(/not archived/i);
-      expect(attempts).toBe(1);
+      expect(result.attempts).toBe(1);
       expect(sendRequests()).toHaveLength(1);
     });
 
@@ -615,7 +623,7 @@ describe('archiving messages sent by tgcli', () => {
       const { messageSyncService } = await start(() => sentToChannel(ownChannelMessage(94)));
       const telegramClient = { sendTextMessage: vi.fn().mockResolvedValue({ messageId: 94 }) };
 
-      const { result } = await OPERATIONS.sendText({ telegramClient, messageSyncService }, { chat: CHANNEL_ID, text: 'hi' });
+      const result = await send('text', { telegramClient, messageSyncService }, { channelId: CHANNEL_ID, text: 'hi' });
 
       expect(result.warning).toMatch(/not archived/i);
     });
@@ -624,7 +632,7 @@ describe('archiving messages sent by tgcli', () => {
       const { messageSyncService } = await start(() => sentToChannel(ownChannelMessage(95)));
       const telegramClient = { sendTextMessage: vi.fn().mockResolvedValue({ messageId: 95, warning: 'first' }) };
 
-      const { result } = await OPERATIONS.sendText({ telegramClient, messageSyncService }, { chat: CHANNEL_ID, text: 'hi' });
+      const result = await send('text', { telegramClient, messageSyncService }, { channelId: CHANNEL_ID, text: 'hi' });
 
       expect(result.warning).toMatch(/^first; .*not archived/i);
     });
@@ -632,22 +640,23 @@ describe('archiving messages sent by tgcli', () => {
 
   describe('printSendOutcome', () => {
     it('prints the warning next to the outcome in text mode', () => {
-      const log = vi.spyOn(console, 'log').mockImplementation(() => {});
-      const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const print = vi.fn();
+      const warn = vi.fn();
 
-      printSendOutcome('Message', { messageId: 7, warning: 'Message delivered but not archived.' });
+      printSendOutcome('Message', { messageId: 7, warning: 'Message delivered but not archived.' }, { print, warn });
 
-      expect(log).toHaveBeenCalledWith('Message sent (7).');
-      expect(error).toHaveBeenCalledWith('Warning: Message delivered but not archived.');
+      expect(print).toHaveBeenCalledWith('Message sent (7).');
+      expect(warn).toHaveBeenCalledWith('Warning: Message delivered but not archived.');
     });
 
     it('prints no warning line when there is none', () => {
-      vi.spyOn(console, 'log').mockImplementation(() => {});
-      const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const print = vi.fn();
+      const warn = vi.fn();
 
-      printSendOutcome('Photo', { messageId: 8, scheduled: true });
+      printSendOutcome('Photo', { messageId: 8, scheduled: true }, { print, warn });
 
-      expect(error).not.toHaveBeenCalled();
+      expect(print).toHaveBeenCalledWith('Photo scheduled (8).');
+      expect(warn).not.toHaveBeenCalled();
     });
   });
 });

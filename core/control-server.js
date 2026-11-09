@@ -3,7 +3,9 @@ import path from 'path';
 import crypto from 'crypto';
 
 import { readJsonBody, sendJson } from './http-util.js';
-import { OPERATIONS } from './operations.js';
+import { OPERATIONS } from './ops/index.js';
+import { executeOperation } from './ops/execute.js';
+import { OperationInputError } from './ops/operation.js';
 import { SendCommandError } from './send-utils.js';
 import { isChatId } from './chat-key.js';
 
@@ -87,7 +89,7 @@ export function isIdle({ jobCounts, watchedCount, lastActivityAt, now, idleExitM
  * @param {object} deps.service       MessageSyncService (or compatible stub).
  * @param {object} [deps.warmServices] Warm { telegramClient, messageSyncService }
  *                                     the shared operation handlers run against
- *                                     for /control/invoke.
+ *                                     for /control/run.
  * @param {string} deps.token         Secret required in the control token header.
  * @param {number} deps.pid           Server process id.
  * @param {string} deps.version       Server version string.
@@ -301,26 +303,36 @@ export function createControlRequestHandler({
         return;
       }
 
+      // /control/invoke carries operation names and args that /control/run reads
+      // differently (`chat` for `channelId`, a nested `modification` for
+      // foldersEdit). It is refused, not guessed at, and the caller is told how to
+      // get a CLI and a server that match.
       if (req.method === 'POST' && url.pathname === '/control/invoke') {
+        sendJson(res, 400, {
+          error: `This tgcli server (${version}, pid ${pid}) is newer than this CLI; update tgcli, or run \`tgcli server restart\` to put the server on this CLI's version.`,
+        });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/control/run') {
         const body = await readJsonBody(req);
-        const op = body?.op;
-        const handler = typeof op === 'string' ? OPERATIONS[op] : undefined;
-        if (!handler) {
-          sendJson(res, 400, { error: `Unknown operation: ${op ?? ''}` });
+        const name = body?.op;
+        const op = typeof name === 'string' && Object.hasOwn(OPERATIONS, name) ? OPERATIONS[name] : undefined;
+        if (!op) {
+          sendJson(res, 400, { error: `Unknown operation: ${name ?? ''}` });
           return;
         }
-        // The warm client serves these operations, so make sure it is logged in
-        // before the handler touches MTProto.
-        if (typeof ensureLogin === 'function') {
-          await ensureLogin();
-        }
         try {
-          const result = await handler(warmServices, body?.args ?? {});
+          // The warm client serves these operations: executeOperation awaits the
+          // login before an operation that touches MTProto.
+          const result = await executeOperation(op, body?.args ?? {}, { services: warmServices, ensureLogin });
           sendJson(res, 200, { result });
         } catch (error) {
-          // A send op carries structured failure details; relay them so the CLI
-          // renders the same human/JSON error a local send would.
-          if (error instanceof SendCommandError) {
+          if (error instanceof OperationInputError) {
+            sendJson(res, 400, { error: error.message });
+          } else if (error instanceof SendCommandError) {
+            // A send op carries structured failure details; relay them so the CLI
+            // renders the same human/JSON error a local send would.
             sendJson(res, 500, { error: error.message, sendError: error.details });
           } else {
             sendJson(res, 500, { error: error?.message ?? 'Operation failed' });

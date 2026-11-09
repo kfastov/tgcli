@@ -85,10 +85,11 @@ per store, and every command checks its version before it runs.
    ```
 
 While you test, `tgcli` commands from other tools keep using the dev server and
-warn about it. An installed version that has this change also takes its server
-back by itself: once no command from the clone has reached the dev server for 10
-minutes, its next command replaces it. 2.2.5 and older only warn, so stop the dev
-server when you are done.
+warn about it. An installed version since 2.3.0 also takes its server back by
+itself: once no command from the clone has reached the dev server for 10 minutes,
+its next command replaces it. 2.2.5 and older only warn, so stop the dev server when
+you are done. An installed version without `/control/run` cannot run commands on a
+dev server that has it: they fail with advice to update or restart the server.
 
 ## How the server follows the CLI's version
 
@@ -105,7 +106,9 @@ status` brings up the new version. The rules (see `versionTakeover` in
   before a commit) is always replaced.
 - A server you started yourself (`tgcli server`, `tgcli service`), a server with
   queued backfill jobs and one still answering another CLI's request are not
-  replaced; the CLI warns on stderr instead.
+  replaced; the CLI warns on stderr instead, and runs its commands there. A server
+  without `/control/run` cannot run this CLI's commands at all: they fail with
+  advice to run `tgcli server restart`.
 - `tgcli server restart` switches to the caller's version in any direction.
 
 The `server` and `service` commands do not run this check; they start and stop
