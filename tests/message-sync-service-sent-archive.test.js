@@ -13,6 +13,7 @@ import { resolvePeer, sendMedia, sendText } from '@mtcute/core/methods.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { printSendOutcome } from '../cli.js';
+import { encodeMessage } from '../core/message-codec.js';
 import { OPERATIONS } from '../core/operations.js';
 import MessageSyncService from '../message-sync-service.js';
 import TelegramClient from '../telegram-client.js';
@@ -251,7 +252,7 @@ describe('archiving messages sent by tgcli', () => {
       peerType: 'chat',
       messages: messages
         .filter((message) => message.id > minId)
-        .map((message) => harness.telegramClient._serializeMessage(message, message.chat)),
+        .map(encodeMessage),
     }));
   };
 

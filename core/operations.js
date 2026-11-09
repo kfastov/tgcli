@@ -19,6 +19,8 @@ import {
   formatErrorMessage,
 } from './send-utils.js';
 import { isChatId } from './chat-key.js';
+import { decodeMessage } from './message-codec.js';
+import { toMessageView } from './message-view.js';
 
 // --- shared helpers ---
 
@@ -127,24 +129,10 @@ function filterMessagesById(messages, beforeId, afterId) {
   });
 }
 
-function formatLiveMessage(message, context) {
-  const dateIso = message.date ? new Date(message.date * 1000).toISOString() : null;
-  return {
-    channelId: context.channelId ?? message.peer_id ?? null,
-    peerTitle: context.peerTitle ?? null,
-    username: context.username ?? null,
-    messageId: message.id,
-    date: dateIso,
-    fromId: message.from_id ?? null,
-    fromUsername: message.from_username ?? null,
-    fromDisplayName: message.from_display_name ?? null,
-    fromPeerType: message.from_peer_type ?? null,
-    fromIsBot: typeof message.from_is_bot === 'boolean' ? message.from_is_bot : null,
-    text: message.text ?? message.message ?? '',
-    urls: message.urls ?? null,
-    media: message.media ?? null,
-    topicId: message.topic_id ?? null,
-  };
+// The message view of a stored message a live read returned, the same projection the
+// archive gives its rows. chat: { channelId, peerTitle, username }.
+function liveMessageView(stored, chat) {
+  return { ...toMessageView(decodeMessage(stored), { chat }), source: 'live' };
 }
 
 function messageDateMs(message) {
@@ -382,20 +370,17 @@ async function messagesList(ctx, args = {}) {
         beforeId,
         afterId,
       );
-      results.push(...filtered.map((message) => ({
-        ...formatLiveMessage(message, {
-          channelId: String(id),
-          peerTitle: fetched.peerTitle,
-          username: fetched.username,
-        }),
-        source: 'live',
+      results.push(...filtered.map((message) => liveMessageView(message, {
+        channelId: String(id),
+        peerTitle: fetched.peerTitle,
+        username: fetched.username,
       })));
     }
     return results;
   };
 
   if (resolvedSource === 'archive' || resolvedSource === 'both') {
-    const archived = ctx.messageSyncService.listArchivedMessages({
+    const archived = ctx.messageSyncService.archive.list({
       channelIds: channelIds.length ? channelIds : null,
       topicId,
       fromDate: args.fromDate,
@@ -495,20 +480,17 @@ async function messagesSearch(ctx, args = {}) {
           liveRegex.test(message.text ?? message.message ?? ''),
         );
       }
-      results.push(...filtered.map((message) => ({
-        ...formatLiveMessage(message, {
-          channelId: String(id),
-          peerTitle: fetched.peerTitle,
-          username: fetched.username,
-        }),
-        source: 'live',
+      results.push(...filtered.map((message) => liveMessageView(message, {
+        channelId: String(id),
+        peerTitle: fetched.peerTitle,
+        username: fetched.username,
       })));
     }
     return results;
   };
 
   if (resolvedSource === 'archive' || resolvedSource === 'both') {
-    const archived = ctx.messageSyncService.searchArchiveMessages({
+    const archived = ctx.messageSyncService.archive.search({
       query,
       regex: args.regex,
       tags: tagList.length ? tagList : null,
@@ -566,14 +548,11 @@ async function messagesGet(ctx, args = {}) {
       return null;
     }
     const meta = await resolveLiveMetadata(ctx, channelId);
-    return {
-      ...formatLiveMessage(live, { channelId: String(channelId), ...meta }),
-      source: 'live',
-    };
+    return liveMessageView(live, { channelId: String(channelId), ...meta });
   };
 
   const fetchArchive = async () => {
-    const archived = ctx.messageSyncService.getArchivedMessage({ channelId: await archiveKey(ctx, channelId), messageId });
+    const archived = ctx.messageSyncService.archive.get(await archiveKey(ctx, channelId), messageId);
     return archived ? { ...archived, source: 'archive' } : null;
   };
 
@@ -603,10 +582,7 @@ async function messagesContext(ctx, args = {}) {
       return null;
     }
     const meta = await resolveLiveMetadata(ctx, channelId);
-    const toLive = (message) => ({
-      ...formatLiveMessage(message, { channelId: String(channelId), ...meta }),
-      source: 'live',
-    });
+    const toLive = (message) => liveMessageView(message, { channelId: String(channelId), ...meta });
     return {
       target: toLive(liveContext.target),
       before: liveContext.before.map(toLive),
@@ -615,9 +591,7 @@ async function messagesContext(ctx, args = {}) {
   };
 
   const fetchArchive = async () => {
-    const archiveContext = ctx.messageSyncService.getArchivedMessageContext({
-      channelId: await archiveKey(ctx, channelId),
-      messageId,
+    const archiveContext = ctx.messageSyncService.archive.context(await archiveKey(ctx, channelId), messageId, {
       before: safeBefore,
       after: safeAfter,
     });
@@ -992,7 +966,6 @@ export const OPERATIONS = {
 export {
   archiveKey,
   buildSendSuccessPayload,
-  formatLiveMessage,
   mergeMessageSets,
   resolveSource,
   SendCommandError,

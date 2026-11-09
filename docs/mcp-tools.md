@@ -94,6 +94,9 @@ This document defines the consolidated MCP tool surface. The goal is fewer tools
 - Output: list of topics.
 
 ## Messages
+Every message tool returns messages in one shape, from the archive or live alike; the
+fields are listed under "Message fields" in docs/cli.md.
+
 ### messagesList
 - Params:
   - channelId? (optional)
@@ -114,7 +117,7 @@ This document defines the consolidated MCP tool surface. The goal is fewer tools
 
 ### messagesSearch
 - Params:
-  - query? (FTS query string)
+  - query? (FTS5 query; text that is not valid syntax is searched as plain words)
   - regex? (optional regex filter)
   - source? (archive|live|both, default archive)
   - channelIds? (list)

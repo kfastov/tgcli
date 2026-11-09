@@ -1454,7 +1454,7 @@ function createServerInstance() {
         .describe("Numeric channel ID or username"),
     },
     async ({ channelId }) => {
-      const stats = messageSyncService.getMessageStats(await archiveKeyFor(channelId));
+      const stats = messageSyncService.archive.stats(await archiveKeyFor(channelId));
 
       return {
         content: [

@@ -20,7 +20,7 @@ vi.mock('../core/services.js', () => ({
   })),
   createMessageSyncService: vi.fn(() => ({
     messageSyncService: {
-      getSearchStatus: () => ({ enabled: true, version: 5 }),
+      archive: { searchStatus: () => ({ enabled: true, version: 5 }) },
       getQueueStats: () => ({ pending: 0, in_progress: 0, idle: 0, error: 0, gaps: 0 }),
       isRepairSuggested: () => false,
       getLeftChatCounts: () => ({ syncOff: 0, stillJoined: 0 }),

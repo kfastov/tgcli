@@ -2,16 +2,16 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import { setTimeout as delay } from 'timers/promises';
-import { Message, MtArgumentError, MtPeerNotFoundError, PeersIndex, _messageMediaFromTl, getMarkedPeerId } from '@mtcute/core';
-import { isChatGone, normalizeChannelId, summarizeMedia } from './telegram-client.js';
+import { Message, MtArgumentError, MtPeerNotFoundError, PeersIndex, getMarkedPeerId } from '@mtcute/core';
+import { isChatGone, normalizeChannelId } from './telegram-client.js';
 import { resolveStoreDir, resolveStorePaths } from './core/store.js';
 import { parseRequiredWaitSeconds } from './core/send-utils.js';
-import { chatIdSql, isChatId } from './core/chat-key.js';
+import { chatIdForWrite, chatIdSql, chatKey, isChatId } from './core/chat-key.js';
+import MessageArchive, { parseIsoDate } from './core/message-archive.js';
+import { describePeer, describeSender, encodeMessage, normalizePeerType } from './core/message-codec.js';
 
 const DEFAULT_DB_PATH = resolveStorePaths(resolveStoreDir()).dbPath;
 const DEFAULT_TARGET_MESSAGES = 1000;
-const SEARCH_INDEX_VERSION = 2;
-const MEDIA_INDEX_VERSION = 1;
 const METADATA_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const JOB_STATUS = {
   PENDING: 'pending',
@@ -50,26 +50,6 @@ const RETRY_MAX_MS = 60 * 60 * 1000;
 const USERNAME_RECHECK_MS = 24 * 60 * 60 * 1000;
 // Marked channel ids are below this. A text prefix would also match some basic groups.
 const MAX_MARKED_CHANNEL_ID = -1000000000000;
-const URL_PATTERN = /https?:\/\/[^\s<>"')]+/giu;
-const FILE_NAME_PATTERN = /\b[\w.\-]+\.[a-z0-9]{2,7}\b/iu;
-const MAX_FILENAME_SCAN_DEPTH = 5;
-const MEDIA_COLUMNS = `
-  message_media.media_type,
-  message_media.file_id,
-  message_media.unique_file_id,
-  message_media.file_name,
-  message_media.mime_type,
-  message_media.file_size,
-  message_media.width,
-  message_media.height,
-  message_media.duration,
-  message_media.extra_json
-`;
-const MEDIA_JOIN = `
-  LEFT JOIN message_media
-    ON message_media.channel_id = messages.channel_id
-   AND message_media.message_id = messages.message_id
-`;
 
 const TAG_RULES = [
   {
@@ -226,16 +206,7 @@ const TAG_RULES = [
 ];
 
 function normalizeChannelKey(channelId) {
-  return String(normalizeChannelId(channelId));
-}
-
-// A username gets here only through resolveChatKey, which turns it into the id.
-function chatIdForWrite(channelId) {
-  const key = normalizeChannelKey(channelId);
-  if (!isChatId(key)) {
-    throw new Error(`Chat ${key} has to be resolved to its Telegram id before it is archived.`);
-  }
-  return key;
+  return chatKey(channelId);
 }
 
 const USERNAME_NOT_FOUND_ERRORS = new Set(['USERNAME_INVALID', 'USERNAME_NOT_OCCUPIED']);
@@ -284,69 +255,9 @@ function mayLackFullContent(message) {
   return message.raw?.peerId?._ !== 'peerChannel' && !message.raw?.media;
 }
 
-function normalizePeerType(peer) {
-  if (!peer) return 'chat';
-  if (peer.type === 'user' || peer.type === 'bot') return 'user';
-  if (peer.type === 'channel') return 'channel';
-  if (peer.type === 'chat' && peer.chatType && peer.chatType !== 'group') return 'channel';
-  return 'chat';
-}
-
-function parseIsoDate(value) {
-  if (!value) return null;
-  const date = value instanceof Date ? value : new Date(value);
-  const ts = date.getTime();
-  if (Number.isNaN(ts)) {
-    throw new Error('minDate must be a valid ISO-8601 string');
-  }
-  return Math.floor(ts / 1000);
-}
-
 function toIsoString(dateSeconds) {
   if (!dateSeconds) return null;
   return new Date(dateSeconds * 1000).toISOString();
-}
-
-function formatMediaRow(row) {
-  if (!row) {
-    return null;
-  }
-  const hasMedia = row.media_type || row.file_id || row.unique_file_id || row.file_name;
-  if (!hasMedia) {
-    return null;
-  }
-  const extras = safeParseJson(row.extra_json);
-  return {
-    type: row.media_type ?? null,
-    fileId: row.file_id ?? null,
-    uniqueFileId: row.unique_file_id ?? null,
-    fileName: row.file_name ?? null,
-    mimeType: row.mime_type ?? null,
-    fileSize: typeof row.file_size === 'number' ? row.file_size : row.file_size ?? null,
-    width: typeof row.width === 'number' ? row.width : row.width ?? null,
-    height: typeof row.height === 'number' ? row.height : row.height ?? null,
-    duration: typeof row.duration === 'number' ? row.duration : row.duration ?? null,
-    extras: extras ?? null,
-  };
-}
-
-function formatArchivedRow(row) {
-  const isBot = row.from_is_bot;
-  return {
-    channelId: row.channel_id,
-    peerTitle: row.peer_title ?? null,
-    username: row.username ?? null,
-    messageId: row.message_id,
-    date: row.date ? new Date(row.date * 1000).toISOString() : null,
-    fromId: row.from_id ?? null,
-    fromUsername: row.from_username ?? null,
-    fromDisplayName: row.from_display_name ?? null,
-    fromPeerType: row.from_peer_type ?? null,
-    fromIsBot: typeof isBot === 'number' ? Boolean(isBot) : isBot ?? null,
-    text: row.text ?? '',
-    media: formatMediaRow(row),
-    topicId: row.topic_id ?? null,
-  };
 }
 
 function normalizeTagsList(raw) {
@@ -384,213 +295,6 @@ function formatContactRow(row) {
     notes: row.notes ?? null,
     tags,
   };
-}
-
-function extractLinksFromText(text) {
-  if (!text || typeof text !== 'string') {
-    return [];
-  }
-  const matches = text.match(URL_PATTERN) ?? [];
-  const results = new Set();
-  for (const raw of matches) {
-    const cleaned = raw.replace(/[),.!?;:]+$/g, '');
-    if (cleaned) {
-      results.add(cleaned);
-    }
-  }
-  return [...results];
-}
-
-function extractFileNamesFromText(text) {
-  if (!text || typeof text !== 'string') {
-    return [];
-  }
-  const matches = text.match(new RegExp(FILE_NAME_PATTERN.source, 'giu')) ?? [];
-  return matches;
-}
-
-function collectFileNames(value, results, depth = 0) {
-  if (!value || depth > MAX_FILENAME_SCAN_DEPTH) {
-    return;
-  }
-  if (Array.isArray(value)) {
-    for (const entry of value) {
-      collectFileNames(entry, results, depth + 1);
-    }
-    return;
-  }
-  if (typeof value !== 'object') {
-    return;
-  }
-  for (const [key, entry] of Object.entries(value)) {
-    if ((key === 'fileName' || key === 'file_name') && typeof entry === 'string') {
-      results.add(entry);
-      continue;
-    }
-    if (key === 'name' && typeof entry === 'string' && FILE_NAME_PATTERN.test(entry)) {
-      results.add(entry);
-      continue;
-    }
-    collectFileNames(entry, results, depth + 1);
-  }
-}
-
-function extractFileNames(message) {
-  const results = new Set();
-  const textFiles = extractFileNamesFromText(message?.text ?? message?.message ?? null);
-  for (const entry of textFiles) {
-    results.add(entry);
-  }
-  if (message?.raw) {
-    collectFileNames(message.raw, results);
-  }
-  return [...results];
-}
-
-function buildSenderText(message) {
-  const parts = [];
-  if (message?.from_username) {
-    parts.push(String(message.from_username));
-  }
-  if (message?.from_display_name) {
-    parts.push(String(message.from_display_name));
-  }
-  if (message?.from_id) {
-    parts.push(String(message.from_id));
-  }
-  return parts.length ? parts.join(' ') : null;
-}
-
-function buildTopicText(message) {
-  if (!message) {
-    return null;
-  }
-  if (typeof message.topic_title === 'string' && message.topic_title.trim()) {
-    return message.topic_title.trim();
-  }
-  if (message.topic_id !== null && message.topic_id !== undefined) {
-    return String(message.topic_id);
-  }
-  return null;
-}
-
-function buildLinkEntries(links) {
-  const entries = [];
-  for (const url of links) {
-    let domain = null;
-    try {
-      domain = new URL(url).hostname || null;
-    } catch (error) {
-      domain = null;
-    }
-    entries.push({ url, domain });
-  }
-  return entries;
-}
-
-function buildSearchFields(message) {
-  const links = extractLinksFromText(message?.text ?? message?.message ?? null);
-  const files = extractFileNames(message);
-  const sender = buildSenderText(message);
-  const topic = buildTopicText(message);
-  return {
-    linksText: links.length ? links.join(' ') : null,
-    filesText: files.length ? files.join(' ') : null,
-    senderText: sender,
-    topicText: topic,
-    linkEntries: buildLinkEntries(links),
-  };
-}
-
-function safeParseJson(value) {
-  if (!value || typeof value !== 'string') {
-    return null;
-  }
-  try {
-    return JSON.parse(value);
-  } catch (error) {
-    return null;
-  }
-}
-
-function normalizeMediaText(value) {
-  if (typeof value === 'string') {
-    const trimmed = value.trim();
-    return trimmed ? trimmed : null;
-  }
-  if (typeof value === 'number' || typeof value === 'bigint') {
-    return String(value);
-  }
-  return null;
-}
-
-function normalizeMediaNumber(value) {
-  if (value === null || value === undefined) {
-    return null;
-  }
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return value;
-  }
-  if (typeof value === 'string' && value.trim()) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-  return null;
-}
-
-function buildMediaRecord(summary) {
-  if (!summary || typeof summary !== 'object') {
-    return null;
-  }
-  const mediaType = normalizeMediaText(summary.type ?? summary.media_type);
-  if (!mediaType) {
-    return null;
-  }
-  let extraJson = null;
-  if (summary.extras && typeof summary.extras === 'object') {
-    try {
-      extraJson = JSON.stringify(summary.extras);
-    } catch (error) {
-      extraJson = null;
-    }
-  } else if (typeof summary.extra_json === 'string') {
-    extraJson = summary.extra_json;
-  }
-
-  return {
-    media_type: mediaType,
-    file_id: normalizeMediaText(summary.fileId ?? summary.file_id),
-    unique_file_id: normalizeMediaText(summary.uniqueFileId ?? summary.unique_file_id),
-    file_name: normalizeMediaText(summary.fileName ?? summary.file_name),
-    mime_type: normalizeMediaText(summary.mimeType ?? summary.mime_type),
-    file_size: normalizeMediaNumber(summary.fileSize ?? summary.file_size),
-    width: normalizeMediaNumber(summary.width),
-    height: normalizeMediaNumber(summary.height),
-    duration: normalizeMediaNumber(summary.duration),
-    extra_json: extraJson,
-  };
-}
-
-function extractMediaSummary(message) {
-  if (!message || typeof message !== 'object') {
-    return null;
-  }
-  if (message.media) {
-    const summary = summarizeMedia(message.media);
-    if (summary) {
-      return summary;
-    }
-  }
-  const rawMedia = message.raw?.media;
-  if (!rawMedia || typeof rawMedia !== 'object') {
-    return null;
-  }
-  try {
-    const parsed = _messageMediaFromTl(null, rawMedia);
-    return summarizeMedia(parsed);
-  } catch (error) {
-    return null;
-  }
 }
 
 function normalizeTag(tag) {
@@ -837,30 +541,6 @@ export default class MessageSyncService {
       ON contact_tags (user_id);
     `);
 
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        channel_id TEXT NOT NULL,
-        message_id INTEGER NOT NULL,
-        topic_id INTEGER,
-        date INTEGER,
-        from_id TEXT,
-        text TEXT,
-        links TEXT,
-        files TEXT,
-        sender TEXT,
-        topic TEXT,
-        raw_json TEXT,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(channel_id, message_id)
-      );
-    `);
-
-    this._ensureMessageColumn('topic_id', 'INTEGER');
-    this._ensureMessageColumn('links', 'TEXT');
-    this._ensureMessageColumn('files', 'TEXT');
-    this._ensureMessageColumn('sender', 'TEXT');
-    this._ensureMessageColumn('topic', 'TEXT');
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS sent_messages_to_refetch (
@@ -917,63 +597,6 @@ export default class MessageSyncService {
     `);
 
     this.db.exec(`
-      CREATE TABLE IF NOT EXISTS message_links (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        channel_id TEXT NOT NULL,
-        message_id INTEGER NOT NULL,
-        url TEXT NOT NULL,
-        domain TEXT,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(channel_id, message_id, url)
-      );
-    `);
-
-    this.db.exec(`
-      CREATE INDEX IF NOT EXISTS message_links_url_idx
-      ON message_links (url);
-    `);
-
-    this.db.exec(`
-      CREATE INDEX IF NOT EXISTS message_links_domain_idx
-      ON message_links (domain);
-    `);
-
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS message_media (
-        channel_id TEXT NOT NULL,
-        message_id INTEGER NOT NULL,
-        media_type TEXT,
-        file_id TEXT,
-        unique_file_id TEXT,
-        file_name TEXT,
-        mime_type TEXT,
-        file_size INTEGER,
-        width INTEGER,
-        height INTEGER,
-        duration INTEGER,
-        extra_json TEXT,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (channel_id, message_id)
-      );
-    `);
-
-    this.db.exec(`
-      CREATE INDEX IF NOT EXISTS message_media_type_idx
-      ON message_media (media_type);
-    `);
-
-    this.db.exec(`
-      CREATE INDEX IF NOT EXISTS message_media_mime_idx
-      ON message_media (mime_type);
-    `);
-
-    this.db.exec(`
-      CREATE INDEX IF NOT EXISTS message_media_name_idx
-      ON message_media (file_name);
-    `);
-
-    this.db.exec(`
       CREATE TABLE IF NOT EXISTS topics (
         channel_id TEXT NOT NULL,
         topic_id INTEGER NOT NULL,
@@ -999,110 +622,8 @@ export default class MessageSyncService {
       this._setRepairNotNeeded('archive started with the fixes');
     }
 
-    const searchSchema = this.db.prepare(`
-      SELECT sql FROM sqlite_master
-      WHERE type = 'table' AND name = 'message_search'
-    `).get();
-    const storedVersion = this.db.prepare(`
-      SELECT value FROM search_meta WHERE key = 'search_index_version'
-    `).get()?.value;
-    const storedMediaVersion = this.db.prepare(`
-      SELECT value FROM search_meta WHERE key = 'media_index_version'
-    `).get()?.value;
-    const needsVersionRebuild = Number(storedVersion ?? 0) !== SEARCH_INDEX_VERSION;
-    const needsMediaRebuild = Number(storedMediaVersion ?? 0) !== MEDIA_INDEX_VERSION;
-    const needsSearchRecreate = !searchSchema?.sql
-      || !searchSchema.sql.includes("tokenize='unicode61'")
-      || !searchSchema.sql.includes('links')
-      || needsVersionRebuild;
-    const shouldRebuildSearch = needsSearchRecreate;
-
-    if (needsSearchRecreate) {
-      this.db.exec(`
-        DROP TRIGGER IF EXISTS messages_ai;
-        DROP TRIGGER IF EXISTS messages_ad;
-        DROP TRIGGER IF EXISTS messages_au;
-        DROP TABLE IF EXISTS message_search;
-      `);
-    }
-
-    if (needsVersionRebuild || needsMediaRebuild) {
-      this._backfillSearchFields({ rebuildMedia: needsMediaRebuild });
-    }
-
-    this.db.exec(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS message_search USING fts5(
-        text,
-        links,
-        files,
-        sender,
-        topic,
-        content='messages',
-        content_rowid='id',
-        tokenize='unicode61'
-      );
-    `);
-
-    this.db.exec(`
-      CREATE TRIGGER IF NOT EXISTS messages_ai
-      AFTER INSERT ON messages BEGIN
-        INSERT INTO message_search(rowid, text, links, files, sender, topic)
-        VALUES (
-          new.id,
-          COALESCE(new.text, ''),
-          COALESCE(new.links, ''),
-          COALESCE(new.files, ''),
-          COALESCE(new.sender, ''),
-          COALESCE(new.topic, '')
-        );
-      END;
-    `);
-
-    this.db.exec(`
-      CREATE TRIGGER IF NOT EXISTS messages_ad
-      AFTER DELETE ON messages BEGIN
-        INSERT INTO message_search(message_search, rowid, text, links, files, sender, topic)
-        VALUES (
-          'delete',
-          old.id,
-          COALESCE(old.text, ''),
-          COALESCE(old.links, ''),
-          COALESCE(old.files, ''),
-          COALESCE(old.sender, ''),
-          COALESCE(old.topic, '')
-        );
-      END;
-    `);
-
-    this.db.exec(`
-      CREATE TRIGGER IF NOT EXISTS messages_au
-      AFTER UPDATE ON messages BEGIN
-        INSERT INTO message_search(message_search, rowid, text, links, files, sender, topic)
-        VALUES (
-          'delete',
-          old.id,
-          COALESCE(old.text, ''),
-          COALESCE(old.links, ''),
-          COALESCE(old.files, ''),
-          COALESCE(old.sender, ''),
-          COALESCE(old.topic, '')
-        );
-        INSERT INTO message_search(rowid, text, links, files, sender, topic)
-        VALUES (
-          new.id,
-          COALESCE(new.text, ''),
-          COALESCE(new.links, ''),
-          COALESCE(new.files, ''),
-          COALESCE(new.sender, ''),
-          COALESCE(new.topic, '')
-        );
-      END;
-    `);
-
-    this.db.exec(`
-      CREATE INDEX IF NOT EXISTS messages_channel_topic_idx
-      ON messages (channel_id, topic_id, message_id);
-    `);
+    this.archive = new MessageArchive(this.db);
+    this.archive.init();
 
     this.db.exec(`
       INSERT OR IGNORE INTO channels (channel_id, sync_enabled)
@@ -1145,37 +666,6 @@ export default class MessageSyncService {
       WHERE channel_id = ? AND source = ?
     `);
 
-    this.upsertUserStmt = this.db.prepare(`
-      INSERT INTO users (
-        user_id,
-        peer_type,
-        username,
-        display_name,
-        phone,
-        is_contact,
-        is_bot,
-        updated_at
-      )
-      VALUES (
-        @user_id,
-        @peer_type,
-        @username,
-        @display_name,
-        @phone,
-        @is_contact,
-        @is_bot,
-        CURRENT_TIMESTAMP
-      )
-      ON CONFLICT(user_id) DO UPDATE SET
-        peer_type = COALESCE(excluded.peer_type, users.peer_type),
-        username = COALESCE(excluded.username, users.username),
-        display_name = COALESCE(excluded.display_name, users.display_name),
-        phone = COALESCE(excluded.phone, users.phone),
-        is_contact = COALESCE(excluded.is_contact, users.is_contact),
-        is_bot = COALESCE(excluded.is_bot, users.is_bot),
-        updated_at = CURRENT_TIMESTAMP
-    `);
-
     this.ensureUserStmt = this.db.prepare(`
       INSERT OR IGNORE INTO users (user_id, peer_type, updated_at)
       VALUES (?, 'user', CURRENT_TIMESTAMP)
@@ -1214,134 +704,6 @@ export default class MessageSyncService {
       ORDER BY tag ASC
     `);
 
-    this.insertMessageStmt = this.db.prepare(`
-      INSERT OR IGNORE INTO messages (
-        channel_id,
-        message_id,
-        topic_id,
-        date,
-        from_id,
-        text,
-        links,
-        files,
-        sender,
-        topic,
-        raw_json
-      )
-      VALUES (
-        @channel_id,
-        @message_id,
-        @topic_id,
-        @date,
-        @from_id,
-        @text,
-        @links,
-        @files,
-        @sender,
-        @topic,
-        @raw_json
-      )
-    `);
-
-    this.upsertMessageStmt = this.db.prepare(`
-      INSERT INTO messages (
-        channel_id,
-        message_id,
-        topic_id,
-        date,
-        from_id,
-        text,
-        links,
-        files,
-        sender,
-        topic,
-        raw_json
-      )
-      VALUES (
-        @channel_id,
-        @message_id,
-        @topic_id,
-        @date,
-        @from_id,
-        @text,
-        @links,
-        @files,
-        @sender,
-        @topic,
-        @raw_json
-      )
-      ON CONFLICT(channel_id, message_id) DO UPDATE SET
-        topic_id = excluded.topic_id,
-        date = excluded.date,
-        from_id = excluded.from_id,
-        text = excluded.text,
-        links = excluded.links,
-        files = excluded.files,
-        sender = excluded.sender,
-        topic = excluded.topic,
-        raw_json = excluded.raw_json
-    `);
-
-    this.insertMessageLinkStmt = this.db.prepare(`
-      INSERT OR IGNORE INTO message_links (channel_id, message_id, url, domain)
-      VALUES (@channel_id, @message_id, @url, @domain)
-    `);
-
-    this.deleteMessageLinksStmt = this.db.prepare(`
-      DELETE FROM message_links
-      WHERE channel_id = ? AND message_id = ?
-    `);
-
-    this.upsertMessageMediaStmt = this.db.prepare(`
-      INSERT INTO message_media (
-        channel_id,
-        message_id,
-        media_type,
-        file_id,
-        unique_file_id,
-        file_name,
-        mime_type,
-        file_size,
-        width,
-        height,
-        duration,
-        extra_json,
-        updated_at
-      )
-      VALUES (
-        @channel_id,
-        @message_id,
-        @media_type,
-        @file_id,
-        @unique_file_id,
-        @file_name,
-        @mime_type,
-        @file_size,
-        @width,
-        @height,
-        @duration,
-        @extra_json,
-        CURRENT_TIMESTAMP
-      )
-      ON CONFLICT(channel_id, message_id) DO UPDATE SET
-        media_type = excluded.media_type,
-        file_id = excluded.file_id,
-        unique_file_id = excluded.unique_file_id,
-        file_name = excluded.file_name,
-        mime_type = excluded.mime_type,
-        file_size = excluded.file_size,
-        width = excluded.width,
-        height = excluded.height,
-        duration = excluded.duration,
-        extra_json = excluded.extra_json,
-        updated_at = CURRENT_TIMESTAMP
-    `);
-
-    this.deleteMessageMediaStmt = this.db.prepare(`
-      DELETE FROM message_media
-      WHERE channel_id = ? AND message_id = ?
-    `);
-
     this.upsertTopicStmt = this.db.prepare(`
       INSERT INTO topics (channel_id, topic_id, title, updated_at)
       VALUES (@channel_id, @topic_id, @title, CURRENT_TIMESTAMP)
@@ -1349,25 +711,6 @@ export default class MessageSyncService {
         title = excluded.title,
         updated_at = CURRENT_TIMESTAMP
     `);
-
-    this.updateMessagesTopicStmt = this.db.prepare(`
-      UPDATE messages
-      SET topic = ?
-      WHERE channel_id = ? AND topic_id = ?
-    `);
-
-    this.insertMessagesTx = this.db.transaction((records) => {
-      let inserted = 0;
-      for (const record of records) {
-        const result = this.insertMessageStmt.run(record);
-        if (result.changes > 0) {
-          inserted += result.changes;
-          this._replaceMessageLinks(record);
-          this._replaceMessageMedia(record);
-        }
-      }
-      return inserted;
-    });
 
     this.setChannelTagsTx = this.db.transaction((channelId, source, tags) => {
       this.deleteChannelTagsStmt.run(channelId, source);
@@ -1381,12 +724,6 @@ export default class MessageSyncService {
       }
     });
 
-    this.upsertUsersTx = this.db.transaction((records) => {
-      for (const record of records) {
-        this.upsertUserStmt.run(record);
-      }
-    });
-
     this.upsertTopicsTx = this.db.transaction((channelId, topics) => {
       for (const topic of topics) {
         this.upsertTopicStmt.run({
@@ -1395,27 +732,10 @@ export default class MessageSyncService {
           title: topic.title ?? null,
         });
         if (topic.title) {
-          this.updateMessagesTopicStmt.run(topic.title, channelId, topic.id);
+          this.archive.setTopicTitle(channelId, topic.id, topic.title);
         }
       }
     });
-
-    if (shouldRebuildSearch) {
-      this.db.prepare("INSERT INTO message_search(message_search) VALUES ('rebuild')").run();
-      this.db.prepare(`
-        INSERT INTO search_meta (key, value)
-        VALUES ('search_index_version', ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-      `).run(String(SEARCH_INDEX_VERSION));
-    }
-
-    if (needsMediaRebuild) {
-      this.db.prepare(`
-        INSERT INTO search_meta (key, value)
-        VALUES ('media_index_version', ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-      `).run(String(MEDIA_INDEX_VERSION));
-    }
   }
 
   _ensureJobColumn(column, definition) {
@@ -1432,13 +752,6 @@ export default class MessageSyncService {
     }
     this.db.exec(`ALTER TABLE channels ADD COLUMN ${column} ${definition}`);
     return true;
-  }
-
-  _ensureMessageColumn(column, definition) {
-    const existing = this.db.prepare('PRAGMA table_info(messages)').all();
-    if (!existing.some((col) => col.name === column)) {
-      this.db.exec(`ALTER TABLE messages ADD COLUMN ${column} ${definition}`);
-    }
   }
 
   _ensureUserColumn(column, definition) {
@@ -1808,17 +1121,7 @@ export default class MessageSyncService {
 
   async refreshContacts() {
     const contacts = await this.telegramClient.listContacts();
-    const records = [];
-    for (const contact of contacts) {
-      const record = this._buildUserRecordFromPeer(contact);
-      if (record) {
-        records.push(record);
-      }
-    }
-    if (records.length) {
-      this.upsertUsersTx(records);
-    }
-    return records.length;
+    return this.archive.upsertUsers(contacts.map(describePeer));
   }
 
   setContactAlias(userId, alias) {
@@ -2484,20 +1787,6 @@ export default class MessageSyncService {
       processing: this.processing,
       ...stats,
       gaps: this._getGapChannelIds().length,
-    };
-  }
-
-  getSearchStatus() {
-    const row = this.db.prepare(`
-      SELECT name FROM sqlite_master
-      WHERE type = 'table' AND name = 'message_search'
-    `).get();
-    const version = this.db.prepare(`
-      SELECT value FROM search_meta WHERE key = 'search_index_version'
-    `).get()?.value ?? null;
-    return {
-      enabled: Boolean(row?.name),
-      version: version ? Number(version) : null,
     };
   }
 
@@ -3471,11 +2760,7 @@ export default class MessageSyncService {
 
   _countMissingMessages(channelId, messages) {
     const ids = messages.map((message) => message.id);
-    const { present } = this.db.prepare(`
-      SELECT COUNT(*) AS present FROM messages
-      WHERE channel_id = ? AND message_id IN (SELECT value FROM json_each(?))
-    `).get(channelId, JSON.stringify(ids));
-    return ids.length - present;
+    return ids.length - this.archive.countPresent(channelId, ids);
   }
 
   // Holes lie where the archive followed the chat: from when the chat entered the archive,
@@ -3487,574 +2772,6 @@ export default class MessageSyncService {
     `).get(channelId);
     const sinceDate = Math.max(repair.since_date ?? 0, row?.entered_at ?? 0) || null;
     return { floor: repair.after_message_id ?? 0, sinceDate };
-  }
-
-  searchMessages({ channelId, topicId, pattern, limit = 50, caseInsensitive = true }) {
-    const normalizedId = normalizeChannelKey(channelId);
-    const flags = caseInsensitive ? 'i' : '';
-    let regex;
-    try {
-      regex = new RegExp(pattern, flags);
-    } catch (error) {
-      throw new Error(`Invalid pattern: ${error.message}`);
-    }
-
-    const topicClause = typeof topicId === 'number' ? 'AND topic_id = ?' : '';
-    const params = typeof topicId === 'number' ? [normalizedId, topicId] : [normalizedId];
-    const rows = this.db.prepare(`
-      SELECT
-        messages.message_id,
-        messages.date,
-        messages.from_id,
-        messages.text,
-        messages.topic_id,
-        users.username AS from_username,
-        users.display_name AS from_display_name
-      FROM messages
-      LEFT JOIN users ON users.user_id = messages.from_id
-      WHERE channel_id = ?
-      ${topicClause}
-      ORDER BY message_id DESC
-    `).all(...params);
-
-    const matches = [];
-    for (const row of rows) {
-      const text = row.text || '';
-      if (regex.test(text)) {
-        matches.push({
-          messageId: row.message_id,
-          date: row.date ? new Date(row.date * 1000).toISOString() : null,
-          fromId: row.from_id,
-          fromUsername: row.from_username ?? null,
-          fromDisplayName: row.from_display_name ?? null,
-          text,
-          topicId: row.topic_id ?? null,
-        });
-        if (matches.length >= limit) {
-          break;
-        }
-      }
-    }
-
-    return matches;
-  }
-
-  listArchivedMessages({ channelIds, topicId, fromDate, toDate, beforeId, afterId, limit = 50 }) {
-    const resolvedIds = Array.isArray(channelIds) ? channelIds : (channelIds ? [channelIds] : []);
-    const normalizedIds = resolvedIds.map((id) => normalizeChannelKey(id)).filter(Boolean);
-    const clauses = [];
-    const params = [];
-
-    if (normalizedIds.length) {
-      clauses.push(`messages.channel_id IN (${normalizedIds.map(() => '?').join(', ')})`);
-      params.push(...normalizedIds);
-    }
-
-    if (typeof topicId === 'number') {
-      clauses.push('messages.topic_id = ?');
-      params.push(topicId);
-    }
-
-    if (fromDate) {
-      params.push(parseIsoDate(fromDate));
-      clauses.push('messages.date >= ?');
-    }
-
-    if (toDate) {
-      params.push(parseIsoDate(toDate));
-      clauses.push('messages.date <= ?');
-    }
-
-    if (Number.isFinite(beforeId) && beforeId > 0) {
-      params.push(Number(beforeId));
-      clauses.push('messages.message_id < ?');
-    }
-
-    if (Number.isFinite(afterId) && afterId > 0) {
-      params.push(Number(afterId));
-      clauses.push('messages.message_id > ?');
-    }
-
-    const whereClause = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-    const finalLimit = limit && limit > 0 ? Number(limit) : 50;
-    params.push(finalLimit);
-
-    const rows = this.db.prepare(`
-      SELECT
-        messages.channel_id,
-        channels.peer_title,
-        channels.username,
-        messages.message_id,
-        messages.date,
-        messages.from_id,
-        messages.text,
-        messages.topic_id,
-        users.username AS from_username,
-        users.display_name AS from_display_name,
-        users.peer_type AS from_peer_type,
-        users.is_bot AS from_is_bot,
-        ${MEDIA_COLUMNS}
-      FROM messages
-      LEFT JOIN channels ON channels.channel_id = messages.channel_id
-      LEFT JOIN users ON users.user_id = messages.from_id
-      ${MEDIA_JOIN}
-      ${whereClause}
-      ORDER BY messages.date DESC
-      LIMIT ?
-    `).all(...params);
-
-    return rows.map((row) => formatArchivedRow(row));
-  }
-
-  getArchivedMessage({ channelId, messageId }) {
-    const normalizedId = normalizeChannelKey(channelId);
-    const row = this.db.prepare(`
-      SELECT
-        messages.channel_id,
-        channels.peer_title,
-        channels.username,
-        messages.message_id,
-        messages.date,
-        messages.from_id,
-        messages.text,
-        messages.topic_id,
-        users.username AS from_username,
-        users.display_name AS from_display_name,
-        users.peer_type AS from_peer_type,
-        users.is_bot AS from_is_bot,
-        ${MEDIA_COLUMNS}
-      FROM messages
-      LEFT JOIN channels ON channels.channel_id = messages.channel_id
-      LEFT JOIN users ON users.user_id = messages.from_id
-      ${MEDIA_JOIN}
-      WHERE messages.channel_id = ? AND messages.message_id = ?
-    `).get(normalizedId, Number(messageId));
-
-    if (!row) {
-      return null;
-    }
-
-    return formatArchivedRow(row);
-  }
-
-  getArchivedMessageContext({ channelId, messageId, before = 20, after = 20 }) {
-    const normalizedId = normalizeChannelKey(channelId);
-    const target = this.getArchivedMessage({ channelId: normalizedId, messageId });
-    if (!target) {
-      return { target: null, before: [], after: [] };
-    }
-
-    const safeBefore = before && before > 0 ? Number(before) : 0;
-    const safeAfter = after && after > 0 ? Number(after) : 0;
-
-    const beforeRows = safeBefore > 0
-      ? this.db.prepare(`
-          SELECT
-            messages.channel_id,
-            channels.peer_title,
-            channels.username,
-            messages.message_id,
-            messages.date,
-            messages.from_id,
-            messages.text,
-            messages.topic_id,
-            users.username AS from_username,
-            users.display_name AS from_display_name,
-            users.peer_type AS from_peer_type,
-            users.is_bot AS from_is_bot,
-            ${MEDIA_COLUMNS}
-          FROM messages
-          LEFT JOIN channels ON channels.channel_id = messages.channel_id
-          LEFT JOIN users ON users.user_id = messages.from_id
-          ${MEDIA_JOIN}
-          WHERE messages.channel_id = ? AND messages.message_id < ?
-          ORDER BY messages.message_id DESC
-          LIMIT ?
-        `).all(normalizedId, Number(messageId), safeBefore)
-      : [];
-
-    const afterRows = safeAfter > 0
-      ? this.db.prepare(`
-          SELECT
-            messages.channel_id,
-            channels.peer_title,
-            channels.username,
-            messages.message_id,
-            messages.date,
-            messages.from_id,
-            messages.text,
-            messages.topic_id,
-            users.username AS from_username,
-            users.display_name AS from_display_name,
-            users.peer_type AS from_peer_type,
-            users.is_bot AS from_is_bot,
-            ${MEDIA_COLUMNS}
-          FROM messages
-          LEFT JOIN channels ON channels.channel_id = messages.channel_id
-          LEFT JOIN users ON users.user_id = messages.from_id
-          ${MEDIA_JOIN}
-          WHERE messages.channel_id = ? AND messages.message_id > ?
-          ORDER BY messages.message_id ASC
-          LIMIT ?
-        `).all(normalizedId, Number(messageId), safeAfter)
-      : [];
-
-    const beforeMessages = beforeRows.map((row) => formatArchivedRow(row)).reverse();
-    const afterMessages = afterRows.map((row) => formatArchivedRow(row));
-
-    return {
-      target,
-      before: beforeMessages,
-      after: afterMessages,
-    };
-  }
-
-  searchArchiveMessages(options = {}) {
-    const queryText = typeof options.query === 'string' ? options.query.trim() : '';
-    const regexText = typeof options.regex === 'string' ? options.regex.trim() : '';
-    const tagList = Array.isArray(options.tags) ? options.tags : (options.tag ? [options.tag] : []);
-    const normalizedTags = tagList.map((tag) => normalizeTag(tag)).filter(Boolean);
-    const resolvedIds = Array.isArray(options.channelIds)
-      ? options.channelIds
-      : (options.channelIds ? [options.channelIds] : []);
-    const normalizedIds = resolvedIds.map((id) => normalizeChannelKey(id)).filter(Boolean);
-    const topicId = typeof options.topicId === 'number' ? options.topicId : null;
-    const finalLimit = options.limit && options.limit > 0 ? Number(options.limit) : 100;
-    const caseInsensitive = options.caseInsensitive !== false;
-
-    let regex = null;
-    if (regexText) {
-      try {
-        regex = new RegExp(regexText, caseInsensitive ? 'i' : '');
-      } catch (error) {
-        throw new Error(`Invalid regex: ${error.message}`);
-      }
-    }
-
-    const clauses = [];
-    const params = [];
-    const joinTags = normalizedTags.length
-      ? 'JOIN channel_tags ON channel_tags.channel_id = messages.channel_id'
-      : '';
-
-    if (normalizedTags.length) {
-      clauses.push(`channel_tags.tag IN (${normalizedTags.map(() => '?').join(', ')})`);
-      params.push(...normalizedTags);
-    }
-
-    if (normalizedIds.length) {
-      clauses.push(`messages.channel_id IN (${normalizedIds.map(() => '?').join(', ')})`);
-      params.push(...normalizedIds);
-    }
-
-    if (topicId !== null) {
-      clauses.push('messages.topic_id = ?');
-      params.push(topicId);
-    }
-
-    if (options.fromDate) {
-      params.push(parseIsoDate(options.fromDate));
-      clauses.push('messages.date >= ?');
-    }
-
-    if (options.toDate) {
-      params.push(parseIsoDate(options.toDate));
-      clauses.push('messages.date <= ?');
-    }
-
-    if (Number.isFinite(options.beforeId) && options.beforeId > 0) {
-      params.push(Number(options.beforeId));
-      clauses.push('messages.message_id < ?');
-    }
-
-    if (Number.isFinite(options.afterId) && options.afterId > 0) {
-      params.push(Number(options.afterId));
-      clauses.push('messages.message_id > ?');
-    }
-
-    if (queryText) {
-      clauses.push('message_search MATCH ?');
-      params.push(queryText);
-    }
-
-    const whereClause = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-    const preLimit = regex ? Math.min(finalLimit * 5, 1000) : finalLimit;
-    params.push(preLimit);
-
-    const baseSelect = `
-      SELECT DISTINCT
-        messages.channel_id,
-        channels.peer_title,
-        channels.username,
-        messages.message_id,
-        messages.date,
-        messages.from_id,
-        messages.text,
-        messages.topic_id,
-        users.username AS from_username,
-        users.display_name AS from_display_name,
-        users.peer_type AS from_peer_type,
-        users.is_bot AS from_is_bot,
-        ${MEDIA_COLUMNS}
-    `;
-
-    const rows = queryText
-      ? this.db.prepare(`
-          ${baseSelect}
-          FROM message_search
-          JOIN messages ON messages.id = message_search.rowid
-          ${joinTags}
-          LEFT JOIN channels ON channels.channel_id = messages.channel_id
-          LEFT JOIN users ON users.user_id = messages.from_id
-          ${MEDIA_JOIN}
-          ${whereClause}
-          ORDER BY messages.date DESC
-          LIMIT ?
-        `).all(...params)
-      : this.db.prepare(`
-          ${baseSelect}
-          FROM messages
-          ${joinTags}
-          LEFT JOIN channels ON channels.channel_id = messages.channel_id
-          LEFT JOIN users ON users.user_id = messages.from_id
-          ${MEDIA_JOIN}
-          ${whereClause}
-          ORDER BY messages.date DESC
-          LIMIT ?
-        `).all(...params);
-
-    let results = rows.map((row) => formatArchivedRow(row));
-    if (regex) {
-      results = results.filter((row) => regex.test(row.text || ''));
-    }
-
-    return results.slice(0, finalLimit);
-  }
-
-  getArchivedMessages({ channelId, topicId, limit = 50 }) {
-    const normalizedId = normalizeChannelKey(channelId);
-    const topicClause = typeof topicId === 'number' ? 'AND topic_id = ?' : '';
-    const params = typeof topicId === 'number'
-      ? [normalizedId, topicId, limit]
-      : [normalizedId, limit];
-    const rows = this.db.prepare(`
-      SELECT
-        messages.message_id,
-        messages.date,
-        messages.from_id,
-        messages.text,
-        messages.topic_id,
-        users.username AS from_username,
-        users.display_name AS from_display_name
-      FROM messages
-      LEFT JOIN users ON users.user_id = messages.from_id
-      WHERE channel_id = ?
-      ${topicClause}
-      ORDER BY message_id DESC
-      LIMIT ?
-    `).all(...params);
-
-    return rows.map((row) => ({
-      messageId: row.message_id,
-      date: row.date ? new Date(row.date * 1000).toISOString() : null,
-      fromId: row.from_id,
-      fromUsername: row.from_username ?? null,
-      fromDisplayName: row.from_display_name ?? null,
-      text: row.text,
-      topicId: row.topic_id ?? null,
-    }));
-  }
-
-  getMessageStats(channelId) {
-    const normalizedId = normalizeChannelKey(channelId);
-    const summary = this.db.prepare(`
-      SELECT
-        COUNT(*) AS total,
-        MIN(message_id) AS oldestMessageId,
-        MAX(message_id) AS newestMessageId,
-        MIN(date) AS oldestDate,
-        MAX(date) AS newestDate
-      FROM messages
-      WHERE channel_id = ?
-    `).get(normalizedId);
-
-    return {
-      total: summary.total || 0,
-      oldestMessageId: summary.oldestMessageId || null,
-      newestMessageId: summary.newestMessageId || null,
-      oldestDate: summary.oldestDate ? new Date(summary.oldestDate * 1000).toISOString() : null,
-      newestDate: summary.newestDate ? new Date(summary.newestDate * 1000).toISOString() : null,
-    };
-  }
-
-  searchTaggedMessages({ tag, query, fromDate, toDate, limit = 100, source = null }) {
-    const normalizedTag = normalizeTag(tag);
-    if (!normalizedTag) {
-      return [];
-    }
-    const queryText = typeof query === 'string' ? query.trim() : '';
-    const params = [normalizedTag];
-    const sourceClause = source ? 'AND channel_tags.source = ?' : '';
-    if (source) {
-      params.push(String(source));
-    }
-
-    let dateClause = '';
-    if (fromDate) {
-      params.push(parseIsoDate(fromDate));
-      dateClause += ' AND messages.date >= ?';
-    }
-    if (toDate) {
-      params.push(parseIsoDate(toDate));
-      dateClause += ' AND messages.date <= ?';
-    }
-
-    const finalLimit = limit && limit > 0 ? Number(limit) : 100;
-
-    if (queryText) {
-      params.push(queryText);
-      params.push(finalLimit);
-      const rows = this.db.prepare(`
-        SELECT
-          messages.channel_id,
-          channels.peer_title,
-          channels.username,
-          messages.message_id,
-          messages.date,
-          messages.from_id,
-          messages.text,
-          messages.topic_id,
-          users.username AS from_username,
-          users.display_name AS from_display_name
-        FROM message_search
-        JOIN messages ON messages.id = message_search.rowid
-        JOIN channel_tags ON channel_tags.channel_id = messages.channel_id
-        LEFT JOIN channels ON channels.channel_id = messages.channel_id
-        LEFT JOIN users ON users.user_id = messages.from_id
-        WHERE channel_tags.tag = ?
-        ${sourceClause}
-        ${dateClause}
-        AND message_search MATCH ?
-        ORDER BY messages.date DESC
-        LIMIT ?
-      `).all(...params);
-
-      return rows.map((row) => ({
-        channelId: row.channel_id,
-        peerTitle: row.peer_title,
-        username: row.username,
-        messageId: row.message_id,
-        date: row.date ? new Date(row.date * 1000).toISOString() : null,
-        fromId: row.from_id,
-        fromUsername: row.from_username ?? null,
-        fromDisplayName: row.from_display_name ?? null,
-        text: row.text,
-        topicId: row.topic_id ?? null,
-      }));
-    }
-
-    params.push(finalLimit);
-    const rows = this.db.prepare(`
-      SELECT
-        messages.channel_id,
-        channels.peer_title,
-        channels.username,
-        messages.message_id,
-        messages.date,
-        messages.from_id,
-        messages.text,
-        messages.topic_id,
-        users.username AS from_username,
-        users.display_name AS from_display_name
-      FROM messages
-      JOIN channel_tags ON channel_tags.channel_id = messages.channel_id
-      LEFT JOIN channels ON channels.channel_id = messages.channel_id
-      LEFT JOIN users ON users.user_id = messages.from_id
-      WHERE channel_tags.tag = ?
-      ${sourceClause}
-      ${dateClause}
-      ORDER BY messages.date DESC
-      LIMIT ?
-    `).all(...params);
-
-    return rows.map((row) => ({
-      channelId: row.channel_id,
-      peerTitle: row.peer_title,
-      username: row.username,
-      messageId: row.message_id,
-      date: row.date ? new Date(row.date * 1000).toISOString() : null,
-      fromId: row.from_id,
-      fromUsername: row.from_username ?? null,
-      fromDisplayName: row.from_display_name ?? null,
-      text: row.text,
-      topicId: row.topic_id ?? null,
-    }));
-  }
-
-  async scanTaggedMessages(options = {}) {
-    const normalizedTag = normalizeTag(options.tag);
-    if (!normalizedTag) {
-      return {
-        tag: null,
-        source: null,
-        autoTag: false,
-        taggedChannelCount: 0,
-        messageCount: 0,
-        taggedChannels: [],
-        messages: [],
-      };
-    }
-
-    const source = options.source ? String(options.source) : 'auto';
-    const autoTag = options.autoTag !== false;
-    const autoTagLimit = options.autoTagLimit && options.autoTagLimit > 0
-      ? Number(options.autoTagLimit)
-      : 50;
-    const refreshMetadata = options.refreshMetadata !== false;
-    const channelLimit = options.channelLimit && options.channelLimit > 0
-      ? Number(options.channelLimit)
-      : 100;
-    const messageLimit = options.messageLimit && options.messageLimit > 0
-      ? Number(options.messageLimit)
-      : 100;
-    const channelIds = Array.isArray(options.channelIds) ? options.channelIds : null;
-
-    if (autoTag) {
-      await this.autoTagChannels({
-        channelIds,
-        limit: autoTagLimit,
-        source,
-        refreshMetadata,
-      });
-    }
-
-    const taggedChannels = this.listTaggedChannels(normalizedTag, {
-      source,
-      limit: channelLimit,
-    });
-
-    const messages = this.searchTaggedMessages({
-      tag: normalizedTag,
-      query: options.query,
-      fromDate: options.fromDate,
-      toDate: options.toDate,
-      limit: messageLimit,
-      source,
-    });
-
-    return {
-      tag: normalizedTag,
-      source,
-      query: typeof options.query === 'string' ? options.query : null,
-      fromDate: options.fromDate ?? null,
-      toDate: options.toDate ?? null,
-      autoTag,
-      autoTagLimit,
-      taggedChannelCount: taggedChannels.length,
-      messageCount: messages.length,
-      taggedChannels,
-      messages,
-    };
   }
 
   async _processJob(job) {
@@ -4077,7 +2794,7 @@ export default class MessageSyncService {
         return;
       }
 
-      const currentCount = this._countMessages(channelId);
+      const currentCount = this.archive.count(channelId);
       const targetCount = job.target_message_count || DEFAULT_TARGET_MESSAGES;
       const backfillResult = await this._backfillHistory(job, currentCount, targetCount);
       if (this.stopRequested || backfillResult.stoppedEarly) {
@@ -4182,252 +2899,6 @@ export default class MessageSyncService {
       SET status = ?, error = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `).run(JOB_STATUS.ERROR, error.message || String(error), id);
-  }
-
-  _countMessages(channelId) {
-    return this.db.prepare(`
-      SELECT COUNT(*) AS cnt
-      FROM messages
-      WHERE channel_id = ?
-    `).get(String(channelId)).cnt;
-  }
-
-  _replaceMessageLinks(record) {
-    if (!record) {
-      return;
-    }
-    this.deleteMessageLinksStmt.run(record.channel_id, record.message_id);
-    const entries = Array.isArray(record.link_entries) ? record.link_entries : [];
-    for (const entry of entries) {
-      this.insertMessageLinkStmt.run({
-        channel_id: record.channel_id,
-        message_id: record.message_id,
-        url: entry.url,
-        domain: entry.domain ?? null,
-      });
-    }
-  }
-
-  _replaceMessageMedia(record) {
-    if (!record) {
-      return;
-    }
-    const summary = buildMediaRecord(record.media_summary);
-    if (!summary) {
-      this.deleteMessageMediaStmt.run(record.channel_id, record.message_id);
-      return;
-    }
-    this.upsertMessageMediaStmt.run({
-      channel_id: record.channel_id,
-      message_id: record.message_id,
-      ...summary,
-    });
-  }
-
-  _backfillSearchFields(options = {}) {
-    const rebuildMedia = Boolean(options.rebuildMedia);
-    const selectStmt = this.db.prepare(`
-      SELECT id, channel_id, message_id, raw_json, text, topic_id, from_id
-      FROM messages
-      WHERE id > ?
-      ORDER BY id ASC
-      LIMIT ?
-    `);
-    const updateStmt = this.db.prepare(`
-      UPDATE messages
-      SET links = ?, files = ?, sender = ?, topic = ?
-      WHERE id = ?
-    `);
-    const deleteLinksStmt = this.db.prepare(`
-      DELETE FROM message_links
-      WHERE channel_id = ? AND message_id = ?
-    `);
-    const insertLinkStmt = this.db.prepare(`
-      INSERT OR IGNORE INTO message_links (channel_id, message_id, url, domain)
-      VALUES (?, ?, ?, ?)
-    `);
-    const deleteMediaStmt = rebuildMedia ? this.db.prepare(`
-      DELETE FROM message_media
-      WHERE channel_id = ? AND message_id = ?
-    `) : null;
-    const upsertMediaStmt = rebuildMedia ? this.db.prepare(`
-      INSERT INTO message_media (
-        channel_id,
-        message_id,
-        media_type,
-        file_id,
-        unique_file_id,
-        file_name,
-        mime_type,
-        file_size,
-        width,
-        height,
-        duration,
-        extra_json,
-        updated_at
-      )
-      VALUES (
-        ?,
-        ?,
-        ?,
-        ?,
-        ?,
-        ?,
-        ?,
-        ?,
-        ?,
-        ?,
-        ?,
-        ?,
-        CURRENT_TIMESTAMP
-      )
-      ON CONFLICT(channel_id, message_id) DO UPDATE SET
-        media_type = excluded.media_type,
-        file_id = excluded.file_id,
-        unique_file_id = excluded.unique_file_id,
-        file_name = excluded.file_name,
-        mime_type = excluded.mime_type,
-        file_size = excluded.file_size,
-        width = excluded.width,
-        height = excluded.height,
-        duration = excluded.duration,
-        extra_json = excluded.extra_json,
-        updated_at = CURRENT_TIMESTAMP
-    `) : null;
-
-    const applyBatch = this.db.transaction((rows) => {
-      for (const row of rows) {
-        const parsed = safeParseJson(row.raw_json) ?? {};
-        const message = {
-          ...parsed,
-          text: parsed.text ?? row.text ?? null,
-          topic_id: parsed.topic_id ?? row.topic_id ?? null,
-          from_id: parsed.from_id ?? row.from_id ?? null,
-        };
-        const fields = buildSearchFields(message);
-        updateStmt.run(
-          fields.linksText,
-          fields.filesText,
-          fields.senderText,
-          fields.topicText,
-          row.id,
-        );
-        deleteLinksStmt.run(row.channel_id, row.message_id);
-        for (const entry of fields.linkEntries) {
-          insertLinkStmt.run(row.channel_id, row.message_id, entry.url, entry.domain);
-        }
-        if (rebuildMedia) {
-          const summary = extractMediaSummary(message);
-          const mediaRecord = buildMediaRecord(summary);
-          if (mediaRecord) {
-            upsertMediaStmt.run(
-              row.channel_id,
-              row.message_id,
-              mediaRecord.media_type,
-              mediaRecord.file_id,
-              mediaRecord.unique_file_id,
-              mediaRecord.file_name,
-              mediaRecord.mime_type,
-              mediaRecord.file_size,
-              mediaRecord.width,
-              mediaRecord.height,
-              mediaRecord.duration,
-              mediaRecord.extra_json,
-            );
-          } else {
-            deleteMediaStmt.run(row.channel_id, row.message_id);
-          }
-        }
-      }
-    });
-
-    let lastId = 0;
-    const batchSize = 500;
-    while (true) {
-      const rows = selectStmt.all(lastId, batchSize);
-      if (!rows.length) {
-        break;
-      }
-      applyBatch(rows);
-      lastId = rows[rows.length - 1].id;
-    }
-  }
-
-  _buildMessageRecord(channelId, message) {
-    const searchFields = buildSearchFields(message);
-    const mediaSummary = extractMediaSummary(message);
-    return {
-      channel_id: chatIdForWrite(channelId),
-      message_id: message.id,
-      topic_id: message.topic_id ?? null,
-      date: message.date ?? null,
-      from_id: message.from_id ?? null,
-      text: message.text ?? null,
-      links: searchFields.linksText,
-      files: searchFields.filesText,
-      sender: searchFields.senderText,
-      topic: searchFields.topicText,
-      raw_json: JSON.stringify(message),
-      link_entries: searchFields.linkEntries,
-      media_summary: mediaSummary,
-    };
-  }
-
-  _buildUserRecordFromPeer(peer) {
-    if (!peer?.id) {
-      return null;
-    }
-    const username = typeof peer.username === 'string' && peer.username ? peer.username : null;
-    let displayName = null;
-    if (typeof peer.displayName === 'string' && peer.displayName.trim()) {
-      displayName = peer.displayName.trim();
-    } else {
-      const nameParts = [peer.firstName, peer.lastName].filter(Boolean);
-      displayName = nameParts.length ? nameParts.join(' ') : null;
-    }
-    const peerType = normalizePeerType(peer);
-    const isBot = typeof peer.isBot === 'boolean' ? (peer.isBot ? 1 : 0) : null;
-    const phone = typeof peer.phoneNumber === 'string' && peer.phoneNumber.trim()
-      ? peer.phoneNumber.trim()
-      : null;
-    const isContact = typeof peer.isContact === 'boolean' ? (peer.isContact ? 1 : 0) : null;
-
-    return {
-      user_id: peer.id.toString(),
-      peer_type: peerType,
-      username,
-      display_name: displayName,
-      phone,
-      is_contact: isContact,
-      is_bot: isBot,
-    };
-  }
-
-  _buildUserRecordFromSerialized(message) {
-    if (!message?.from_id) {
-      return null;
-    }
-    const userId = String(message.from_id);
-    if (!userId || userId === 'unknown') {
-      return null;
-    }
-    const username = message.from_username ?? null;
-    const displayName = message.from_display_name ?? null;
-    const peerType = message.from_peer_type ?? null;
-    const isBot = typeof message.from_is_bot === 'boolean' ? (message.from_is_bot ? 1 : 0) : null;
-    if (!username && !displayName && !peerType && isBot === null) {
-      return null;
-    }
-
-    return {
-      user_id: userId,
-      peer_type: peerType,
-      username,
-      display_name: displayName,
-      phone: null,
-      is_contact: null,
-      is_bot: isBot,
-    };
   }
 
   _getChannel(channelId) {
@@ -4610,26 +3081,9 @@ export default class MessageSyncService {
       return null;
     }
 
-    const senderRecord = this._buildUserRecordFromPeer(message.sender || message.from || message.author);
-    if (senderRecord) {
-      this.upsertUserStmt.run(senderRecord);
-    }
-
-    const serialized = this.telegramClient._serializeMessage(message, message.chat);
-    const record = this._buildMessageRecord(channelId, serialized);
-
-    this._storeRecord(record, { replace: isEdit });
-    return record;
-  }
-
-  _storeRecord(record, { replace }) {
-    if (replace) {
-      this.upsertMessageStmt.run(record);
-    } else {
-      this.insertMessageStmt.run(record);
-    }
-    this._replaceMessageLinks(record);
-    this._replaceMessageMedia(record);
+    const stored = encodeMessage(message);
+    this.archive.write(channelId, [stored], { replace: isEdit, senders: [describeSender(message)] });
+    return { channel_id: channelId, message_id: stored.id, date: stored.date };
   }
 
   // mtcute keeps a client's own sends out of onNewMessage, so the send operations
@@ -4661,7 +3115,7 @@ export default class MessageSyncService {
     try {
       const message = await this.telegramClient.getMessageById(channelId, messageId);
       if (message) {
-        this._storeRecord(this._buildMessageRecord(channelId, message), { replace: true });
+        this.archive.write(channelId, [message], { replace: true });
         console.log(`[archive] Completed sent message ${messageId} in chat ${channelId}.`);
       } else {
         console.log(`[archive] Sent message ${messageId} in chat ${channelId} is gone from Telegram, its row stays as it is.`);
@@ -4694,11 +3148,7 @@ export default class MessageSyncService {
   // Writes messages fetched from history without touching the cursors, and returns
   // how many were not in the archive yet.
   archiveHistoryMessages(channelId, messages) {
-    const userRecords = messages.map((message) => this._buildUserRecordFromSerialized(message)).filter(Boolean);
-    if (userRecords.length) {
-      this.upsertUsersTx(userRecords);
-    }
-    return this.insertMessagesTx(messages.map((message) => this._buildMessageRecord(channelId, message)));
+    return this.archive.write(channelId, messages);
   }
 
   _handleDeleteMessage(update) {
@@ -4707,28 +3157,16 @@ export default class MessageSyncService {
     }
 
     const ids = update.messageIds;
-    const placeholders = ids.map(() => '?').join(', ');
 
     if (update.channelId) {
       const channelId = normalizeChannelKey(update.channelId);
-      this.db.prepare(`
-        DELETE FROM messages
-        WHERE channel_id = ? AND message_id IN (${placeholders})
-      `).run(channelId, ...ids);
-      this.db.prepare(`
-        DELETE FROM message_links
-        WHERE channel_id = ? AND message_id IN (${placeholders})
-      `).run(channelId, ...ids);
-      this.db.prepare(`
-        DELETE FROM message_media
-        WHERE channel_id = ? AND message_id IN (${placeholders})
-      `).run(channelId, ...ids);
+      this.archive.deleteChannelMessages(channelId, ids);
       // Telegram pushes a delete with a real ptsCount, and no message named that way has stayed.
       // Only differences, always with ptsCount 0, have named messages that turned out real.
       if (update.raw?.ptsCount > 0) {
         this.db.prepare(`
           DELETE FROM messages_to_recheck
-          WHERE channel_id = ? AND message_id IN (${placeholders})
+          WHERE channel_id = ? AND message_id IN (${ids.map(() => '?').join(', ')})
         `).run(channelId, ...ids);
       } else {
         this._queueRecheckOfDeleted(channelId, ids);
@@ -4736,30 +3174,7 @@ export default class MessageSyncService {
       return;
     }
 
-    this.db.prepare(`
-      DELETE FROM messages
-      WHERE message_id IN (${placeholders})
-        AND channel_id IN (
-          SELECT channel_id FROM channels
-          WHERE peer_type IN ('chat', 'user') AND CAST(channel_id AS INTEGER) > ${MAX_MARKED_CHANNEL_ID}
-        )
-    `).run(...ids);
-    this.db.prepare(`
-      DELETE FROM message_links
-      WHERE message_id IN (${placeholders})
-        AND channel_id IN (
-          SELECT channel_id FROM channels
-          WHERE peer_type IN ('chat', 'user') AND CAST(channel_id AS INTEGER) > ${MAX_MARKED_CHANNEL_ID}
-        )
-    `).run(...ids);
-    this.db.prepare(`
-      DELETE FROM message_media
-      WHERE message_id IN (${placeholders})
-        AND channel_id IN (
-          SELECT channel_id FROM channels
-          WHERE peer_type IN ('chat', 'user') AND CAST(channel_id AS INTEGER) > ${MAX_MARKED_CHANNEL_ID}
-        )
-    `).run(...ids);
+    this.archive.deleteSharedSequenceMessages(ids);
   }
 
   _handleChannelTooLong({ channelId, diff }) {
@@ -4768,8 +3183,8 @@ export default class MessageSyncService {
     }
 
     const peers = PeersIndex.from(diff);
-    const records = [];
-    const userRecords = new Map();
+    const stored = [];
+    const senders = [];
     let batchChannelId = null;
     let latestMessageId = null;
     let latestMessageDate = null;
@@ -4790,13 +3205,9 @@ export default class MessageSyncService {
         continue;
       }
 
-      const senderRecord = this._buildUserRecordFromPeer(message.sender || message.from || message.author);
-      if (senderRecord) {
-        userRecords.set(senderRecord.user_id, senderRecord);
-      }
-
-      const serialized = this.telegramClient._serializeMessage(message, message.chat);
-      records.push(this._buildMessageRecord(channelKey, serialized));
+      const serialized = encodeMessage(message);
+      stored.push(serialized);
+      senders.push(describeSender(message));
 
       const messageDateIso = toIsoString(serialized.date);
       if (Number.isFinite(serialized.id)) {
@@ -4811,15 +3222,11 @@ export default class MessageSyncService {
       }
     }
 
-    if (!records.length || !batchChannelId) {
+    if (!stored.length || !batchChannelId) {
       return;
     }
 
-    if (userRecords.size) {
-      this.upsertUsersTx([...userRecords.values()]);
-    }
-
-    this.insertMessagesTx(records);
+    this.archive.write(batchChannelId, stored, { senders });
 
     // The diff holds only the newest messages. mtcute has already moved past the rest
     // and will not report them again, so the gap has to be on disk before anything else.
@@ -4899,9 +3306,7 @@ export default class MessageSyncService {
     if (!hasSequentialIds(channelId) || !(cursor - fromId <= RECHECK_MAX_ID_DISTANCE)) {
       return;
     }
-    const archived = new Set(this.db.prepare(`
-      SELECT message_id FROM messages WHERE channel_id = ? AND message_id > ? AND message_id < ?
-    `).all(channelId, fromId, cursor).map((row) => row.message_id));
+    const archived = this.archive.idsBetween(channelId, fromId, cursor);
     const missing = [];
     for (let id = fromId + 1; id < cursor; id += 1) {
       if (!archived.has(id)) {
@@ -5175,8 +3580,8 @@ export default class MessageSyncService {
         addOffset: 0,
       });
 
-      const records = [];
-      const userRecords = new Map();
+      const stored = [];
+      const senders = [];
       let lowestIdInChunk = null;
       let lowestDateInChunk = null;
       let lowestDateSecondsInChunk = null;
@@ -5186,18 +3591,14 @@ export default class MessageSyncService {
           stoppedEarly = true;
           break;
         }
-        const serialized = this.telegramClient._serializeMessage(message, peer);
+        const serialized = encodeMessage(message);
         if (minDateSeconds && serialized.date && serialized.date < minDateSeconds) {
           stopDueToDate = true;
           break;
         }
 
-        const senderRecord = this._buildUserRecordFromPeer(message.sender || message.from || message.author);
-        if (senderRecord) {
-          userRecords.set(senderRecord.user_id, senderRecord);
-        }
-
-        records.push(this._buildMessageRecord(channelId, serialized));
+        stored.push(serialized);
+        senders.push(describeSender(message));
 
         if (!lowestIdInChunk || serialized.id < lowestIdInChunk) {
           lowestIdInChunk = serialized.id;
@@ -5210,15 +3611,11 @@ export default class MessageSyncService {
         break;
       }
 
-      if (!records.length) {
+      if (!stored.length) {
         break;
       }
 
-      if (userRecords.size) {
-        this.upsertUsersTx([...userRecords.values()]);
-      }
-
-      const inserted = this.insertMessagesTx(records);
+      const inserted = this.archive.write(channelId, stored, { senders });
 
       total += inserted;
       insertedCount += inserted;
@@ -5239,7 +3636,7 @@ export default class MessageSyncService {
       // monitor see the archived count and resume cursor advance mid-run, not
       // just on terminal completion. `started_at` is stamped on the first batch.
       this._updateJobProgress(job.id, {
-        messageCount: this._countMessages(channelId),
+        messageCount: this.archive.count(channelId),
         cursorMessageId: nextOffsetId ?? null,
         cursorMessageDate: Number.isFinite(nextOffsetDate) && nextOffsetDate > 0
           ? toIsoString(nextOffsetDate)
@@ -5268,7 +3665,7 @@ export default class MessageSyncService {
     }
 
     return {
-      finalCount: this._countMessages(channelId),
+      finalCount: this.archive.count(channelId),
       oldestMessageId: currentOldestId,
       oldestMessageDate: currentOldestDate,
       hasMoreOlder: insertedCount > 0 && total < targetCount && !stopDueToDate && !stoppedEarly,

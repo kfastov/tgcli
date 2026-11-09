@@ -265,6 +265,33 @@ Update available: tgcli 2.2.5 -> 2.3.0. Run `brew update && brew upgrade tgcli` 
 - messages show --chat <id> --id <msgId> [--source]
 - messages context --chat <id> --id <msgId> [--before N] [--after N] [--source]
 
+### Message fields
+
+`list`, `search`, `show` and `context` return each message in the same shape, from
+Telegram or from the archive alike (only `source` tells them apart):
+
+- `channelId`, `peerTitle`, `username` — the chat.
+- `messageId`, `date`, `editDate` (ISO, null when never edited), `out` (sent by you).
+- `fromId`, `fromUsername`, `fromDisplayName`, `fromPeerType`, `fromIsBot` — the sender.
+- `text`, `urls` (from the message's links), `media` (type, file id, name, size…).
+- `topicId` — the forum topic, or the thread of a channel post a comment belongs to.
+- `replyTo` — `{ messageId, topId, chatId, quote }` of the message this one answers, or null.
+  In a forum a message that only sits in a topic answers nothing.
+- `forward` — `{ date, fromId, fromName, messageId, postAuthor, imported }`. For a message
+  imported from another app, `imported` is true and `date` is when it was first sent;
+  the message's own `date` is the day of the import.
+- `action` — what a service message did, named after Telegram's action without its
+  `messageAction` prefix: `{ type: "chatAddUser", users: ["…"] }`, `{ type: "pinMessage" }`…
+- `todo` — `{ title, othersCanAppend, othersCanComplete, items: [{ id, text, completedBy, completedAt }] }`.
+- `poll` — `{ question, closed, quiz, multipleChoice, publicVoters, totalVoters, answers: [{ text, voters, chosen, correct }] }`.
+- `groupedId` (the album a photo or file belongs to), `viaBotId`, `postAuthor`.
+
+Archived messages get these fields from the Telegram message the archive keeps, so
+messages archived by older versions have them too.
+
+`search` takes FTS5 query syntax (`a OR b`, `pre*`); a query that is not valid syntax,
+such as `UTF-8` or `example.org`, is searched as plain words.
+
 ### Pagination
 
 Use `--before-id` and `--after-id` for cursor-based pagination by message ID:

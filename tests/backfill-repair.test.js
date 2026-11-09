@@ -83,7 +83,7 @@ describe('backfill repair', () => {
       INSERT INTO channels (channel_id, peer_title, username, sync_enabled, last_message_id, oldest_message_id, created_at)
       VALUES (?, 'Group', ?, ?, ?, ?, datetime(?, 'unixepoch'))
     `).run(CHANNEL_ID, username, syncEnabled, Math.max(...historyIds), oldestCursor, enteredAt);
-    service.insertMessagesTx(archivedIds.map((id) => service._buildMessageRecord(CHANNEL_ID, {
+    service.archive.write(CHANNEL_ID, archivedIds.map((id) => ({
       id,
       date: BASE_DATE + id,
       text: `archived ${id}`,
@@ -225,7 +225,7 @@ describe('backfill repair', () => {
   it('counts in a dry run only this chat\'s rows as present', async () => {
     const service = setUp(range(10, 20), [10]);
     service.db.prepare('INSERT INTO channels (channel_id, sync_enabled) VALUES (?, 1)').run(OTHER_ID);
-    service.insertMessagesTx(range(11, 20).map((id) => service._buildMessageRecord(OTHER_ID, { id, date: BASE_DATE + id })));
+    service.archive.write(OTHER_ID, range(11, 20).map((id) => ({ id, date: BASE_DATE + id })));
 
     service.addRepairs({ chats: [CHANNEL_ID], dryRun: true });
     await service.processQueue();

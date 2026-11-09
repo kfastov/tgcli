@@ -351,7 +351,7 @@ describe('MessageSyncService counting points', () => {
 
   it('counts repair pages, the messages they checked and added, and finished repairs', async () => {
     seedChannel({ lastMessageId: 12, oldestMessageId: 10 });
-    service.insertMessagesTx([10, 12].map((id) => service._buildMessageRecord(CHANNEL_ID, message(id))));
+    service.archive.write(CHANNEL_ID, [10, 12].map(message));
     telegramClient.getMessagesByChannelId.mockImplementation(async (_, __, { offsetId }) => ({
       messages: [12, 11, 10, 9].filter((id) => !offsetId || id < offsetId).slice(0, 2).map(message),
     }));
@@ -373,7 +373,7 @@ describe('MessageSyncService counting points', () => {
 
   it('counts a repair that fails', async () => {
     seedChannel({ lastMessageId: 12, oldestMessageId: 10 });
-    service.insertMessagesTx([service._buildMessageRecord(CHANNEL_ID, message(10))]);
+    service.archive.write(CHANNEL_ID, [message(10)]);
     telegramClient.getMessagesByChannelId.mockRejectedValue(new Error('CHANNEL_PRIVATE'));
 
     service.addRepairs({ chats: [CHANNEL_ID] });
@@ -404,7 +404,7 @@ describe('MessageSyncService counting points', () => {
 
   it('counts what a dry run would add apart from what a repair added', async () => {
     seedChannel({ lastMessageId: 12, oldestMessageId: 10 });
-    service.insertMessagesTx([10, 12].map((id) => service._buildMessageRecord(CHANNEL_ID, message(id))));
+    service.archive.write(CHANNEL_ID, [10, 12].map(message));
     telegramClient.getMessagesByChannelId.mockImplementation(async (_, __, { offsetId }) => ({
       messages: [12, 11, 10].filter((id) => !offsetId || id < offsetId).map(message),
     }));
@@ -417,7 +417,7 @@ describe('MessageSyncService counting points', () => {
 
   it('counts the pages of a gap fill, what they added, and the gap closing', async () => {
     seedChannel({ lastMessageId: 15, gapAfter: 10 });
-    service.insertMessagesTx([10, 15].map((id) => service._buildMessageRecord(CHANNEL_ID, message(id))));
+    service.archive.write(CHANNEL_ID, [10, 15].map(message));
     telegramClient.getMessagesByChannelId.mockImplementation(async (_, __, { afterId }) => ({
       messages: [11, 12, 15].filter((id) => id > afterId).map(message),
     }));

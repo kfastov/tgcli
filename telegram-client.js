@@ -14,6 +14,7 @@ import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import { nodeReadableToFuman } from '@fuman/node';
 import { resolveStoreDir, resolveStorePaths } from './core/store.js';
+import { encodeMessage, normalizeMediaText, normalizePeerType, summarizeMedia } from './core/message-codec.js';
 
 // How long a session Telegram confirmed is taken as logged in without asking again.
 const AUTH_CHECK_TTL_MS = 5 * 60 * 1000;
@@ -310,14 +311,6 @@ function coerceApiId(value) {
   throw new Error('TELEGRAM_API_ID must be a number');
 }
 
-function normalizePeerType(peer) {
-  if (!peer) return 'chat';
-  if (peer.type === 'user' || peer.type === 'bot') return 'user';
-  if (peer.type === 'channel') return 'channel';
-  if (peer.type === 'chat' && peer.chatType && peer.chatType !== 'group') return 'channel';
-  return 'chat';
-}
-
 function isGroupPeer(peer) {
   if (!peer) return false;
   if (typeof peer.isGroup === 'boolean') {
@@ -330,138 +323,6 @@ function isGroupPeer(peer) {
     return peer.chatType !== 'channel';
   }
   return false;
-}
-
-function extractTopicId(message) {
-  if (!message) return null;
-  if (typeof message.replyToMessage?.threadId === 'number') {
-    return message.replyToMessage.threadId;
-  }
-  if (message.action?.type === 'topic_created' && typeof message.id === 'number') {
-    return message.id;
-  }
-  const raw = message.raw ?? message;
-  const replyTo = raw?.replyTo;
-  if (replyTo?.replyToTopId) {
-    return replyTo.replyToTopId;
-  }
-  return null;
-}
-
-function normalizeMediaText(value) {
-  if (typeof value === 'string') {
-    const trimmed = value.trim();
-    return trimmed ? trimmed : null;
-  }
-  if (typeof value === 'number' || typeof value === 'bigint') {
-    return String(value);
-  }
-  return null;
-}
-
-function normalizeMediaNumber(value) {
-  if (value === null || value === undefined) {
-    return null;
-  }
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return value;
-  }
-  if (typeof value === 'string' && value.trim()) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-  return null;
-}
-
-function readMediaProperty(media, prop) {
-  if (!media) {
-    return null;
-  }
-  try {
-    return media[prop];
-  } catch (error) {
-    return null;
-  }
-}
-
-function buildWebpageExtras(media) {
-  if (!media || media.type !== 'webpage' || !media.preview) {
-    return null;
-  }
-  const preview = media.preview;
-  const previewData = {
-    url: preview.url ?? null,
-    displayUrl: preview.displayUrl ?? null,
-    siteName: preview.siteName ?? null,
-    title: preview.title ?? null,
-    description: preview.description ?? null,
-    author: preview.author ?? null,
-    previewType: preview.previewType ?? null,
-  };
-  const hasPreview = Object.values(previewData).some((value) => value);
-  const extras = {};
-  if (hasPreview) {
-    extras.preview = previewData;
-  }
-  if (typeof media.displaySize === 'string') {
-    extras.displaySize = media.displaySize;
-  }
-  if (typeof media.manual === 'boolean') {
-    extras.manual = media.manual;
-  }
-  return Object.keys(extras).length ? extras : null;
-}
-
-export function summarizeMedia(media) {
-  if (!media || typeof media !== 'object') {
-    return null;
-  }
-  const type = normalizeMediaText(media.type);
-  if (!type) {
-    return null;
-  }
-
-  const summary = {
-    type,
-    fileId: normalizeMediaText(readMediaProperty(media, 'fileId') ?? media.file_id),
-    uniqueFileId: normalizeMediaText(readMediaProperty(media, 'uniqueFileId') ?? media.unique_file_id),
-    fileName: normalizeMediaText(readMediaProperty(media, 'fileName') ?? media.file_name),
-    mimeType: normalizeMediaText(readMediaProperty(media, 'mimeType') ?? media.mime_type),
-    fileSize: normalizeMediaNumber(readMediaProperty(media, 'fileSize') ?? media.file_size),
-    width: normalizeMediaNumber(readMediaProperty(media, 'width') ?? media.width),
-    height: normalizeMediaNumber(readMediaProperty(media, 'height') ?? media.height),
-    duration: normalizeMediaNumber(readMediaProperty(media, 'duration') ?? media.duration),
-    extras: null,
-  };
-
-  if (!summary.mimeType && type === 'photo') {
-    summary.mimeType = 'image/jpeg';
-  }
-
-  if (media.extras && typeof media.extras === 'object') {
-    summary.extras = media.extras;
-  } else {
-    summary.extras = buildWebpageExtras(media);
-  }
-
-  if (type === 'webpage' && media.preview) {
-    const previewMedia = media.preview.document ?? media.preview.photo ?? null;
-    if (previewMedia) {
-      const previewSummary = summarizeMedia(previewMedia);
-      if (previewSummary) {
-        summary.fileId = summary.fileId ?? previewSummary.fileId;
-        summary.uniqueFileId = summary.uniqueFileId ?? previewSummary.uniqueFileId;
-        summary.fileName = summary.fileName ?? previewSummary.fileName;
-        summary.mimeType = summary.mimeType ?? previewSummary.mimeType;
-        summary.fileSize = summary.fileSize ?? previewSummary.fileSize;
-        summary.width = summary.width ?? previewSummary.width;
-        summary.height = summary.height ?? previewSummary.height;
-        summary.duration = summary.duration ?? previewSummary.duration;
-      }
-    }
-  }
-
-  return summary;
 }
 
 function extensionFromMime(mimeType) {
@@ -1144,7 +1005,7 @@ class TelegramClient {
     let chat = null;
     for await (const message of this.client.iterHistory(peer, iterOptions)) {
       chat ??= message.chat;
-      messages.push(this._serializeMessage(message, peer));
+      messages.push(encodeMessage(message));
       if (messages.length >= effectiveLimit) {
         break;
       }
@@ -1172,8 +1033,7 @@ class TelegramClient {
     if (!message) {
       return null;
     }
-    const peer = message.chat ?? await this.client.resolvePeer(peerRef);
-    return this._serializeMessage(message, peer);
+    return encodeMessage(message);
   }
 
   async getMessageContext(channelId, messageId, options = {}) {
@@ -1208,13 +1068,12 @@ class TelegramClient {
       limit: total,
     });
 
-    const peer = message.chat ?? await this.client.resolvePeer(peerRef);
-    const target = this._serializeMessage(message, peer);
+    const target = encodeMessage(message);
     const before = [];
     const after = [];
 
     for (const entry of history) {
-      const serialized = this._serializeMessage(entry, peer);
+      const serialized = encodeMessage(entry);
       if (serialized.id < target.id) {
         before.push(serialized);
       } else if (serialized.id > target.id) {
@@ -1246,14 +1105,16 @@ class TelegramClient {
       query,
     });
     const messages = filterSerializedMessagesById(
-      results.map((message) => this._serializeMessage(message, peer)),
+      results.map((message) => encodeMessage(message)),
       options,
     );
 
+    // resolvePeer gives an input peer, which has no title or type of its own.
+    const chat = results.find((message) => message.chat)?.chat ?? null;
     return {
-      peerTitle: peer?.displayName || 'Unknown',
+      peerTitle: chat?.displayName ?? null,
       peerId: peer?.id?.toString?.() ?? String(channelId),
-      peerType: normalizePeerType(peer),
+      peerType: chat ? normalizePeerType(chat) : null,
       total: results.total ?? messages.length,
       next: results.next ?? null,
       messages,
@@ -1623,87 +1484,6 @@ class TelegramClient {
     };
   }
 
-  _serializeMessage(message, peer = null) {
-    const resolvedPeer = peer ?? message?.chat ?? null;
-    const id = typeof message.id === 'number' ? message.id : Number(message.id || 0);
-    let dateSeconds = null;
-    if (message.date instanceof Date) {
-      dateSeconds = Math.floor(message.date.getTime() / 1000);
-    } else if (typeof message.date === 'number') {
-      dateSeconds = Math.floor(message.date);
-    }
-
-    let textContent = '';
-    if (typeof message.text === 'string') {
-      textContent = message.text;
-    } else if (typeof message.message === 'string') {
-      textContent = message.message;
-    } else if (message.text && typeof message.text.toString === 'function') {
-      textContent = message.text.toString();
-    }
-
-    // Extract URLs from message entities (text_link and url kinds)
-    const urls = [];
-    const entities = message.entities;
-    if (Array.isArray(entities)) {
-      for (const entity of entities) {
-        try {
-          const kind = entity.kind;
-          if (kind === 'text_link') {
-            const url = entity.params?.url;
-            if (url) urls.push(url);
-          } else if (kind === 'url') {
-            const urlText = entity.text;
-            if (urlText) urls.push(urlText);
-          }
-        } catch {}
-      }
-    }
-
-    const sender = message.sender || message.from || message.author;
-    let senderId = sender?.id ? sender.id.toString() : null;
-    if (!senderId) {
-      const rawFrom = message.fromId ?? message.raw?.fromId;
-      if (rawFrom && typeof rawFrom === 'object') {
-        senderId = (rawFrom.userId ?? rawFrom.channelId ?? rawFrom.chatId ?? 'unknown').toString();
-      } else if (rawFrom) {
-        senderId = rawFrom.toString();
-      } else {
-        senderId = 'unknown';
-      }
-    }
-    const topicId = extractTopicId(message);
-    const senderUsername = typeof sender?.username === 'string' && sender.username ? sender.username : null;
-    let senderDisplayName = null;
-    if (typeof sender?.displayName === 'string' && sender.displayName.trim()) {
-      senderDisplayName = sender.displayName.trim();
-    } else {
-      const nameParts = [sender?.firstName, sender?.lastName].filter(Boolean);
-      senderDisplayName = nameParts.length ? nameParts.join(' ') : null;
-    }
-    const senderPeerType = sender ? normalizePeerType(sender) : null;
-    const senderIsBot = typeof sender?.isBot === 'boolean' ? sender.isBot : null;
-    const mediaSummary = summarizeMedia(message.media);
-
-    return {
-      id,
-      date: dateSeconds,
-      message: textContent,
-      text: textContent,
-      urls: urls.length > 0 ? urls : null,
-      from_id: senderId,
-      from_username: senderUsername,
-      from_display_name: senderDisplayName,
-      from_peer_type: senderPeerType,
-      from_is_bot: senderIsBot,
-      peer_type: normalizePeerType(resolvedPeer),
-      peer_id: resolvedPeer?.id?.toString?.() ?? 'unknown',
-      topic_id: topicId,
-      media: mediaSummary,
-      raw: message.raw ?? null,
-    };
-  }
-
   _extractPeerId(peer) {
     if (peer == null) return 'unknown';
     if (typeof peer !== 'object') return String(peer);
@@ -1789,7 +1569,7 @@ class TelegramClient {
       query: options.query ?? '',
     });
     const messages = filterSerializedMessagesById(
-      results.map((message) => this._serializeMessage(message, message.chat)),
+      results.map((message) => encodeMessage(message)),
       options,
     );
 

@@ -25,15 +25,6 @@ function makeFakeClient(batches) {
         })();
       },
     },
-    // _backfillHistory serializes each yielded message through the client.
-    _serializeMessage(message) {
-      return {
-        id: message.id,
-        date: message.date,
-        from_id: message.from_id ?? null,
-        text: message.text ?? `msg ${message.id}`,
-      };
-    },
   };
 }
 

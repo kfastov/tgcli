@@ -332,7 +332,7 @@ describe('chats given by username', () => {
       expect(links.map((row) => row.message_id)).toEqual([1, 2, 3, 4, 5]);
       expect(links[1].url).toContain('from-the-id');
       // Search finds the moved messages under the id, and nothing under the username.
-      const found = service.searchArchiveMessages({ query: 'username' });
+      const found = service.archive.search({ query: 'username' });
       expect(found.map((message) => [message.channelId, message.messageId])).toEqual(expect.arrayContaining([[BOT_ID, 4], [BOT_ID, 5]]));
       expect(found.every((message) => message.channelId === BOT_ID)).toBe(true);
       // The chat under the id keeps its own row.

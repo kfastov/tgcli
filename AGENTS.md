@@ -5,6 +5,7 @@
 - `telegram-client.js`: Domain logic for MTProto login, dialog traversal, and message helpers.
 - `client.js`: Example CLI harness for manual testing without the MCP layer.
 - `message-sync-service.js`: Background worker that archives messages into a local SQLite database.
+- `core/message-codec.js`, `core/message-view.js`, `core/message-archive.js`: the one message model. The codec is the only reader of Telegram's TL messages, the view is the JSON every message read returns, the archive owns the message tables. Terms in `GLOSSARY.md`, decision in `docs/adr/0001-canonical-message.md`.
 - Store location: OS app-data dir (tgcli store; override with `TGCLI_STORE`); keep runtime artifacts out of version control.
 - Documentation lives in `README.md` and `LIBRARY.md`; configuration relies on environment variables and the tgcli store.
 
