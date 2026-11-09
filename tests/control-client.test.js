@@ -232,15 +232,23 @@ describe('invoke', () => {
     writeControl({ pid: 9, port: 8765, token: 'secret', startedAt: 's' });
   });
 
-  it('POSTs { op, args } to /control/invoke and returns result', async () => {
+  it('POSTs { op, args } to /control/run and returns result', async () => {
     global.fetch.mockResolvedValue(jsonResponse(200, { result: [{ id: '1' }] }));
     const result = await invoke(storeDir, { op: 'listChannels', args: { limit: 5 } });
     expect(result).toEqual([{ id: '1' }]);
     const [url, init] = global.fetch.mock.calls[0];
-    expect(url).toBe('http://127.0.0.1:8765/control/invoke');
+    expect(url).toBe('http://127.0.0.1:8765/control/run');
     expect(init.method).toBe('POST');
     expect(init.headers[CONTROL_TOKEN_HEADER]).toBe('secret');
     expect(JSON.parse(init.body)).toEqual({ op: 'listChannels', args: { limit: 5 } });
+  });
+
+  it('tells the caller to restart a server that predates /control/run', async () => {
+    writeControl({ pid: 9, port: 8765, token: 'secret', startedAt: 's', version: '2.3.0' });
+    global.fetch.mockResolvedValue(jsonResponse(404, { error: 'Not found' }));
+    const error = await invoke(storeDir, { op: 'foldersEdit', args: { folder: '1', title: 'X' } }).catch((e) => e);
+    expect(error.message).toBe('The running tgcli server (2.3.0, pid 9) predates this tgcli; run `tgcli server restart` and try again.');
+    expect(error).not.toBeInstanceOf(ServerUnavailableError);
   });
 
   it('throws the server error message on a non-200 response', async () => {
@@ -372,7 +380,7 @@ describe('server older or newer than this CLI', () => {
   }
 
   function invokeCalls() {
-    return global.fetch.mock.calls.filter(([url]) => url.endsWith('/control/invoke'));
+    return global.fetch.mock.calls.filter(([url]) => url.endsWith('/control/run'));
   }
 
   function stderr() {

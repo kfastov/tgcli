@@ -10,8 +10,14 @@ import { MtPeerNotFoundError } from '@mtcute/core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import MessageSyncService from '../message-sync-service.js';
-import { OPERATIONS } from '../core/operations.js';
+import { OPERATIONS } from '../core/ops/index.js';
+import { executeOperation } from '../core/ops/execute.js';
 import { createTelegramConnector } from '../core/telegram-connection.js';
+
+// Runs an operation the way the server does: args validated, defaults applied.
+function run(name, services, args) {
+  return executeOperation(OPERATIONS[name], args, { services });
+}
 
 const BOT_ID = '700000002';
 const SELF_ID = '700000001';
@@ -191,14 +197,14 @@ describe('chats given by username', () => {
   describe('ways in', () => {
     it('channels watch archives the chat under its id', async () => {
       const service = makeService();
-      const result = await OPERATIONS.channelSetSync({ messageSyncService: service }, { chat: '@shop_bot', enable: true });
+      const result = await run('channelsWatch', { messageSyncService: service }, { channelId: '@shop_bot' });
       expect(result).toMatchObject({ channelId: BOT_ID, syncEnabled: true, jobQueued: true });
       expect(allKeys(service)).toEqual([BOT_ID]);
     });
 
     it('tags set tags the chat under its id', async () => {
       const service = makeService();
-      const result = await OPERATIONS.tagsSet({ messageSyncService: service }, { chat: '@shop_bot', tags: ['jobs'] });
+      const result = await run('setChannelTags', { messageSyncService: service }, { channelId: '@shop_bot', tags: ['jobs'] });
       expect(result).toEqual({ channelId: BOT_ID, tags: ['jobs'] });
       expect(allKeys(service)).toEqual([BOT_ID]);
     });
@@ -206,15 +212,15 @@ describe('chats given by username', () => {
     it('topics list caches the topics under the id', async () => {
       const service = makeService();
       const listForumTopics = vi.fn(async () => [{ id: 1, title: 'General' }]);
-      await OPERATIONS.topicsList({ messageSyncService: service, telegramClient: { listForumTopics } }, { channelId: '@shop_bot' });
+      await run('topicsList', { messageSyncService: service, telegramClient: { listForumTopics } }, { channelId: '@shop_bot' });
       expect(keysIn(service, 'topics')).toEqual([BOT_ID]);
     });
 
     it('a username Telegram does not know leaves no row behind', async () => {
       const service = makeService();
-      await expect(OPERATIONS.channelSetSync({ messageSyncService: service }, { chat: '@nobody', enable: true }))
+      await expect(run('channelsWatch', { messageSyncService: service }, { channelId: '@nobody' }))
         .rejects.toMatchObject({ code: 'CHAT_NOT_FOUND' });
-      await expect(OPERATIONS.tagsSet({ messageSyncService: service }, { chat: '@nobody', tags: ['x'] }))
+      await expect(run('setChannelTags', { messageSyncService: service }, { channelId: '@nobody', tags: ['x'] }))
         .rejects.toMatchObject({ code: 'CHAT_NOT_FOUND' });
       expect(allKeys(service)).toEqual([]);
     });
@@ -232,21 +238,21 @@ describe('chats given by username', () => {
     it('reads by username find the chat under its id, and what is left under a username Telegram lost', async () => {
       const service = makeService();
       const ctx = { messageSyncService: service, telegramClient: { getPeerMetadata: vi.fn(async () => ({})) } };
-      await OPERATIONS.channelSetSync(ctx, { chat: '@shop_bot', enable: true });
-      await OPERATIONS.tagsSet(ctx, { chat: '@shop_bot', tags: ['jobs'] });
+      await run('channelsWatch', ctx, { channelId: '@shop_bot' });
+      await run('setChannelTags', ctx, { channelId: '@shop_bot', tags: ['jobs'] });
       insertMessages(service, BOT_ID, [1, 2]);
       seedUsernameChat(service, '@lost', { messageIds: [9], job: null, repair: null });
 
-      expect((await OPERATIONS.tagsList(ctx, { chat: '@shop_bot' })).map((tag) => tag.tag)).toEqual(['jobs']);
-      expect(await OPERATIONS.channelShow(ctx, { chat: '@shop_bot' })).toMatchObject({ channelId: BOT_ID, syncEnabled: true });
-      expect(await OPERATIONS.metadataGet(ctx, { chat: '@shop_bot' })).toMatchObject({ channelId: BOT_ID });
-      const listed = await OPERATIONS.messagesList(ctx, { channelIds: ['@shop_bot'], source: 'archive' });
+      expect((await run('listChannelTags', ctx, { channelId: '@shop_bot' })).map((tag) => tag.tag)).toEqual(['jobs']);
+      expect(await run('channelsShow', ctx, { channelId: '@shop_bot' })).toMatchObject({ channelId: BOT_ID, syncEnabled: true });
+      expect(await run('getChannelMetadata', ctx, { channelId: '@shop_bot' })).toMatchObject({ channelId: BOT_ID });
+      const listed = await run('messagesList', ctx, { channelIds: ['@shop_bot'], source: 'archive' });
       expect(listed.messages.map((message) => [message.channelId, message.messageId])).toEqual([[BOT_ID, 2], [BOT_ID, 1]]);
-      const searched = await OPERATIONS.messagesSearch(ctx, { channelIds: ['@shop_bot'], query: 'id', source: 'archive' });
+      const searched = await run('messagesSearch', ctx, { channelIds: ['@shop_bot'], query: 'id', source: 'archive' });
       expect(searched.messages.map((message) => message.messageId).sort()).toEqual([1, 2]);
-      expect((await OPERATIONS.messagesGet(ctx, { channelId: '@shop_bot', messageId: 2, source: 'archive' })).message)
+      expect((await run('messagesGet', ctx, { channelId: '@shop_bot', messageId: 2, source: 'archive' })).message)
         .toMatchObject({ channelId: BOT_ID, messageId: 2 });
-      expect((await OPERATIONS.messagesList(ctx, { channelIds: ['@lost'], source: 'archive' })).messages.map((m) => m.messageId))
+      expect((await run('messagesList', ctx, { channelIds: ['@lost'], source: 'archive' })).messages.map((m) => m.messageId))
         .toEqual([9]);
       // `backfill jobs list` reads without Telegram, by the username the watch stored.
       expect(service.listJobs({ channelId: '@Shop_bot' }).map((job) => job.channel_id)).toEqual([BOT_ID]);
@@ -262,7 +268,7 @@ describe('chats given by username', () => {
           getPeerMetadata: vi.fn(async () => ({})),
         },
       };
-      const listed = await OPERATIONS.messagesList(ctx, { channelIds: ['@shop_bot'], source: 'both' });
+      const listed = await run('messagesList', ctx, { channelIds: ['@shop_bot'], source: 'both' });
       expect(listed.messages.map((message) => [message.channelId, message.messageId, message.source]))
         .toEqual([[BOT_ID, 2, 'live'], [BOT_ID, 1, 'archive']]);
     });

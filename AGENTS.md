@@ -1,7 +1,8 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `mcp-server.js`: MCP HTTP server built with `@modelcontextprotocol/sdk`, registering the Telegram tools (`listChannels`, `searchChannels`, `getChannelMessages`, `scheduleMessageSync`, `listMessageSyncJobs`).
+- `mcp-server.js`: the warm server process: control API, realtime archive worker, and the MCP HTTP server built with `@modelcontextprotocol/sdk`.
+- `core/ops/`: every Telegram and archive operation, declared once (args schema, CLI spelling, MCP hints, handler, human rendering). The CLI commands, the MCP tools and the control API's `/control/run` are built from the declarations; `docs/mcp-tools.md` is generated from them (`node scripts/gen-mcp-tools-doc.js`). See `docs/adr/0002-operations-declared-once.md`.
 - `telegram-client.js`: Domain logic for MTProto login, dialog traversal, and message helpers.
 - `client.js`: Example CLI harness for manual testing without the MCP layer.
 - `message-sync-service.js`: Background worker that archives messages into a local SQLite database.

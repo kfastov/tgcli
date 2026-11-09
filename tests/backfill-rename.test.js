@@ -165,14 +165,18 @@ describe('channels watch / unwatch', () => {
   beforeEach(() => {
     logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     control.ensureServer = vi.fn().mockResolvedValue({ ok: true });
-    // The server runs the channelSetSync op; model its result shape here.
-    control.invoke = vi.fn(async (_storeDir, { args }) => ({
-      channelId: args.chat,
-      syncEnabled: args.enable,
-      jobId: args.enable ? 1 : null,
-      jobStatus: args.enable ? 'pending' : null,
-      jobQueued: Boolean(args.enable),
-    }));
+    // The server runs channelsWatch / channelsUnwatch / channelsSync; model their
+    // result shape here.
+    control.invoke = vi.fn(async (_storeDir, { op, args }) => {
+      const enable = op === 'channelsWatch' || (op === 'channelsSync' && Boolean(args.enable));
+      return {
+        channelId: args.channelId,
+        syncEnabled: enable,
+        jobId: enable ? 1 : null,
+        jobStatus: enable ? 'pending' : null,
+        jobQueued: enable,
+      };
+    });
   });
 
   afterEach(() => {
@@ -181,55 +185,56 @@ describe('channels watch / unwatch', () => {
     vi.clearAllMocks();
   });
 
-  it('`channels watch --chat X` routes channelSetSync(enable) to the server', async () => {
+  it('`channels watch --chat X` routes channelsWatch to the server', async () => {
     await runProgram(['channels', 'watch', '--chat', '@chan']);
     // The server is reachable, so the op invokes directly without a spawn.
     expect(control.ensureServer).not.toHaveBeenCalled();
     expect(control.invoke).toHaveBeenCalledWith('/tmp/tgcli-test-store', {
-      op: 'channelSetSync',
-      args: { chat: '@chan', enable: true },
+      op: 'channelsWatch',
+      args: { channelId: '@chan' },
       timeoutMs: undefined,
       quiet: false,
     });
   });
 
-  it('`channels unwatch --chat X` routes channelSetSync(disable) to the server', async () => {
+  it('`channels unwatch --chat X` routes channelsUnwatch to the server', async () => {
     await runProgram(['channels', 'unwatch', '--chat', '@chan']);
     expect(control.invoke).toHaveBeenCalledWith('/tmp/tgcli-test-store', {
-      op: 'channelSetSync',
-      args: { chat: '@chan', enable: false },
+      op: 'channelsUnwatch',
+      args: { channelId: '@chan' },
       timeoutMs: undefined,
       quiet: false,
     });
   });
 
-  it('`channels unwatch --missing` routes channelsUnwatchMissing to the server', async () => {
+  it('`channels unwatch --missing` routes channelsUnwatch with missing to the server', async () => {
     control.invoke.mockResolvedValueOnce({ channelIds: ['-1000000000820'] });
     await runProgram(['channels', 'unwatch', '--missing']);
     expect(control.invoke).toHaveBeenCalledWith('/tmp/tgcli-test-store', {
-      op: 'channelsUnwatchMissing',
-      args: {},
+      op: 'channelsUnwatch',
+      args: { missing: true },
       timeoutMs: undefined,
       quiet: false,
     });
   });
 
-  it('`channels watch` matches legacy `channels sync --enable` (same op + args)', async () => {
+  it('`channels watch` prints what legacy `channels sync --enable` prints', async () => {
     await runProgram(['channels', 'watch', '--chat', '@chan']);
-    const watchCalls = control.invoke.mock.calls.slice();
+    const watchOut = logSpy.mock.calls.map((c) => c.join(' '));
 
-    control.invoke.mockClear();
+    logSpy.mockClear();
     await runProgram(['channels', 'sync', '--chat', '@chan', '--enable']);
-    const enableCalls = control.invoke.mock.calls.slice();
+    const enableOut = logSpy.mock.calls.map((c) => c.join(' '));
 
-    expect(watchCalls).toEqual(enableCalls);
+    expect(watchOut).toEqual(enableOut);
+    expect(watchOut.join('\n')).toContain('Sync enabled for @chan');
   });
 
   it('legacy hidden `channels sync --enable/--disable` still routes to the server', async () => {
     await runProgram(['channels', 'sync', '--chat', '@chan', '--enable']);
     expect(control.invoke).toHaveBeenCalledWith('/tmp/tgcli-test-store', {
-      op: 'channelSetSync',
-      args: { chat: '@chan', enable: true },
+      op: 'channelsSync',
+      args: { channelId: '@chan', enable: true },
       timeoutMs: undefined,
       quiet: false,
     });
@@ -237,8 +242,8 @@ describe('channels watch / unwatch', () => {
     control.invoke.mockClear();
     await runProgram(['channels', 'sync', '--chat', '@chan', '--disable']);
     expect(control.invoke).toHaveBeenCalledWith('/tmp/tgcli-test-store', {
-      op: 'channelSetSync',
-      args: { chat: '@chan', enable: false },
+      op: 'channelsSync',
+      args: { channelId: '@chan', disable: true },
       timeoutMs: undefined,
       quiet: false,
     });

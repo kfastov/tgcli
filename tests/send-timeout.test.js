@@ -48,12 +48,11 @@ vi.mock('../core/store.js', () => ({
   resolveStoreDir: vi.fn(() => '/tmp/tgcli-test-store'),
 }));
 
+const { buildProgram } = await import('../cli.js');
 const {
   DEFAULT_SEND_TIMEOUT_MS,
   formatSendTimeoutMessage,
-  resolveSendTimeoutMs,
-  buildProgram,
-} = await import('../cli.js');
+} = await import('../core/ops/send.js');
 
 const {
   executeSendWithRetries,
@@ -63,20 +62,9 @@ const {
 
 // --- Pure helper unit tests ----------------------------------------------
 
-describe('resolveSendTimeoutMs', () => {
-  it('(a) applies the default when no --timeout is given (null)', () => {
-    expect(resolveSendTimeoutMs(null)).toBe(DEFAULT_SEND_TIMEOUT_MS);
-    expect(resolveSendTimeoutMs(undefined)).toBe(DEFAULT_SEND_TIMEOUT_MS);
+describe('DEFAULT_SEND_TIMEOUT_MS', () => {
+  it('(a) bounds a send by 30s when no --timeout is given', () => {
     expect(DEFAULT_SEND_TIMEOUT_MS).toBe(30000);
-  });
-
-  it('(c) treats --timeout 0 as disabled/unbounded (stays 0)', () => {
-    expect(resolveSendTimeoutMs(0)).toBe(0);
-  });
-
-  it('(d) honors an explicit --timeout value', () => {
-    expect(resolveSendTimeoutMs(5000)).toBe(5000);
-    expect(resolveSendTimeoutMs(300000)).toBe(300000);
   });
 });
 
@@ -186,7 +174,7 @@ function makeFakeServices({ refreshImpl } = {}) {
 // Model the warm server's send execution behind invoke: a hanging send rejects
 // with a TimeoutError once the CLI's invoke timeoutMs elapses (mirroring
 // AbortSignal.timeout aborting the real request); a normal send resolves with the
-// op's { result, attempts } shape.
+// payload the send text operation returns.
 function makeInvoke({ resultMessageId, hang = false } = {}) {
   return vi.fn((_storeDir, { timeoutMs } = {}) => new Promise((resolve, reject) => {
     if (hang) {
@@ -200,7 +188,7 @@ function makeInvoke({ resultMessageId, hang = false } = {}) {
       // timeoutMs === 0 (--timeout 0): never settle.
       return;
     }
-    resolve({ result: { messageId: resultMessageId }, attempts: 1 });
+    resolve({ channelId: '@x', messageId: resultMessageId });
   }));
 }
 
@@ -272,7 +260,7 @@ describe('send command default timeout (CLI integration)', () => {
     expect(process.exitCode).toBeUndefined();
 
     // Now let the send finish and confirm success, not a timeout.
-    invokeResolve({ result: { messageId: 7 }, attempts: 1 });
+    invokeResolve({ channelId: '@x', messageId: 7 });
     await done;
 
     expect(process.exitCode).toBeUndefined();
@@ -327,11 +315,11 @@ describe('send command default timeout (CLI integration)', () => {
   });
 
   it.each([
-    ['text', ['--message', 'hi'], 'Message'],
-    ['photo', ['--photo', 'x.png'], 'Photo'],
-    ['file', ['--file', 'x.pdf'], 'File'],
-  ])('send %s --schedule reports scheduled instead of sent', async (kind, extra, noun) => {
-    control.invoke = vi.fn().mockResolvedValue({ result: { messageId: 13, scheduled: true }, attempts: 1 });
+    ['text', ['--message', 'hi'], 'Message', { channelId: '@x', messageId: 13, scheduled: true }],
+    ['photo', ['--photo', 'x.png'], 'Photo', { ok: true, method: 'sendPhoto', chat_id: '@x', message_id: 13, scheduled: true }],
+    ['file', ['--file', 'x.pdf'], 'File', { channelId: '@x', messageId: 13, scheduled: true }],
+  ])('send %s --schedule reports scheduled instead of sent', async (kind, extra, noun, payload) => {
+    control.invoke = vi.fn().mockResolvedValue(payload);
     const schedule = new Date(Date.now() + 3600000).toISOString();
 
     await runProgram(['send', kind, '--to', '@x', ...extra, '--schedule', schedule]);

@@ -9,7 +9,13 @@ import { Long } from '@mtcute/core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import MessageSyncService from '../message-sync-service.js';
-import { OPERATIONS } from '../core/operations.js';
+import { OPERATIONS } from '../core/ops/index.js';
+import { executeOperation } from '../core/ops/execute.js';
+
+// Runs an operation the way the server does: args validated, defaults applied.
+function run(name, services, args) {
+  return executeOperation(OPERATIONS[name], args, { services });
+}
 
 const CHANNEL = '-1000000000701';
 const OTHER = '-1000000000702';
@@ -107,18 +113,18 @@ describe('chats given by username, for reads', () => {
     const live = { getMessagesByChannelId: vi.fn(async () => ({ messages: [] })), getPeerMetadata: vi.fn(async () => ({})) };
     telegram.getPeer.mockResolvedValue({ id: Number(OTHER), username: 'news_room', usernames: [] });
 
-    await OPERATIONS.messagesList({ messageSyncService: service, telegramClient: live }, { channelId: '@news_room', source: 'live', limit: 5 });
+    await run('messagesList', { messageSyncService: service, telegramClient: live }, { channelIds: '@news_room', source: 'live', limit: 5 });
     expect(live.getMessagesByChannelId).toHaveBeenLastCalledWith(OTHER, 5, {});
 
-    await OPERATIONS.messagesList({ messageSyncService: service, telegramClient: live }, { channelId: '@news_room', source: 'archive', limit: 5 });
+    await run('messagesList', { messageSyncService: service, telegramClient: live }, { channelIds: '@news_room', source: 'archive', limit: 5 });
     expect(live.getMessagesByChannelId).toHaveBeenLastCalledWith(OTHER, 5, {});
   });
 
   it('lists archived messages by username without Telegram', async () => {
     service.insertMessagesTx([service._buildMessageRecord(CHANNEL, { id: 1, date: 1700000001, text: 'one' })]);
 
-    const payload = await OPERATIONS.messagesList({ messageSyncService: service, telegramClient: {} }, {
-      channelId: '@news_room',
+    const payload = await run('messagesList', { messageSyncService: service, telegramClient: {} }, {
+      channelIds: '@news_room',
       source: 'archive',
       limit: 5,
     });
