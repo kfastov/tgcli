@@ -408,7 +408,7 @@ describe('backfill repair', () => {
 
     service.addRepairs({ chats: [CHANNEL_ID] });
     await service.processQueue();
-    expect(repairRow(service)).toMatchObject({ status: 'skipped', error: expect.stringContaining("haven't joined") });
+    expect(repairRow(service)).toMatchObject({ status: 'skipped', error: expect.stringContaining('CHANNEL_PRIVATE') });
 
     historyRequests = [];
     service._resetErroredJobs();

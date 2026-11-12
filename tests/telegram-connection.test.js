@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { Long, MtPeerNotFoundError, tl } from '@mtcute/core';
+import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createTelegramConnector } from '../core/telegram-connection.js';
@@ -885,6 +886,65 @@ describe('cold start catch-up', () => {
 
       const hash = await telegramClient.client.storage.peers.getMinAccessHash(-1000000000600);
       expect(hash.eq(MIN_HASH)).toBe(true);
+    });
+
+    // A megagroup with an access hash as `channel#1c32b11c`, the constructor of layer 221
+    // that tgcli 2.3.0 and older wrote to the session.
+    function layer221Channel({ id, accessHash, title }) {
+      const int = (value) => {
+        const bytes = Buffer.alloc(4);
+        bytes.writeUInt32LE(value);
+        return bytes;
+      };
+      const long = (value) => {
+        const bytes = Buffer.alloc(8);
+        bytes.writeBigInt64LE(BigInt(value));
+        return bytes;
+      };
+      const text = Buffer.from(title);
+      return Buffer.concat([
+        int(0x1c32b11c), int(256 | 8192), int(0),
+        long(id), long(accessHash.toString()),
+        Buffer.from([text.length]), text, Buffer.alloc((4 - ((1 + text.length) % 4)) % 4),
+        int(0x37c1011c), // chatPhotoEmpty
+        int(1700000000),
+      ]);
+    }
+
+    it('keeps the access hash of a chat stored on an older Telegram layer', async () => {
+      await startKnowingTheChannel();
+      await stopServer();
+      const db = new Database(sessionPath);
+      db.prepare('UPDATE peers SET complete = ? WHERE id = ?')
+        .run(layer221Channel({ id: BARE_CHANNEL_ID, accessHash: ACCESS_HASH, title: 'Old layer' }), Number(CHANNEL_ID));
+      db.close();
+
+      const restarted = startServer();
+      await restarted.telegramClient.client.prepare();
+      const { peers } = restarted.telegramClient.client.storage;
+      expect(await peers.getCompleteById(Number(CHANNEL_ID))).toMatchObject({ _: 'channel', title: 'Old layer' });
+
+      await peers.updatePeersFrom({ users: [], chats: [MIN_CHANNEL] });
+      expect((await peers.getById(Number(CHANNEL_ID)))?.accessHash.eq(ACCESS_HASH)).toBe(true);
+    });
+
+    it('looks a community up by its marked id, not as the user with the same bare id', async () => {
+      const { telegramClient } = await startKnowingTheChannel();
+      const { peers } = telegramClient.client.storage;
+      const community = {
+        _: 'community',
+        min: true,
+        id: FRIEND_ID,
+        title: 'Community',
+        accessHash: MIN_HASH,
+        photo: { _: 'chatPhotoEmpty' },
+        date: 1700000000,
+      };
+
+      await peers.updatePeersFrom({ users: [], chats: [community] });
+
+      const hash = await peers.getMinAccessHash(Number(`-100${String(FRIEND_ID).padStart(10, '0')}`));
+      expect(hash?.eq(MIN_HASH)).toBe(true);
     });
 
     it('can still fetch what that chat has missed', async () => {

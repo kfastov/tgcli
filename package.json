@@ -55,8 +55,8 @@
   "homepage": "https://github.com/kfastov/telegram-mcp-server#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.2",
-    "@mtcute/core": "^0.27.8",
-    "@mtcute/node": "^0.27.8",
+    "@mtcute/core": "^0.32.8",
+    "@mtcute/node": "^0.32.8",
     "better-sqlite3": "^12.6.0",
     "commander": "^12.1.0",
     "qrcode": "^1.5.4"
