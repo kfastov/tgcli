@@ -118,6 +118,7 @@ async function createHarness({ respond, dbPath }) {
     call,
     log: logger,
     onRawUpdate: createEvent(),
+    onServerUpdate: createEvent(),
     onError: createEvent(),
     isConnected: true,
     destroyed: false,

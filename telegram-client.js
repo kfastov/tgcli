@@ -1,6 +1,6 @@
 import { TelegramClient as MtCuteClient } from '@mtcute/node';
 import { InputMedia, Message, MtPeerNotFoundError, PeersIndex, networkMiddlewares } from '@mtcute/core';
-import { randomLong, toggleChannelIdMark } from '@mtcute/core/utils.js';
+import { __tlReaderMapWithCompat, randomLong, toggleChannelIdMark } from '@mtcute/core/utils.js';
 import { html } from '@mtcute/html-parser';
 import { md } from '@mtcute/markdown-parser';
 import QRCode from 'qrcode';
@@ -205,15 +205,18 @@ function resolveUploadPath(filePath) {
   return `file:${resolved}`;
 }
 
+const CHANNEL_ID_PEERS = new Set(['channel', 'channelForbidden', 'community', 'communityForbidden']);
+
 // mtcute writes a min peer over the complete one it already has, access hash included
-// (still so in 0.32.7). A min row counts as having no hash, so from then on the chat
+// (still so in 0.32.8). A min row counts as having no hash, so from then on the chat
 // cannot be looked up, and an update that hits a pts gap is lost: getChannelDifference
 // finds no peer, or is refused with CHANNEL_INVALID. A min copy adds nothing worth that.
 function keepCompletePeersOverMinCopies(client) {
   const { peers, refMsgs } = client.storage;
   const store = peers.store.bind(peers);
   peers.store = async (peer) => {
-    const isChannel = peer._ === 'channel' || peer._ === 'channelForbidden';
+    // mtcute keeps communities (layer 232) under marked ids, as it does channels.
+    const isChannel = CHANNEL_ID_PEERS.has(peer._);
     const id = isChannel ? toggleChannelIdMark(peer.id) : peer.id;
     if (peer.min) {
       const existing = await peers.getCompleteById(id);
@@ -630,6 +633,12 @@ class TelegramClient {
       apiId: this.apiId,
       apiHash: this.apiHash,
       storage: this.sessionPath,
+      // The session keeps each chat as a TL object of the layer that wrote it, and mtcute
+      // reads a constructor of an older layer as no chat at all. Then
+      // keepCompletePeersOverMinCopies finds nothing to keep, and the next min copy takes
+      // the access hash. The compat map reads the older constructors (layer 221 for
+      // tgcli 2.3.0 and before) as current ones.
+      readerMap: __tlReaderMapWithCompat,
       // A delayed write of a min copy can land after the complete row that replaced it.
       storageOptions: { peers: { updatesWriteInterval: 0 } },
       platform: createPlatform(),
