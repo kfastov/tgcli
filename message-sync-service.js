@@ -4775,16 +4775,27 @@ export default class MessageSyncService {
     let latestMessageDate = null;
     let oldestMessageId = null;
     let oldestMessageDate = null;
+    let unresolved = 0;
 
     for (const rawMessage of diff.messages) {
       if (rawMessage._ === 'messageEmpty') {
         continue;
       }
       const message = new Message(rawMessage, peers);
-      const channelKey = String(message.chat?.id ?? normalizeChannelKey(channelId));
+      // mtcute throws building the chat of a message with no peerId, or with a peer
+      // missing from the diff. Skip it: the gap recorded below covers it.
+      let chat;
+      try {
+        chat = message.chat;
+      } catch (error) {
+        unresolved += 1;
+        console.warn(`[sync] Channel ${channelId}: update diff too long, skipped message ${rawMessage.id} with no chat: ${error?.message ?? error}`);
+        continue;
+      }
+      const channelKey = String(chat?.id ?? normalizeChannelKey(channelId));
       batchChannelId = batchChannelId ?? channelKey;
 
-      const channelRow = this._ensureChannelFromPeer(channelKey, message.chat);
+      const channelRow = this._ensureChannelFromPeer(channelKey, chat);
       const syncEnabled = channelRow ? channelRow.sync_enabled === 1 : this._isChannelActive(channelKey);
       if (!syncEnabled) {
         continue;
@@ -4795,7 +4806,7 @@ export default class MessageSyncService {
         userRecords.set(senderRecord.user_id, senderRecord);
       }
 
-      const serialized = this.telegramClient._serializeMessage(message, message.chat);
+      const serialized = this.telegramClient._serializeMessage(message, chat);
       records.push(this._buildMessageRecord(channelKey, serialized));
 
       const messageDateIso = toIsoString(serialized.date);
@@ -4812,6 +4823,16 @@ export default class MessageSyncService {
     }
 
     if (!records.length || !batchChannelId) {
+      // Nothing could be archived, yet the diff says messages exist past the cursor.
+      // The update names the channel by its bare id; the archive keys it marked.
+      const bareId = Number(channelId);
+      if (unresolved && Number.isFinite(bareId) && bareId > 0) {
+        const channelKey = String(getMarkedPeerId(bareId, 'channel'));
+        if (this._markChannelGap(channelKey)) {
+          console.log(`[sync] Channel ${channelKey}: update diff too long, queued a history fetch for what it skipped.`);
+          void this.processQueue();
+        }
+      }
       return;
     }
 
