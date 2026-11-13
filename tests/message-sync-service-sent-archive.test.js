@@ -262,9 +262,9 @@ describe('archiving messages sent by tgcli', () => {
 
   afterEach(() => {
     harness?.manager?.stopLoop();
-    if (harness?.messageSyncService?.db?.open) {
-      harness.messageSyncService.db.close();
-    }
+    // close(), not db.close(): it also stops the queue loop and its timers, which
+    // would otherwise wake up to a closed archive after the test.
+    harness?.messageSyncService?.close();
     fs.rmSync(storeDir, { recursive: true, force: true });
     vi.restoreAllMocks();
   });
