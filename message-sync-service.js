@@ -7,6 +7,7 @@ import { isChatGone, normalizeChannelId, summarizeMedia } from './telegram-clien
 import { resolveStoreDir, resolveStorePaths } from './core/store.js';
 import { parseRequiredWaitSeconds } from './core/send-utils.js';
 import { chatIdSql, isChatId } from './core/chat-key.js';
+import { compactRawJson, parseRawJson, serializeRawJson } from './core/raw-json.js';
 
 const DEFAULT_DB_PATH = resolveStorePaths(resolveStoreDir()).dbPath;
 const DEFAULT_TARGET_MESSAGES = 1000;
@@ -1074,9 +1075,20 @@ export default class MessageSyncService {
       END;
     `);
 
+    // The index only holds these five columns, so the trigger is scoped to them:
+    // rewriting raw_json (compactRawJson) or edit_date must not delete and
+    // re-insert every FTS row. Stores created before this carry a catch-all
+    // `AFTER UPDATE` trigger; replace it.
+    const updateTrigger = this.db.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'messages_au'
+    `).get();
+    if (updateTrigger?.sql && !updateTrigger.sql.includes('AFTER UPDATE OF')) {
+      this.db.exec('DROP TRIGGER messages_au;');
+    }
+
     this.db.exec(`
       CREATE TRIGGER IF NOT EXISTS messages_au
-      AFTER UPDATE ON messages BEGIN
+      AFTER UPDATE OF text, links, files, sender, topic ON messages BEGIN
         INSERT INTO message_search(message_search, rowid, text, links, files, sender, topic)
         VALUES (
           'delete',
@@ -4224,6 +4236,120 @@ export default class MessageSyncService {
     });
   }
 
+  // Rewrites every stored raw_json in the current compact format and,
+  // with `vacuum`, runs VACUUM so the freed pages go back to the OS. Meant to
+  // run offline under the store write lock: on a multi-GB store this takes
+  // minutes and VACUUM needs free disk about the size of the database.
+  compactRawJson(options = {}) {
+    const batchSize = options.batchSize ?? 2000;
+    const checkpointEveryBatches = options.checkpointEveryBatches ?? 50;
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const stats = {
+      rowsScanned: 0,
+      rowsRewritten: 0,
+      rowsUnparseable: 0,
+      bytesBefore: 0,
+      bytesAfter: 0,
+      vacuumed: false,
+      fileBytesBefore: this._databaseFileBytes(),
+      fileBytesAfter: null,
+    };
+    const totalRows = this.db.prepare(
+      'SELECT COUNT(*) AS n FROM messages WHERE raw_json IS NOT NULL',
+    ).get().n;
+    const selectStmt = this.db.prepare(`
+      SELECT id, raw_json FROM messages
+      WHERE id > ? AND raw_json IS NOT NULL
+      ORDER BY id ASC
+      LIMIT ?
+    `);
+    const updateStmt = this.db.prepare('UPDATE messages SET raw_json = ? WHERE id = ?');
+    const applyBatch = this.db.transaction((rows) => {
+      for (const row of rows) {
+        stats.rowsScanned += 1;
+        const before = Buffer.byteLength(row.raw_json);
+        stats.bytesBefore += before;
+        const compact = compactRawJson(row.raw_json);
+        if (compact === null) {
+          stats.rowsUnparseable += 1;
+          stats.bytesAfter += before;
+          continue;
+        }
+        if (compact === row.raw_json) {
+          stats.bytesAfter += before;
+          continue;
+        }
+        updateStmt.run(compact, row.id);
+        stats.rowsRewritten += 1;
+        stats.bytesAfter += Buffer.byteLength(compact);
+      }
+    });
+
+    let lastId = 0;
+    let batches = 0;
+    while (true) {
+      const rows = selectStmt.all(lastId, batchSize);
+      if (rows.length === 0) {
+        break;
+      }
+      applyBatch(rows);
+      lastId = rows[rows.length - 1].id;
+      batches += 1;
+      if (batches % checkpointEveryBatches === 0) {
+        // Keep the WAL from growing to the size of everything rewritten so far.
+        this.db.pragma('wal_checkpoint(TRUNCATE)');
+      }
+      onProgress?.({ ...stats, totalRows });
+    }
+    this.db.pragma('wal_checkpoint(TRUNCATE)');
+
+    if (options.vacuum) {
+      // The rewrite is committed by now; a VACUUM that cannot run must not cost
+      // the caller the stats of what was done.
+      try {
+        this._assertFreeSpaceForVacuum();
+        this.db.exec('VACUUM');
+        this.db.pragma('wal_checkpoint(TRUNCATE)');
+        stats.vacuumed = true;
+      } catch (error) {
+        stats.vacuumError = error?.message ?? String(error);
+      }
+    }
+    stats.fileBytesAfter = this._databaseFileBytes();
+    return stats;
+  }
+
+  _databaseFileBytes() {
+    let total = 0;
+    for (const suffix of ['', '-wal']) {
+      try {
+        total += fs.statSync(`${this.dbPath}${suffix}`).size;
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          throw error;
+        }
+      }
+    }
+    return total;
+  }
+
+  _assertFreeSpaceForVacuum() {
+    // VACUUM builds a copy of the live data in a temp file and, in WAL mode,
+    // writes it back through the WAL: up to ~2x the live data in transit.
+    const pageSize = this.db.pragma('page_size', { simple: true });
+    const livePages = this.db.pragma('page_count', { simple: true })
+      - this.db.pragma('freelist_count', { simple: true });
+    const needed = 2 * livePages * pageSize;
+    const fsStats = fs.statfsSync(path.dirname(this.dbPath));
+    const available = fsStats.bavail * fsStats.bsize;
+    if (available < needed) {
+      throw new Error(
+        `VACUUM needs ~${Math.ceil(needed / 1e9)} GB free next to ${this.dbPath}, `
+        + `only ${Math.floor(available / 1e9)} GB available`,
+      );
+    }
+  }
+
   _backfillSearchFields(options = {}) {
     const rebuildMedia = Boolean(options.rebuildMedia);
     const selectStmt = this.db.prepare(`
@@ -4297,7 +4423,7 @@ export default class MessageSyncService {
 
     const applyBatch = this.db.transaction((rows) => {
       for (const row of rows) {
-        const parsed = safeParseJson(row.raw_json) ?? {};
+        const parsed = parseRawJson(row.raw_json) ?? {};
         const message = {
           ...parsed,
           text: parsed.text ?? row.text ?? null,
@@ -4367,7 +4493,7 @@ export default class MessageSyncService {
       files: searchFields.filesText,
       sender: searchFields.senderText,
       topic: searchFields.topicText,
-      raw_json: JSON.stringify(message),
+      raw_json: serializeRawJson(message),
       link_entries: searchFields.linkEntries,
       media_summary: mediaSummary,
     };

@@ -175,6 +175,21 @@ it. `server restart` switches to the caller's version in any direction. See
 - service status
 - service logs
 
+## store
+- store compact [--no-vacuum] [--batch-size <n>]
+  - Rewrites every archived message's stored Telegram payload (`messages.raw_json`)
+    in the compact format, then runs `VACUUM` so the file shrinks. Archives written
+    before this format hold binary fields (photo thumbnails, file references) as
+    `{"0":1,"1":24,…}` maps, about 1.5x larger, from which media could not be rebuilt
+    correctly. Nothing is lost: binary is kept as base64.
+  - Needs the store to itself: it refuses while a server is running (stop it with
+    `service stop` or `server stop`), and other commands do not start one until it
+    finishes. Rows already compact are skipped, so it can be rerun.
+  - `VACUUM` needs free disk of up to about twice the remaining data and is checked
+    first; if it cannot run, the rewritten rows stay and the command exits 1. Use
+    `--no-vacuum` to only rewrite rows. With `--json` it prints the counts.
+  - Measured on a 3.3M-message archive: 38 min, 15.8 GB → 12.3 GB.
+
 ## doctor
 - doctor [--connect]
   - Checks auth, lock, FTS, last sync, queue state. For an archive started before 2.2.5,

@@ -16,7 +16,7 @@ import path from 'path';
 import { spawn, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
-import { isPidAlive } from '../store-lock.js';
+import { isPidAlive, liveStoreLockHolder } from '../store-lock.js';
 import {
   CONTROL_CLIENT_VERSION_HEADER,
   CONTROL_FILE,
@@ -628,6 +628,16 @@ export async function ensureServer(storeDir, { quiet } = {}) {
   const existing = await pingServer(storeDir);
   if (existing) {
     return existing;
+  }
+
+  // A process holding the write lock (`tgcli store compact`, a login) needs the
+  // store to itself; a server started now would write to it underneath.
+  const lockHolder = liveStoreLockHolder(storeDir);
+  if (lockHolder) {
+    throw new Error(
+      `The store is locked by another tgcli process (pid ${lockHolder}), e.g. \`tgcli store compact\`; `
+      + 'not starting a server until it finishes.',
+    );
   }
 
   // As long as `tgcli server stop` gives it: the queue worker finishes its batch.

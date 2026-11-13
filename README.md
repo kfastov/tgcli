@@ -55,6 +55,7 @@ tgcli metadata       Channel metadata cache
 tgcli contacts       Contacts and people
 tgcli groups         Group management
 tgcli doctor         Diagnostics and sanity checks
+tgcli store          Local archive maintenance (compact)
 ```
 
 Commands run through `tgcli server`, which the CLI starts on demand. After an upgrade, the next command of any kind replaces a server the CLI started itself, as soon as its backfill queue is empty. A server you started yourself with `tgcli server` or `tgcli service` keeps running the old code until you restart it; the CLI warns about this on stderr. `tgcli server restart` restarts the server on the CLI's version, `tgcli server stop` stops it, and `tgcli server logs --follow` shows its log.
@@ -84,6 +85,18 @@ Then run `tgcli server` and point your client at the configured address.
 
 The tgcli store lives in the OS app-data directory and contains `config.json`, sessions, and `messages.db`.
 Override the location with `TGCLI_STORE`.
+
+### Shrinking `messages.db`
+
+Each archived message keeps the full Telegram payload in `messages.raw_json`. Stores created before the compact `raw_json` format hold it about 1.5x larger than needed (binary fields were written as `{"0":1,"1":24,…}` index maps). Rewrite them once and return the space to the OS:
+
+```bash
+tgcli service stop        # or `tgcli server stop` for a server the CLI auto-started
+tgcli store compact       # rewrites raw_json in batches, then VACUUMs
+tgcli service start
+```
+
+Compaction needs the store to itself: it refuses to start while a server is running, and other commands will not auto-start one until it finishes. `VACUUM` needs free disk of up to about twice the remaining data; the command checks this before running it, and if it cannot run, the rewritten rows are kept and a later `tgcli store compact` releases the space. Use `--no-vacuum` to only rewrite rows. Expect roughly 6 minutes per million messages plus the VACUUM.
 
 Legacy version: see `MIGRATION.md`.
 

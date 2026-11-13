@@ -330,6 +330,31 @@ describe('ensureServer', () => {
     expect(opts).toMatchObject({ detached: true, stdio: 'ignore' });
   });
 
+  it('refuses to start a server while another live process holds the store lock', async () => {
+    // `tgcli store compact` (or a login) holds the write lock; a server started
+    // under it would write to the archive during the rewrite and VACUUM.
+    fs.writeFileSync(path.join(storeDir, 'LOCK'), JSON.stringify({ pid: process.ppid, startedAt: 's' }));
+    global.fetch.mockRejectedValue(new Error('ECONNREFUSED'));
+
+    await expect(ensureServer(storeDir)).rejects.toThrow(/locked by another tgcli process/);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it('ignores a stale store lock left by a dead process', async () => {
+    fs.writeFileSync(path.join(storeDir, 'LOCK'), JSON.stringify({ pid: 2 ** 22 + 12345, startedAt: 's' }));
+    let started = false;
+    spawnMock.mockImplementation(() => {
+      started = true;
+      writeControl({ pid: 42, port: 8765, token: 'secret', startedAt: 's' });
+      return { unref: vi.fn() };
+    });
+    global.fetch.mockImplementation(() => (started
+      ? Promise.resolve(jsonResponse(200, { ok: true, pid: 42 }))
+      : Promise.reject(new Error('ECONNREFUSED'))));
+
+    await expect(ensureServer(storeDir)).resolves.toMatchObject({ pid: 42 });
+  });
+
   it('handles the race where another process started the server first', async () => {
     // No control file initially; "spawn" does nothing, but a concurrent process
     // wrote control.json before our first poll tick.
