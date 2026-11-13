@@ -291,6 +291,14 @@ function buildProgram() {
     .option('--connect', 'Connect to Telegram for live checks')
     .action(withGlobalOptions((globalFlags, options) => runDoctor(globalFlags, options)));
 
+  const store = program.command('store').description('Local archive maintenance');
+  store
+    .command('compact')
+    .description('Rewrite archived raw_json in the compact format and VACUUM (stop the service first)')
+    .option('--no-vacuum', 'Skip VACUUM (space stays inside the file until a later VACUUM)')
+    .option('--batch-size <n>', 'Rows per transaction (default 2000)')
+    .action(withGlobalOptions((globalFlags, options) => runStoreCompact(globalFlags, options)));
+
   const channels = program.command('channels').description('Channel discovery and settings');
   channels
     .command('list')
@@ -708,10 +716,11 @@ function buildProgram() {
   return program;
 }
 
-// `server` and `service` commands start, stop and replace servers themselves.
+// `server` and `service` commands start, stop and replace servers themselves;
+// `store` maintenance needs no server and must not start one.
 function managesServerItself(command) {
   for (let current = command; current?.parent; current = current.parent) {
-    if (current.name() === 'server' || current.name() === 'service') {
+    if (['server', 'service', 'store'].includes(current.name())) {
       return true;
     }
   }
@@ -2631,6 +2640,59 @@ async function runSyncStatus(globalFlags) {
       }
     }
   }, timeoutMs);
+}
+
+function formatGigabytes(bytes) {
+  return `${(bytes / 1e9).toFixed(2)} GB`;
+}
+
+// Offline maintenance. The server opens the archive without taking the store
+// lock, so a live one is refused explicitly; the write lock held for the whole
+// run keeps other commands from auto-starting one meanwhile (ensureServer).
+async function runStoreCompact(globalFlags, options = {}) {
+  const batchSize = parsePositiveInt(options.batchSize, '--batch-size') ?? undefined;
+  if (batchSize !== undefined && !Number.isInteger(batchSize)) {
+    throw new Error('--batch-size must be a whole number');
+  }
+  const vacuum = options.vacuum !== false;
+  const running = await pingServer(resolveStoreDir());
+  if (running) {
+    throw new Error(
+      `A tgcli server (pid ${running.pid}, ${running.version ?? 'unknown version'}) is running on this store. `
+      + 'Stop it first: `tgcli service stop` for the background service, or `tgcli server stop`.',
+    );
+  }
+  return withCommand(globalFlags, { need: 'archive', lock: 'write' }, async ({ messageSyncService }) => {
+    let lastReport = 0;
+    const onProgress = (progress) => {
+      const now = Date.now();
+      if (globalFlags.json || now - lastReport < 5000) {
+        return;
+      }
+      lastReport = now;
+      const pct = progress.totalRows ? Math.floor((progress.rowsScanned / progress.totalRows) * 100) : 100;
+      console.error(
+        `[store compact] ${progress.rowsScanned}/${progress.totalRows} rows (${pct}%), `
+        + `raw_json ${formatGigabytes(progress.bytesBefore)} -> ${formatGigabytes(progress.bytesAfter)}`,
+      );
+    };
+    if (!globalFlags.json && vacuum) {
+      console.error('[store compact] Rewriting raw_json, then VACUUM; this can take a while on a large store.');
+    }
+    const stats = messageSyncService.compactRawJson({ batchSize, vacuum, onProgress });
+    if (globalFlags.json) {
+      writeJson(stats);
+      return;
+    }
+    console.log(`Rows scanned: ${stats.rowsScanned}, rewritten: ${stats.rowsRewritten}, unparseable (kept): ${stats.rowsUnparseable}`);
+    console.log(`raw_json: ${formatGigabytes(stats.bytesBefore)} -> ${formatGigabytes(stats.bytesAfter)}`);
+    console.log(`Database file: ${formatGigabytes(stats.fileBytesBefore)} -> ${formatGigabytes(stats.fileBytesAfter)}`
+      + (stats.vacuumed ? '' : ' (no VACUUM; run again without --no-vacuum to release space)'));
+    if (stats.vacuumError) {
+      // The rewrite is kept; only the space was not released.
+      throw new Error(`Rows were rewritten, but VACUUM did not run: ${stats.vacuumError}`);
+    }
+  });
 }
 
 async function runSyncJobsList(globalFlags, options = {}) {

@@ -43,6 +43,16 @@ function parseLockPid(raw) {
   }
 }
 
+// Pid of a live process other than this one holding the store write lock, or null.
+export function liveStoreLockHolder(storeDir) {
+  const lock = readStoreLock(storeDir);
+  if (!lock.exists) {
+    return null;
+  }
+  const pid = parseLockPid(lock.info);
+  return pid && pid !== process.pid && isPidAlive(pid) ? pid : null;
+}
+
 function removeStaleLockFile(lockPath, pid, label) {
   try {
     fs.unlinkSync(lockPath);
